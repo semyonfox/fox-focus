@@ -17,7 +17,7 @@ WORKDIR /app
 RUN mkdir /data && chown node:node /data
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
-COPY --from=build --chown=node:node /app/server/app.ts /app/server/index.ts /app/server/store.ts /app/server/hermes.ts ./server/
+COPY --from=build --chown=node:node /app/server/app.ts /app/server/index.ts /app/server/store.ts /app/server/hermes.ts /app/server/integrations.ts /app/server/oauth.ts /app/server/providers.ts ./server/
 COPY --from=build --chown=node:node /app/src/model.ts ./src/model.ts
 COPY --from=build --chown=node:node /app/src/hermes-model.ts ./src/hermes-model.ts
 COPY --from=build --chown=node:node /app/package.json ./package.json

@@ -1769,6 +1769,62 @@ textarea:focus-visible {
   color: var(--amber-text);
 }
 
+.inline-action {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 720;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.provider-calendar-context {
+  display: grid;
+  gap: 0;
+  margin: 10px 18px 13px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.provider-calendar-context > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  color: var(--blue-text);
+  font-size: 9px;
+  font-weight: 740;
+}
+
+.provider-calendar-context > p {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 6px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.provider-calendar-context strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-calendar-context small,
+.provider-calendar-context-empty {
+  color: var(--muted-light);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
 .local-workspace-heading {
   margin-block: 16px 8px;
   padding-top: 13px;
@@ -2089,6 +2145,185 @@ textarea:focus-visible {
   line-height: 1.5;
 }
 
+.editor-dialog--drawer {
+  width: min(100%, 540px);
+}
+
+.integrations-drawer {
+  width: min(100%, 680px);
+}
+
+.integration-security,
+.integration-message,
+.integration-provider,
+.integration-record,
+.integration-record-section > div {
+  display: flex;
+  align-items: center;
+}
+
+.integration-security {
+  align-items: flex-start;
+  gap: 8px;
+  margin: 15px 0;
+  padding: 9px 10px;
+  border: 1px solid var(--blue-soft);
+  border-radius: 10px;
+  background: var(--blue-soft);
+  color: var(--blue-text);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.integration-security svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.integration-message {
+  margin: 11px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.integration-message--error {
+  color: var(--amber-text);
+}
+
+.integration-provider-list {
+  display: grid;
+  gap: 8px;
+}
+
+.integration-provider {
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.integration-provider-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.integration-provider-copy strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 730;
+}
+
+.integration-provider-copy small,
+.integration-provider-copy span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.integration-provider-copy span {
+  color: var(--muted-light);
+}
+
+.integration-provider-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+}
+
+.integration-provider-actions .submit-button {
+  text-decoration: none;
+}
+
+.connection-state {
+  padding: 5px 7px;
+  border-radius: 7px;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.connection-state--muted {
+  background: var(--stone-soft);
+  color: var(--stone-text);
+}
+
+.integration-records {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 17px;
+  margin-top: 20px;
+}
+
+.integration-record-section {
+  min-width: 0;
+}
+
+.integration-record-section > div {
+  gap: 7px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--text);
+}
+
+.integration-record-section > div svg {
+  color: var(--blue-text);
+}
+
+.integration-record-section > div strong {
+  font-size: 10px;
+  font-weight: 730;
+}
+
+.integration-record {
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 48px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.integration-record > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.integration-record strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 690;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.integration-record small {
+  overflow: hidden;
+  color: var(--muted-light);
+  font-size: 9px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.integration-record > svg {
+  flex: 0 0 auto;
+  color: var(--stone-text);
+}
+
+.integration-loading {
+  margin: 15px 0;
+  color: var(--muted);
+  font-size: 10px;
+}
 .editor-heading {
   display: flex;
   align-items: flex-start;

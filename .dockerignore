@@ -19,4 +19,11 @@ coverage
 **/*.key
 **/workspace-password
 **/tunnel-token
+**/oauth-token-key
+**/client_secret*.json
+**/*-oauth-client.json
+**/oauth.env
+**/google-client.json
+**/microsoft-client.json
+**/token-key
 **/.env*

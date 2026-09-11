@@ -6,8 +6,31 @@ import { HTTPException } from 'hono/http-exception';
 import { isPrototypeData, isRecord } from '../src/model.ts';
 import type { Store } from './store.ts';
 import type { HermesFeed } from '../src/hermes-model.ts';
+import type { IntegrationOverview, IntegrationService } from './integrations.ts';
 
-export function createApp(store: Store, password: string, hermes?: () => HermesFeed) {
+const emptyIntegrations: IntegrationOverview = {
+  providers: (['google', 'microsoft'] as const).map(provider => ({
+    provider,
+    displayName: provider === 'google' ? 'Google' : 'Microsoft',
+    configured: false,
+    connection: null,
+    sync: { provider, state: 'idle', startedAt: null, completedAt: null, recordCount: 0, lastError: null },
+    calendarEventCount: 0,
+    taskCount: 0,
+  })),
+  records: [],
+};
+
+function providerFrom(value: string): 'google' | 'microsoft' | null {
+  return value === 'google' || value === 'microsoft' ? value : null;
+}
+
+export function createApp(
+  store: Store,
+  password: string,
+  hermes?: () => HermesFeed,
+  integrations?: IntegrationService,
+) {
   if (password.length < 24) throw new Error('Workspace password must have at least 24 characters');
   const app = new Hono();
   app.use('*', secureHeaders());
@@ -30,10 +53,30 @@ export function createApp(store: Store, password: string, hermes?: () => HermesF
     await next();
   });
   app.use('/api/*', bodyLimit({ maxSize: 512 * 1024 }));
-  app.get('/healthz', (c) => c.json({ ok: true, mode: 'prototype', providersConnected: false }));
+  app.get('/healthz', (c) => c.json({ ok: true, mode: 'workspace' }));
   app.get('/app', (c) => c.redirect('/', 302));
   app.get('/api/v1/workspace', (c) => c.json(store.read()));
   app.get('/api/v1/hermes', (c) => c.json(hermes?.() ?? { state: 'unavailable', checkedAt: new Date().toISOString(), board: null }));
+  app.get('/api/v1/integrations', (c) => c.json(integrations?.overview() ?? emptyIntegrations));
+  app.get('/api/v1/integrations/:provider/connect', (c) => {
+    const provider = providerFrom(c.req.param('provider'));
+    const authorizationUrl = provider ? integrations?.startAuthorization(provider) : null;
+    return authorizationUrl
+      ? c.redirect(authorizationUrl, 302)
+      : c.json({ error: 'Provider is not configured' }, 404);
+  });
+  app.get('/api/v1/integrations/:provider/callback', async (c) => {
+    const provider = providerFrom(c.req.param('provider'));
+    if (!provider || !integrations) return c.redirect('/?integration=unavailable', 303);
+    const result = await integrations.completeAuthorization(provider, new URL(c.req.url).searchParams);
+    return c.redirect(`/?integration=${provider}&result=${result.outcome}`, 303);
+  });
+  app.post('/api/v1/integrations/:provider/sync', async (c) => {
+    const provider = providerFrom(c.req.param('provider'));
+    if (!provider || !integrations) return c.json({ error: 'Provider is not configured' }, 404);
+    const result = await integrations.sync(provider);
+    return result.outcome === 'synced' ? c.json(result) : c.json(result, 503);
+  });
   app.put('/api/v1/workspace', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
     let body: unknown;

@@ -8,6 +8,7 @@ import {
   Circle,
   Clock3,
   Inbox,
+  Link2,
   ListTodo,
   Monitor,
   Moon,
@@ -20,8 +21,9 @@ import {
 import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
-import { hermesLabels, useHermesFeed } from './hermes-feed.tsx';
+import { hermesLabels, useHermesFeed } from "./hermes-feed.tsx";
 import { type HermesTask } from "./hermes-model.ts";
+import { IntegrationCalendarContext, IntegrationsDrawer } from './integrations.tsx';
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
@@ -277,6 +279,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [showReminderTray, setShowReminderTray] = useState(false);
   const [activeReminderId, setActiveReminderId] = useState<string | null>(null);
   const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
+  const [showIntegrations, setShowIntegrations] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("integration"));
   const [agentRequest, setAgentRequest] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("");
@@ -322,7 +325,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || showReminderTray || activeReminderId);
+  const isOverlayOpen = Boolean(modal || showReminderTray || activeReminderId || showIntegrations);
 
   useEffect(() => {
     if (!isOverlayOpen) {
@@ -901,7 +904,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <strong>{calendarDay}</strong>
               <small>{sortedEvents.length} block{sortedEvents.length === 1 ? "" : "s"} · local changes stay linked to their task</small>
             </div>
-            {initial ? <p className="source-boundary">Calendar source not connected. Add and edit your own blocks here.</p> : null}
+            {initial ? <IntegrationCalendarContext enabled onOpen={() => setShowIntegrations(true)} /> : null}
             {activeBlock ? (
               <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}>
                 <div className="active-block-copy">
@@ -1085,6 +1088,33 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               ) : null}
             </div>
           </article>
+          <aside className="pane lifeboard-signals" id="signals">
+            <PaneHeader eyebrow="Signals / read-only where needed" title="Keep an eye on it" />
+            <div className="control-list">
+              <button className="control-row control-row--button" type="button" onClick={() => setShowIntegrations(true)}>
+                <span className="control-icon control-icon--blue"><Link2 size={14} /></span>
+                <span><strong>Calendars &amp; tasks</strong><small>Google and Microsoft · read-only</small></span>
+                <b className="control-state control-state--blue">Open</b>
+              </button>
+              <button className="control-row control-row--button" type="button" onClick={() => scrollToSection("agenda")}>
+                <span className="control-icon control-icon--stone"><CalendarDays size={14} /></span>
+                <span><strong>Calendar context</strong><small>Editable local blocks</small></span>
+                <b className="control-state control-state--stone">View</b>
+              </button>
+              <button className="control-row control-row--button" type="button" onClick={() => setShowReminderTray(true)}>
+                <span className="control-icon control-icon--amber"><Bell size={14} /></span>
+                <span><strong>Reminders</strong><small>{reminderCount} local alerts · in-app only</small></span>
+                <b className="control-state control-state--amber">Open</b>
+              </button>
+            </div>
+            <div className="signal-brief">
+              <div><span className="eyebrow">Hermes / Personal Tasks</span><strong>{initial ? hermes.feed?.state === 'connected' ? `${hermes.feed.board.tasks.filter(task => task.status !== 'done').length} active tasks` : hermes.loading ? 'Checking your board…' : 'Board unavailable' : 'Sample assistant activity'}</strong><small>{initial ? hermes.failed ? 'Could not refresh. Previous results may be out of date.' : 'Read-only · source board stays canonical' : 'Preview only · no private records'}</small></div>
+              <button className="secondary-action" type="button" onClick={() => scrollToSection("tasks")}>View tasks <ChevronRight size={13} /></button>
+            </div>
+            <div className="deadline-band deadline-band--lifeboard">
+              <div><span>Prototype state</span><strong>{saveError ? "Save needs attention" : initial ? "Saved to SQLite" : "Stored on this device"}</strong><small>{initial ? "SQLite workspace · Hermes is read-only" : "Browser local storage only"}</small>{!initial && window.location.protocol !== "file:" ? <a className="secondary-action" href="/app">Open server workspace</a> : null}</div>
+            </div>
+          </aside>
           </div>
         </section>
       </>
@@ -1207,6 +1237,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </DialogFrame>
       ) : null}
 
+      <IntegrationsDrawer open={showIntegrations} onClose={() => setShowIntegrations(false)} />
     </div>
   );
 }

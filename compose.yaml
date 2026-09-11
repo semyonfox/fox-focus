@@ -10,11 +10,23 @@ services:
       PORT: 8789
       DATA_DIR: /data
       HERMES_KANBAN_DB: ${HERMES_KANBAN_DB:-}
+      # OAuth configuration is read from individual read-only files. Keep the
+      # host files outside this repository and never mount a whole credential
+      # directory such as Hermes's provider state.
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      GOOGLE_OAUTH_CLIENT_FILE: /run/secrets/fox-focus/google-client.json
+      MICROSOFT_OAUTH_CLIENT_FILE: /run/secrets/fox-focus/microsoft-client.json
+      OAUTH_TOKEN_KEY_FILE: /run/secrets/fox-focus/token-key
     volumes:
       - focus-data:/data
       # Set HERMES_BOARD_DIR to a board directory to enable the optional feed.
       # The empty default keeps this public Compose file portable.
       - ${HERMES_BOARD_DIR:-./empty-hermes-board}:/hermes/personal-tasks:ro
+      # Bind only the three files Fox Focus needs. The safe defaults keep
+      # OAuth disabled for a local-only workspace.
+      - ${GOOGLE_OAUTH_CLIENT_FILE_HOST:-./empty-oauth/google-client.placeholder}:/run/secrets/fox-focus/google-client.json:ro
+      - ${MICROSOFT_OAUTH_CLIENT_FILE_HOST:-./empty-oauth/microsoft-client.placeholder}:/run/secrets/fox-focus/microsoft-client.json:ro
+      - ${OAUTH_TOKEN_KEY_FILE_HOST:-./empty-oauth/token-key.placeholder}:/run/secrets/fox-focus/token-key:ro
     ports:
       - "127.0.0.1:8789:8789"
     security_opt:

@@ -269,6 +269,12 @@ Google Tasks can round-trip title, notes, completion, list, parent, position, an
 
 ## Provider connections and sync design
 
+> Implementation status (2026-09-11): Google Calendar/Tasks and Microsoft
+> Calendar/To Do now have a server-side, read-only OAuth and polling path.
+> Provider writes, approval requests, webhooks, and disconnect/revocation stay
+> future work; this document's write-through rules remain the contract for
+> that later phase.
+
 ### OAuth and secret boundary
 
 Use delegated OAuth 2.0 authorization-code flow with PKCE for Google and Microsoft. Request the smallest scope that enables the selected capability, and request offline access only for the local background process that needs a refresh token.

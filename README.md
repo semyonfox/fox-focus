@@ -11,13 +11,14 @@ It is deliberately small. The point is not to build another project manager or t
 - Capture an Inbox item, review it, and ask for a draft or more work before turning it into action.
 - Keep local data in a SQLite file, with revision checks that stop one browser tab from silently overwriting another.
 - Show a read-only, human-readable feed from a Hermes Personal Tasks board when one is mounted. Hermes remains the source of truth.
+- Connect Google Calendar/Tasks and Microsoft Calendar/To Do through server-side OAuth. Imported records are read-only context and refresh tokens are encrypted locally.
 - Run the app in one Docker container. It generates a password on first start and keeps data in a mounted volume.
 
 The deployed personal instance is intentionally protected. It is not a public demo and it contains no sample workspace for visitors to browse.
 
 ## What is not built yet
 
-Google Calendar, Google Tasks, Microsoft To Do, email capture, MCP, real notification delivery, accounts, and provider write-back are planned work. They are not hidden behind a half-finished button.
+Email capture, MCP, real notification delivery, accounts, provider disconnect/revocation, and provider write-back are planned work. They are not hidden behind a half-finished button.
 
 The proposed rules for those integrations are in [the architecture plan](docs/architecture-plan.md). In short, imported systems keep ownership of their records, and an external change will require a readable preview and human approval.
 
@@ -80,16 +81,24 @@ Browser
 Optional Hermes board
   -> read-only adapter
   -> same Hono API
+
+Optional Google / Microsoft OAuth clients
+  -> server-held OAuth + encrypted token envelope
+  -> read-only provider adapters
+  -> same Hono API
 ```
 
 The current app is a static React client with a small Hono server. SQLite is a sensible fit for one self-hosted user and one app replica. It runs in WAL mode, which lets readers continue while a short write is happening, while still keeping one writer at a time. The app uses short, versioned writes and `synchronous=FULL` so a save is either committed or rejected as stale.
 
-The server exposes only a prototype workspace API today:
+The server exposes a small workspace API:
 
 - `GET /healthz` is an unauthenticated health check with no workspace data.
 - `GET /api/v1/workspace` reads the local workspace.
 - `PUT /api/v1/workspace` saves it when the supplied revision still matches.
 - `GET /api/v1/hermes` reads the optional Hermes feed.
+- `GET /api/v1/integrations` returns safe connection status and imported read-only records.
+- `GET /api/v1/integrations/:provider/connect` starts OAuth; its callback consumes a one-time server state.
+- `POST /api/v1/integrations/:provider/sync` performs an authenticated, read-only provider refresh.
 
 The workspace and API use HTTP Basic authentication in this first self-hosted release. That is a privacy gate, not a multi-user login system. Put it behind HTTPS if it leaves your machine or home network.
 
@@ -99,6 +108,8 @@ The workspace and API use HTTP Basic authentication in this first self-hosted re
 
 For a production-shaped setup, bind the app to loopback and put a TLS-terminating reverse proxy or private network access layer in front of it. See [self-hosting notes](docs/deployment.md) for the safety boundaries and backup guidance.
 
+Provider-specific OAuth setup, scopes, private credential mounts, and token lifetime behaviour are in [Google and Microsoft connections](docs/integrations.md). Reuse a provider client registration only when it is a Web client with Fox Focus's exact callback; never reuse another application's refresh token.
+
 ## Repository and release status
 
 This repository is source-only. It must not contain workspace databases, WAL files, credentials, provider tokens, imported mail, Canvas material, or Hermes board data.
@@ -107,7 +118,8 @@ GitHub Actions independently validates pull requests and `main`. The homelab Jen
 
 ## Where to look next
 
-- [Architecture and delivery plan](docs/architecture-plan.md) explains the proposed Google, Microsoft, MCP, reminder, and data-ownership design.
+- [Architecture and delivery plan](docs/architecture-plan.md) explains the broader Google, Microsoft, MCP, reminder, and data-ownership design.
+- [Google and Microsoft connections](docs/integrations.md) gives the private OAuth deployment steps.
 - [Self-hosting notes](docs/deployment.md) cover the actual prototype's persistence, access boundary, and backup rules.
 - `server/app.test.ts` and `server/hermes.test.ts` show the current API and Hermes-adapter behaviour.
 
