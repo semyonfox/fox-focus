@@ -20,7 +20,7 @@ The deployed personal instance is intentionally protected. It is not a public de
 
 Email capture, MCP, real notification delivery, accounts, provider disconnect/revocation, and provider write-back are planned work. They are not hidden behind a half-finished button.
 
-The proposed rules for those integrations are in [the architecture plan](docs/architecture-plan.md). In short, imported systems keep ownership of their records, and an external change will require a readable preview and human approval.
+The proposed rules for those integrations are in [the architecture plan](docs/architecture-plan.md). The approved category, ownership, and sync direction is in the [task organisation and sync handover](docs/task-organisation-and-sync-handover.md). Imported systems keep ownership of their records, and an external change will require a readable preview and human approval.
 
 ## Try it locally
 
@@ -119,6 +119,7 @@ GitHub Actions independently validates pull requests and `main`. The homelab Jen
 ## Where to look next
 
 - [Architecture and delivery plan](docs/architecture-plan.md) explains the broader Google, Microsoft, MCP, reminder, and data-ownership design.
+- [Task organisation and sync handover](docs/task-organisation-and-sync-handover.md) records the approved category-first browser, ownership rules, Hermes API boundary, and rollout gates.
 - [Google and Microsoft connections](docs/integrations.md) gives the private OAuth deployment steps.
 - [Self-hosting notes](docs/deployment.md) cover the actual prototype's persistence, access boundary, and backup rules.
 - `server/app.test.ts` and `server/hermes.test.ts` show the current API and Hermes-adapter behaviour.

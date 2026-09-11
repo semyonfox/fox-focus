@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { compareTasksByCreatedAt, compareTasksByDue, isTask, type Task } from "../src/model.ts";
+import {
+  compareTasksByCreatedAt,
+  compareTasksByDue,
+  isInboxItem,
+  isTask,
+  isTimelineEvent,
+  type Task,
+} from "../src/model.ts";
 
 function task(id: string, overrides: Partial<Task> = {}): Task {
   return {
@@ -49,4 +56,42 @@ test("orders timestamped tasks newest-first and puts legacy tasks last", () => {
   assert.deepEqual(tasks.sort(compareTasksByCreatedAt).map(({ id }) => id), [
     "z-newer", "a-older", "legacy-a", "legacy-b",
   ]);
+});
+
+test("uses newest-created as the secondary due-ordering rule", () => {
+  const tasks = [
+    task("legacy", { due: "Today" }),
+    task("older", { due: "Today", createdAt: "2026-09-10T09:00:00Z" }),
+    task("newer", { due: "Today", createdAt: "2026-09-11T09:00:00Z" }),
+  ];
+  assert.deepEqual(tasks.sort(compareTasksByDue).map(({ id }) => id), ["newer", "older", "legacy"]);
+});
+
+test("accepts exact calendar instants while preserving time-only legacy rows", () => {
+  const base = {
+    id: "event-1",
+    title: "Focus block",
+    subtitle: "Local",
+    area: "Personal",
+    duration: 30,
+    editable: true,
+    origin: "local",
+  };
+
+  assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11T08:30:00.000Z" }), true);
+  assert.equal(isTimelineEvent({ ...base, start: "09:30" }), true);
+  assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11", start: "09:30" }), false);
+  assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11T08:30:00.000Z", start: "09:30" }), false);
+});
+
+test("accepts handled inbox records", () => {
+  assert.equal(isInboxItem({
+    id: "inbox-1",
+    title: "Reviewed proposal",
+    summary: "No action needed.",
+    source: "Local",
+    actor: "Semyon",
+    status: "handled",
+    accent: "Personal",
+  }), true);
 });

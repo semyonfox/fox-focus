@@ -1,22 +1,53 @@
+import { dublinDateKey, isDateKey } from './calendar-time.ts';
+
 export type CalendarContextItem = {
   title: string;
   startsAt: string | null;
   startsOn: string | null;
+  allDay?: boolean;
 };
 
-function dublinDateKey(value: Date): string {
-  const parts = new Intl.DateTimeFormat('en-IE', {
-    timeZone: 'Europe/Dublin', year: 'numeric', month: '2-digit', day: '2-digit',
-  }).formatToParts(value);
-  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(item => item.type === type)?.value ?? '';
-  return `${part('year')}-${part('month')}-${part('day')}`;
-}
-
 function itemDateKey(item: CalendarContextItem): string {
-  if (item.startsOn && /^\d{4}-\d{2}-\d{2}$/.test(item.startsOn)) return item.startsOn;
+  if (item.startsOn && isDateKey(item.startsOn)) return item.startsOn;
   if (!item.startsAt) return '';
   const instant = new Date(item.startsAt);
   return Number.isNaN(instant.getTime()) ? '' : dublinDateKey(instant);
+}
+
+function compareCalendarContext(first: CalendarContextItem, second: CalendarContextItem): number {
+  const dayOrder = itemDateKey(first).localeCompare(itemDateKey(second));
+  if (dayOrder !== 0) return dayOrder;
+
+  const firstAllDay = first.allDay === true || isDateKey(first.startsOn);
+  const secondAllDay = second.allDay === true || isDateKey(second.startsOn);
+  if (firstAllDay !== secondAllDay) return firstAllDay ? -1 : 1;
+
+  const firstInstant = first.startsAt ? Date.parse(first.startsAt) : Number.POSITIVE_INFINITY;
+  const secondInstant = second.startsAt ? Date.parse(second.startsAt) : Number.POSITIVE_INFINITY;
+  const timeOrder = firstInstant - secondInstant;
+  if (Number.isFinite(timeOrder) && timeOrder !== 0) return timeOrder;
+
+  return first.title.localeCompare(second.title);
+}
+
+/**
+ * Selects records whose start falls within an inclusive calendar-date range.
+ * Timed starts are assigned to dates in Europe/Dublin; all-day date keys are
+ * already calendar dates and must not be shifted through UTC.
+ */
+export function filterCalendarContextByDateRange<T extends CalendarContextItem>(
+  items: readonly T[],
+  startDate: string,
+  endDate: string,
+): T[] {
+  if (!isDateKey(startDate) || !isDateKey(endDate) || startDate > endDate) return [];
+
+  return items
+    .filter((item) => {
+      const date = itemDateKey(item);
+      return date >= startDate && date <= endDate;
+    })
+    .sort(compareCalendarContext);
 }
 
 /** Puts today and upcoming calendar context ahead of the rolling past window. */
@@ -28,7 +59,7 @@ export function sortTodayCalendarContext<T extends CalendarContextItem>(items: r
     const firstCurrentOrUpcoming = firstDay >= today;
     const secondCurrentOrUpcoming = secondDay >= today;
     if (firstCurrentOrUpcoming !== secondCurrentOrUpcoming) return firstCurrentOrUpcoming ? -1 : 1;
-    if (firstCurrentOrUpcoming) return firstDay.localeCompare(secondDay) || first.title.localeCompare(second.title);
-    return secondDay.localeCompare(firstDay) || first.title.localeCompare(second.title);
+    if (firstCurrentOrUpcoming) return compareCalendarContext(first, second);
+    return secondDay.localeCompare(firstDay) || compareCalendarContext(first, second);
   });
 }

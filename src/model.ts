@@ -1,8 +1,11 @@
+import { isTimeValue } from "./calendar-time.ts";
+
 export type Area = "University" | "Work" | "Personal" | "Health" | "Admin";
 export type Priority = "high" | "medium" | "low";
 export type TaskState = "up-next" | "scheduled" | "waiting" | "done";
 export type ActiveTaskState = Exclude<TaskState, "done">;
-export type InboxStatus = "new" | "draft-ready" | "waiting-on-agent";
+
+export type InboxStatus = "new" | "draft-ready" | "waiting-on-agent" | "handled";
 export type ThemeMode = "system" | "light" | "black";
 export type ResolvedTheme = Exclude<ThemeMode, "system">;
 export type SectionAnchor = "today" | "agenda" | "tasks" | "review" | "signals";
@@ -12,7 +15,7 @@ export type ReminderMode = "none" | "one-hour" | "morning";
 export type ActiveReminderMode = Exclude<ReminderMode, "none">;
 export type ReminderState = "scheduled" | "snoozed";
 export type InboxDestination = "task" | "event";
-export type TaskFilter = "all" | "due-today" | "planned" | "waiting" | "done";
+export type TaskFilter = "all" | "open" | "due-today" | "planned" | "waiting" | "done";
 export type TaskSort = "due" | "created";
 
 export type Task = {
@@ -32,18 +35,23 @@ export type Task = {
   createdAt?: string;
 };
 
-export type TimelineEvent = {
+type TimelineEventBase = {
   id: string;
   title: string;
   subtitle: string;
   area: Area;
-  start: string;
   duration: number;
   editable: boolean;
   origin: EventOrigin;
   source?: string;
   taskId?: string;
 };
+
+/** New calendar blocks store an exact instant. `start` remains readable for legacy workspace rows. */
+export type TimelineEvent = TimelineEventBase & (
+  | { startsAt: string; start?: never }
+  | { startsAt?: never; start: string }
+);
 
 export type InboxItem = {
   id: string;
@@ -82,6 +90,7 @@ export type TaskDraft = {
   due: string;
   duration: string;
   state: ActiveTaskState;
+  scheduledDate: string;
   scheduledTime: string;
   reminderMode: ReminderMode;
 };
@@ -90,6 +99,7 @@ export type EventDraft = {
   title: string;
   subtitle: string;
   area: Area;
+  date: string;
   time: string;
   duration: string;
   reminderMode: ReminderMode;
@@ -105,13 +115,13 @@ export const areas = ["University", "Work", "Personal", "Health", "Admin"] as co
 export const priorities = ["high", "medium", "low"] as const;
 export const taskStates = ["up-next", "scheduled", "waiting", "done"] as const;
 export const activeTaskStates = ["up-next", "scheduled", "waiting"] as const;
-export const inboxStatuses = ["new", "draft-ready", "waiting-on-agent"] as const;
+export const inboxStatuses = ["new", "draft-ready", "waiting-on-agent", "handled"] as const;
 export const eventOrigins = ["fixture", "local", "task", "inbox"] as const;
 export const taskOrigins = ["manual", "inbox"] as const;
 export const reminderModes = ["none", "one-hour", "morning"] as const;
 export const activeReminderModes = ["one-hour", "morning"] as const;
 export const reminderStates = ["scheduled", "snoozed"] as const;
-export const taskFilters = ["all", "due-today", "planned", "waiting", "done"] as const;
+export const taskFilters = ["all", "open", "due-today", "planned", "waiting", "done"] as const;
 export const taskSorts = ["due", "created"] as const;
 export const storageKey = "fox-focus-prototype-v2";
 
@@ -122,6 +132,7 @@ export const defaultTaskDraft: TaskDraft = {
   due: "No deadline",
   duration: "30 min",
   state: "up-next",
+  scheduledDate: "",
   scheduledTime: "",
   reminderMode: "none",
 };
@@ -130,6 +141,7 @@ export const defaultEventDraft: EventDraft = {
   title: "",
   subtitle: "",
   area: "Personal",
+  date: "",
   time: "09:00",
   duration: "30",
   reminderMode: "none",
@@ -188,9 +200,10 @@ export function taskDueWeight(due: string): number {
   return dueOrdering[due] ?? 3;
 }
 
-/** Sorts earlier/current deadlines first, with task ID as a stable tie-breaker. */
+/** Sorts earlier/current deadlines first, then newest-created, then task ID. */
 export function compareTasksByDue(first: Task, second: Task): number {
-  return taskDueWeight(first.due) - taskDueWeight(second.due) || first.id.localeCompare(second.id);
+  return taskDueWeight(first.due) - taskDueWeight(second.due) ||
+    compareTasksByCreatedAt(first, second) || first.id.localeCompare(second.id);
 }
 
 /** Sorts newest tasks first; legacy tasks without timestamps sort after timestamped ones. */
@@ -203,14 +216,16 @@ export function compareTasksByCreatedAt(first: Task, second: Task): number {
 export function isTimelineEvent(value: unknown): value is TimelineEvent {
   if (!isRecord(value)) return false;
 
+  const hasInstant = isIsoInstant(value.startsAt);
+  const hasLegacyTime = isTimeValue(value.start);
+
   return (
     typeof value.id === "string" &&
     typeof value.title === "string" &&
     typeof value.subtitle === "string" &&
     isOneOf(value.area, areas) &&
-    typeof value.start === "string" &&
     typeof value.duration === "number" && Number.isFinite(value.duration) && value.duration > 0 && value.duration <= 1440 &&
-    /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value.start) &&
+    ((hasInstant && value.start === undefined) || (hasLegacyTime && value.startsAt === undefined)) &&
     typeof value.editable === "boolean" &&
     isOneOf(value.origin, eventOrigins) &&
     (value.source === undefined || typeof value.source === "string") &&

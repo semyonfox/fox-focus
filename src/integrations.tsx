@@ -1,6 +1,7 @@
 import { CalendarDays, CheckCircle2, CircleAlert, Link2, ListTodo, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
-import { sortTodayCalendarContext } from './integration-model.ts';
+import { dublinDateKey, isDateKey } from './calendar-time.ts';
+import { filterCalendarContextByDateRange } from './integration-model.ts';
 
 type Provider = 'google' | 'microsoft';
 type SyncState = 'idle' | 'syncing' | 'failed';
@@ -212,19 +213,58 @@ export function IntegrationsDrawer({ open, onClose }: { open: boolean; onClose: 
   );
 }
 
-/** A compact Today-view hint; the drawer remains the full source browser. */
-export function IntegrationCalendarContext({ enabled, onOpen }: { enabled: boolean; onOpen: () => void }) {
-  const { overview, loading } = useOverview(enabled);
+function calendarContextHeading(startDate: string, endDate: string, today: string): string {
+  if (!isDateKey(startDate) || !isDateKey(endDate) || startDate > endDate) return 'Imported calendar';
+  if (startDate === endDate) return `Imported calendar · ${formatDate(startDate)}`;
+  return startDate >= today ? 'Upcoming imported calendar' : 'Imported calendar range';
+}
+
+function emptyCalendarContextCopy(
+  startDate: string,
+  endDate: string,
+  today: string,
+  hasImportedEvents: boolean,
+): string {
+  if (!isDateKey(startDate) || !isDateKey(endDate) || startDate > endDate) {
+    return 'The selected calendar range is unavailable.';
+  }
+  if (!hasImportedEvents) return 'Connected, but no calendar items have been imported yet.';
+  if (startDate === endDate) {
+    return startDate === today
+      ? 'No imported calendar items today.'
+      : `No imported calendar items on ${formatDate(startDate)}.`;
+  }
+  const prefix = startDate >= today ? 'No upcoming imported calendar items' : 'No imported calendar items';
+  return `${prefix} from ${formatDate(startDate)} to ${formatDate(endDate)}.`;
+}
+
+/** Compact context for the selected calendar range; the drawer remains the full source browser. */
+export function IntegrationCalendarContext({
+  enabled,
+  startDate,
+  endDate,
+  onOpen,
+}: {
+  enabled: boolean;
+  startDate: string;
+  endDate: string;
+  onOpen: () => void;
+}) {
+  const { overview, loading, failed } = useOverview(enabled);
   if (!enabled) return null;
   const connected = overview?.providers.some(provider => provider.connection?.state === 'connected') ?? false;
-  const events = sortTodayCalendarContext((overview?.records ?? [])
-    .filter(record => record.kind === 'calendar_event')).slice(0, 4);
+  const importedEvents = (overview?.records ?? []).filter(record => record.kind === 'calendar_event');
+  const matchingEvents = filterCalendarContextByDateRange(importedEvents, startDate, endDate);
+  const events = matchingEvents.slice(0, 8);
+  const today = dublinDateKey(new Date());
 
   if (loading && !overview) return <p className="source-boundary">Checking calendar connections…</p>;
+  if (failed && !overview) return <p className="source-boundary source-boundary--warning">Calendar connections could not be checked. <button className="inline-action" type="button" onClick={onOpen}>Open sources</button></p>;
   if (!connected) return <p className="source-boundary">Calendar source not connected. <button className="inline-action" type="button" onClick={onOpen}>Connect Google or Microsoft</button></p>;
   return <div className="provider-calendar-context">
-    <div><span>Imported calendar context</span><button className="inline-action" type="button" onClick={onOpen}>Open sources</button></div>
+    <div><span>{calendarContextHeading(startDate, endDate, today)} · read-only</span><button className="inline-action" type="button" onClick={onOpen}>Open sources</button></div>
     {events.map(record => <p key={record.id}><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {recordWhen(record)}</small></p>)}
-    {!events.length ? <p className="provider-calendar-context-empty">Connected, but no calendar items fall in the current window.</p> : null}
+    {matchingEvents.length > events.length ? <p className="provider-calendar-context-empty">{matchingEvents.length - events.length} more imported item{matchingEvents.length - events.length === 1 ? '' : 's'} in this range. Open sources to review them.</p> : null}
+    {!matchingEvents.length ? <p className="provider-calendar-context-empty">{emptyCalendarContextCopy(startDate, endDate, today, importedEvents.length > 0)}</p> : null}
   </div>;
 }
