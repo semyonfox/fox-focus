@@ -1,10 +1,9 @@
-name: Test and publish container
+name: Test container
 
 on:
   pull_request:
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -52,42 +51,3 @@ jobs:
           done
           echo 'Container did not become healthy with protected workspace routes.' >&2
           exit 1
-
-  publish:
-    needs: test
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Build release image
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}
-        run: docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" --tag "${IMAGE,,}:sha-$GITHUB_SHA" .
-      - name: Publish to GitHub Container Registry
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${IMAGE,,}"
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            tag=latest
-          else
-            tag="$GITHUB_REF_NAME"
-            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9_.-]+)?$ ]]; then
-              echo 'Release tags must be vMAJOR.MINOR.PATCH, optionally with a prerelease suffix.' >&2
-              exit 1
-            fi
-          fi
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          trap 'docker logout ghcr.io >/dev/null' EXIT
-          docker push "$image:sha-$GITHUB_SHA"
-          docker tag "$image:sha-$GITHUB_SHA" "$image:$tag"
-          docker push "$image:$tag"

@@ -103,7 +103,7 @@ For a production-shaped setup, bind the app to loopback and put a TLS-terminatin
 
 This repository is source-only. It must not contain workspace databases, WAL files, credentials, provider tokens, imported mail, Canvas material, or Hermes board data.
 
-GitHub Actions will publish `ghcr.io/semyonfox/fox-focus:latest` on main, a commit-specific image, and version tags when a release tag is pushed. Until the first workflow succeeds and the package visibility is checked, build the image locally using the commands above instead of assuming a registry tag exists.
+GitHub Actions independently validates pull requests and `main`. The homelab Jenkins job is the release authority: a push to `main` triggers Jenkins to build, test, check an isolated candidate, and deploy its local image; a ten-minute source poll recovers from a missed webhook. No release image is published to GitHub Container Registry, so a GitHub Actions or GHCR outage cannot prevent Jenkins from deploying a verified `main` commit.
 
 ## Where to look next
 
