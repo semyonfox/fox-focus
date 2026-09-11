@@ -147,12 +147,19 @@ function updateReminder(
   targetType: Reminder["targetType"],
   title: string,
   mode: ReminderMode,
+  startsAt?: string | null,
 ): Reminder[] {
   const withoutTarget = reminders.filter(
     (reminder) => !(reminder.targetId === targetId && reminder.targetType === targetType),
   );
 
   if (mode === "none") return withoutTarget;
+
+  let fireAt: string | undefined;
+  if (startsAt) {
+    if (mode === "one-hour") fireAt = new Date(Date.parse(startsAt) - 60 * 60 * 1000).toISOString();
+    else fireAt = dublinDateTimeToInstant(dublinDateKey(new Date(startsAt)), "09:00") ?? undefined;
+  }
 
   return [
     ...withoutTarget,
@@ -164,6 +171,7 @@ function updateReminder(
       mode,
       when: formatReminderMode(mode),
       state: "scheduled",
+      ...(fireAt ? { fireAt } : {}),
     },
   ];
 }
@@ -346,6 +354,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [showTaskDetails, setShowTaskDetails] = useState(false);
   const [showReminderTray, setShowReminderTray] = useState(false);
   const [activeReminderId, setActiveReminderId] = useState<string | null>(null);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(() =>
+    typeof window !== "undefined" && "Notification" in window ? Notification.permission : "unsupported",
+  );
   const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
   const [showIntegrations, setShowIntegrations] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("integration"));
@@ -435,26 +446,45 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [isOverlayOpen]);
 
   useEffect(() => {
-    const nextSnoozedReminder = [...data.reminders]
-      .filter((reminder) => reminder.state === "snoozed" && typeof reminder.snoozedUntil === "number")
-      .sort((first, second) => (first.snoozedUntil ?? 0) - (second.snoozedUntil ?? 0))[0];
+    let timeout: number | undefined;
+    const scheduleNext = () => {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      const now = Date.now();
+      const nextReminder = [...data.reminders]
+        .filter((reminder) => reminder.state === "scheduled" && reminder.fireAt && !reminder.firedAt && Date.parse(reminder.fireAt) > now)
+        .sort((first, second) => Date.parse(first.fireAt ?? "") - Date.parse(second.fireAt ?? ""))[0];
+      if (!nextReminder?.fireAt) return;
 
-    if (!nextSnoozedReminder?.snoozedUntil) return;
+      const fireTime = Date.parse(nextReminder.fireAt);
+      timeout = window.setTimeout(() => {
+        if (fireTime > Date.now()) {
+          scheduleNext();
+          return;
+        }
+        const firedAt = new Date().toISOString();
+        setData((current) => ({
+          ...current,
+          reminders: current.reminders.map((reminder) => reminder.id === nextReminder.id && !reminder.firedAt
+            ? { ...reminder, firedAt }
+            : reminder),
+        }));
+        setActiveReminderId(nextReminder.id);
+        if ("Notification" in window && Notification.permission === "granted") {
+          try {
+            new Notification(nextReminder.title, { body: nextReminder.when, tag: nextReminder.id });
+          } catch {
+            // the in-app reminder still fires if the browser notification fails
+          }
+        }
+      }, Math.min(fireTime - now, 6 * 60 * 60 * 1000));
+    };
 
-    const delay = Math.max(0, nextSnoozedReminder.snoozedUntil - Date.now());
-    const timeout = window.setTimeout(() => {
-      setData((current) => ({
-        ...current,
-        reminders: current.reminders.map((reminder) =>
-          reminder.id === nextSnoozedReminder.id
-            ? { ...reminder, state: "scheduled", when: formatReminderMode(reminder.mode), snoozedUntil: undefined }
-            : reminder,
-        ),
-      }));
-      setActiveReminderId(nextSnoozedReminder.id);
-    }, delay);
-
-    return () => window.clearTimeout(timeout);
+    scheduleNext();
+    const interval = window.setInterval(scheduleNext, 60 * 1000);
+    return () => {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      window.clearInterval(interval);
+    };
   }, [data.reminders]);
 
   const resolvedTheme: ResolvedTheme = themeMode === "system" ? systemTheme : themeMode;
@@ -891,12 +921,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         : removedOldLinkedEvent;
 
       return {
+        ...current,
         tasks,
         events,
         inboxItems: modal.inboxId
           ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
           : current.inboxItems,
-        reminders: updateReminder(current.reminders, taskId, "task", title, taskDraft.reminderMode),
+        reminders: updateReminder(current.reminders, taskId, "task", title, taskDraft.reminderMode, plannedStartAt),
       };
     });
 
@@ -954,6 +985,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     };
 
     setData((current) => ({
+      ...current,
       tasks: existingEvent?.taskId
         ? current.tasks.map((task) =>
             task.id === existingEvent.taskId
@@ -974,7 +1006,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       inboxItems: modal.inboxId
         ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
         : current.inboxItems,
-      reminders: updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode),
+      reminders: updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt),
     }));
 
     if (existingEvent?.taskId && completionUndo?.taskId === existingEvent.taskId) setCompletionUndo(null);
@@ -996,6 +1028,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (!eventToRemove?.editable) return;
 
     setData((current) => ({
+      ...current,
       tasks: current.tasks.map((task) =>
         task.linkedEventId === eventToRemove.id
           ? { ...task, linkedEventId: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
@@ -1114,15 +1147,34 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ...current,
       reminders: current.reminders.map((reminder) =>
         reminder.id === activeReminder.id
-          ? { ...reminder, state: "snoozed", when: "in 30 min", snoozedUntil: Date.now() + 30 * 60 * 1000 }
+          ? { ...reminder, state: "scheduled", when: "in 30 min", fireAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(), firedAt: undefined, snoozedUntil: undefined }
           : reminder,
       ),
     }));
     setActiveReminderId(null);
-    setStatusMessage(`Snoozed “${activeReminder.title}” for 30 minutes while this prototype stays open.`);
+    setStatusMessage(`Snoozed “${activeReminder.title}” for 30 minutes.`);
+  }
+
+  async function requestNotificationPermission() {
+    if (!("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+    try {
+      setNotificationPermission(await Notification.requestPermission());
+    } catch {
+      setNotificationPermission(Notification.permission);
+    }
   }
 
   const themeTarget = resolvedTheme === "black" ? "light" : "dark";
+  const notificationStatus = notificationPermission === "granted"
+    ? "Device notifications on"
+    : notificationPermission === "denied"
+      ? "Blocked in browser settings"
+      : notificationPermission === "unsupported"
+        ? "Not supported in this browser"
+        : null;
 
   function plannedDateForTask(task: Task): string | undefined {
     const linkedEvent = task.linkedEventId ? eventById.get(task.linkedEventId) : undefined;
@@ -1344,7 +1396,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               </button>
               <button className="control-row control-row--button" type="button" onClick={() => setShowReminderTray(true)}>
                 <span className="control-icon control-icon--amber"><Bell size={14} /></span>
-                <span><strong>Reminders</strong><small>{reminderCount ? `${reminderCount} saved` : "None saved"} · preview only</small></span>
+                <span><strong>Reminders</strong><small>{reminderCount ? `${reminderCount} saved` : "None saved"} · while open</small></span>
                 <ChevronRight className="control-arrow" size={14} />
               </button>
             </div>
@@ -1378,7 +1430,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "review"} onClick={() => scrollToSection("review")}><Inbox size={14} /><span>Review</span><b>{reviewCount}</b></button>
         </nav>
         <div className="command-actions">
-          <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminder previews`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
+          <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
           <button className="quiet-action theme-action" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeTarget} theme`} title={`Switch to ${themeTarget} theme`}>{resolvedTheme === "black" ? <Sun size={15} /> : <Moon size={15} />}</button>
           <button className="capture-button" type="button" onClick={() => openTaskComposer()}><Plus size={15} /><span>Add task</span></button>
         </div>
@@ -1413,7 +1465,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Task state</span><select value={taskDraft.state} onChange={(event) => { const value = event.target.value; if (isOneOf(value, activeTaskStates)) setTaskDraft((current) => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="scheduled">Scheduled</option><option value="waiting">Waiting</option></select></label>
               <label className="field"><span>Planned day</span><input type="date" value={taskDraft.scheduledDate} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledDate: event.target.value }))} /></label>
               <label className="field"><span>Planned time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
-              <label className="field field--full"><span>Reminder preview · not scheduled</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder preview</option><option value="one-hour">Preview 1 hour before</option><option value="morning">Preview 09:00 on the day</option></select></label>
+              <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
             </div> : null}
             <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div><button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
           </form>
@@ -1437,7 +1489,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Day</span><input type="date" required value={eventDraft.date} onChange={(event) => setEventDraft((current) => ({ ...current, date: event.target.value }))} /></label>
               <label className="field"><span>Start time</span><input type="time" required value={eventDraft.time} onChange={(event) => setEventDraft((current) => ({ ...current, time: event.target.value }))} /></label>
               <label className="field"><span>Duration</span><select value={eventDraft.duration} onChange={(event) => setEventDraft((current) => ({ ...current, duration: event.target.value }))}><option value="15">15 min</option><option value="30">30 min</option><option value="45">45 min</option><option value="60">60 min</option><option value="90">90 min</option></select></label>
-              <label className="field"><span>Reminder preview · not scheduled</span><select value={eventDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setEventDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder preview</option><option value="one-hour">Preview 1 hour before</option><option value="morning">Preview 09:00 on the day</option></select></label>
+              <label className="field"><span>Reminder</span><select value={eventDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setEventDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
             </div>
             <div className="editor-footer"><span>Local only. No provider calendar is being written to.</span><div>{eventModal.eventId ? <button className="danger-button" type="button" onClick={deleteEvent}><Trash2 size={13} /> Delete</button> : null}<button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save block</button></div></div>
           </form>
@@ -1459,22 +1511,22 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ) : null}
 
       {showReminderTray ? (
-        <DialogFrame title="Reminder prototypes" onClose={() => setShowReminderTray(false)} className="editor-dialog--tray">
-          <div className="editor-heading"><div className="composer-icon"><Bell size={17} /></div><div><p className="eyebrow">Manual preview only</p><h2>Reminder prototypes</h2></div><button className="close-composer" type="button" onClick={() => setShowReminderTray(false)} aria-label="Close reminders"><X size={17} /></button></div>
+        <DialogFrame title="Reminders" onClose={() => setShowReminderTray(false)} className="editor-dialog--tray">
+          <div className="editor-heading"><div className="composer-icon"><Bell size={17} /></div><div><p className="eyebrow">While this tab is open</p><h2>Reminders</h2></div><button className="close-composer" type="button" onClick={() => setShowReminderTray(false)} aria-label="Close reminders"><X size={17} /></button></div>
           <div className="reminder-list">
-            {data.reminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.state === "snoozed" ? "preview snoozed" : "saved preview"}</small></span></div>)}
+            {data.reminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.firedAt ? "fired" : reminder.fireAt ? "scheduled" : "needs a planned time"}</small></span></div>)}
             {!data.reminders.length ? <p className="empty-line">No local reminders yet.</p> : null}
           </div>
-          <div className="editor-footer"><span>No scheduler or system-notification delivery is wired yet. This only previews the first saved reminder.</span><button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div>
+          <div className="editor-footer"><span>Notifications fire while Fox Focus is open in a tab. Nothing is delivered when it is closed.</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}<button className="secondary-action" type="button" disabled={notificationPermission !== "default"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button><button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
         </DialogFrame>
       ) : null}
 
       {activeReminder ? (
         <DialogFrame title="Reminder" onClose={() => setActiveReminderId(null)} className="editor-dialog--alert">
           <div className="reminder-alert-icon"><Bell size={22} /></div>
-          <p className="eyebrow">Reminder preview</p>
+          <p className="eyebrow">Reminder</p>
           <h2>{activeReminder.title}</h2>
-          <p>This is a manual in-app preview. Intended timing: {formatReminderMode(activeReminder.mode)}.</p>
+          <p>{activeReminder.when}.</p>
           <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setActiveReminderId(null)}>Dismiss</button><button className="submit-button" type="button" onClick={snoozeReminder}>Snooze 30 min</button></div>
         </DialogFrame>
       ) : null}

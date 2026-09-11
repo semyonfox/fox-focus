@@ -5,6 +5,7 @@ import {
   compareTasksByDue,
   isInboxItem,
   isPrototypeData,
+  isReminder,
   isTask,
   isTimelineEvent,
   type Task,
@@ -110,4 +111,18 @@ test("validates optional task-list area mappings", () => {
   assert.equal(isPrototypeData({ ...base, listAreas: { "": "Personal" } }), false);
   assert.equal(isPrototypeData({ ...base, listAreas: { "google:Tasks": "Other" } }), false);
   assert.equal(isPrototypeData({ ...base, listAreas: Object.fromEntries(Array.from({ length: 101 }, (_, index) => [`google:${index}`, "Personal"])) }), false);
+});
+
+test("validates reminder fire instants", () => {
+  const reminder = {
+    id: "reminder-1",
+    targetId: "task-1",
+    targetType: "task",
+    title: "Start assignment",
+    mode: "one-hour",
+    when: "1 hour before",
+    state: "scheduled",
+  } as const;
+  assert.equal(isReminder({ ...reminder, fireAt: "2026-09-11T08:00:00.000Z" }), true);
+  assert.equal(isReminder({ ...reminder, fireAt: "tomorrow morning" }), false);
 });

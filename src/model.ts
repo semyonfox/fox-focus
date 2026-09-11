@@ -76,6 +76,8 @@ export type Reminder = {
   when: string;
   state: ReminderState;
   snoozedUntil?: number;
+  fireAt?: string;
+  firedAt?: string;
 };
 
 export type PrototypeData = {
@@ -160,7 +162,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 const isoInstantPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
-function isIsoInstant(value: unknown): value is string {
+export function isIsoInstant(value: unknown): value is string {
   if (typeof value !== "string" || !isoInstantPattern.test(value) || !Number.isFinite(Date.parse(value))) return false;
   const [, year, month, day] = value.match(/^(\d{4})-(\d{2})-(\d{2})T/) ?? [];
   if (!year || !month || !day) return false;
@@ -266,7 +268,9 @@ export function isReminder(value: unknown): value is Reminder {
     isOneOf(value.mode, activeReminderModes) &&
     typeof value.when === "string" &&
     isOneOf(value.state, reminderStates) &&
-    (value.snoozedUntil === undefined || typeof value.snoozedUntil === "number")
+    (value.snoozedUntil === undefined || typeof value.snoozedUntil === "number") &&
+    (value.fireAt === undefined || isIsoInstant(value.fireAt)) &&
+    (value.firedAt === undefined || isIsoInstant(value.firedAt))
   );
 }
 
