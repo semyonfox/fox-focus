@@ -154,7 +154,7 @@ test("encrypts a token set into a context-bound SQLite envelope", () => {
   assert.throws(() => openOAuthTokenSet(tampered, masterKey, context), expectSecurityError("token_decryption_failed"));
   assert.throws(() => parseOAuthTokenEnvelope("not json"), expectSecurityError("invalid_token_envelope"));
   assert.throws(
-    () => sealOAuthTokenSet(tokens, "not-a-32-byte-base64url-key", context),
+    () => sealOAuthTokenSet(tokens, "too-short", context),
     expectSecurityError("invalid_token_envelope"),
   );
 });
