@@ -6,11 +6,17 @@ export type StoredPushSubscription = {
   keys: { p256dh: string; auth: string };
 };
 
-export function dueReminders(data: PrototypeData, now: Date): Reminder[] {
+// a snoozed reminder gets a new fireAt, so the key changes and it can be delivered again
+export function deliveryKey(reminder: Reminder): string {
+  return `${reminder.id}@${reminder.fireAt ?? ''}`;
+}
+
+export function dueReminders(data: PrototypeData, now: Date, delivered: ReadonlySet<string> = new Set()): Reminder[] {
   const latestFireAt = now.getTime();
   const earliestFireAt = latestFireAt - 10 * 60_000;
   return data.reminders.filter(reminder => {
     if (reminder.state !== 'scheduled' || reminder.firedAt || !reminder.fireAt) return false;
+    if (delivered.has(deliveryKey(reminder))) return false;
     const fireAt = Date.parse(reminder.fireAt);
     return fireAt >= earliestFireAt && fireAt <= latestFireAt;
   });

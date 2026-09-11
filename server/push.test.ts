@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { PrototypeData, Reminder } from '../src/model.ts';
-import { dueReminders } from './push.ts';
+import { deliveryKey, dueReminders } from './push.ts';
 
 const baseReminder: Reminder = {
   id: 'due',
@@ -34,4 +34,10 @@ test('skips reminders that already fired or are not scheduled', () => {
     { ...baseReminder, id: 'snoozed', state: 'snoozed' },
   ];
   assert.deepEqual(dueReminders(data(reminders), new Date('2026-09-11T10:00:00.000Z')), []);
+});
+
+test('skips reminders the server already delivered unless they were rescheduled', () => {
+  const rescheduled = { ...baseReminder, id: 'again', fireAt: '2026-09-11T09:58:00.000Z' };
+  const delivered = new Set([deliveryKey(baseReminder), `${rescheduled.id}@2026-09-11T09:30:00.000Z`]);
+  assert.deepEqual(dueReminders(data([baseReminder, rescheduled]), new Date('2026-09-11T10:00:00.000Z'), delivered).map(reminder => reminder.id), ['again']);
 });

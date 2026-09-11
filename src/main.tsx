@@ -263,7 +263,7 @@ function HermesTaskRow({ task }: { task: HermesTask }) {
   );
 }
 
-function ImportedTaskRow({ task }: { task: ImportedRecord }) {
+function ImportedTaskRow({ task, area }: { task: ImportedRecord; area: Area }) {
   const completed = task.status === "completed";
   const status = completed
     ? "Completed"
@@ -271,9 +271,10 @@ function ImportedTaskRow({ task }: { task: ImportedRecord }) {
 
   return (
     <article className={`task-row imported-task-row${completed ? " imported-task-row--done" : ""}`}>
+      <span className="imported-task-mark" title="Read-only, managed by the provider"><i className={`area-dot area-dot--${areaClass(area)}`} /></span>
       <div className="task-copy">
         <strong className={completed ? "task-title--done" : undefined}>{task.title}</strong>
-        <span><em className="source-chip">{providerLabel(task.provider)} · {task.containerName}</em></span>
+        <span>{area}<em className="source-chip">{providerLabel(task.provider)} · {task.containerName}</em></span>
       </div>
       <time dateTime={task.dueOn ?? undefined}>{status}</time>
     </article>
@@ -1414,7 +1415,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`} tabIndex={0}>
               {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)}
               {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} />)}
-              {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} />)}
+              {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerName)} />)}
               {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "Nothing completed yet" : "Nothing here"}</strong><p>{taskFilter === "done" ? "Completed tasks will show up here." : "Try another category or add a task."}</p></div> : null}
             </div>
           </article>

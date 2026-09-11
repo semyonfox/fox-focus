@@ -230,6 +230,10 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       record_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT
     );
+    CREATE TABLE IF NOT EXISTS push_deliveries (
+      delivery_key TEXT PRIMARY KEY,
+      fired_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       endpoint TEXT PRIMARY KEY,
       subscription_json TEXT NOT NULL CHECK(json_valid(subscription_json)),
@@ -471,6 +475,29 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     return db.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').run(endpoint).changes === 1;
   }
 
+  // server-side delivery state lives here so firing never bumps the workspace revision
+  function listPushDeliveries(): Set<string> {
+    const rows = db.prepare('SELECT delivery_key FROM push_deliveries').all() as Record<string, unknown>[];
+    return new Set(rows.flatMap(row => typeof row.delivery_key === 'string' ? [row.delivery_key] : []));
+  }
+
+  function markPushDelivered(keys: string[], keepKeys: string[]): void {
+    const firedAt = new Date().toISOString();
+    const insert = db.prepare('INSERT OR IGNORE INTO push_deliveries (delivery_key, fired_at) VALUES (?, ?)');
+    const keep = new Set(keepKeys);
+    db.exec('BEGIN');
+    try {
+      for (const key of keys) insert.run(key, firedAt);
+      for (const key of listPushDeliveries()) {
+        if (!keep.has(key)) db.prepare('DELETE FROM push_deliveries WHERE delivery_key=?').run(key);
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   return {
     read,
     save,
@@ -488,6 +515,8 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     savePushSubscription,
     listPushSubscriptions,
     deletePushSubscription,
+    listPushDeliveries,
+    markPushDelivered,
     close: () => db.close(),
   };
 }

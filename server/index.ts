@@ -8,7 +8,7 @@ import { createIntegrationService, integrationConfigFromEnvironment } from './in
 import { openStore } from './store.ts';
 import { readHermesFeed } from './hermes.ts';
 import webPush, { type WebPushError } from 'web-push';
-import { dueReminders } from './push.ts';
+import { deliveryKey, dueReminders } from './push.ts';
 
 const dataDir = process.env.DATA_DIR ?? './data';
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -55,7 +55,7 @@ async function sendDuePushNotifications(): Promise<void> {
   pushTickRunning = true;
   try {
     const snapshot = store.read();
-    const reminders = dueReminders(snapshot.data, new Date());
+    const reminders = dueReminders(snapshot.data, new Date(), store.listPushDeliveries());
     if (!reminders.length) return;
     const subscriptions = store.listPushSubscriptions();
     let sent = 0;
@@ -75,14 +75,8 @@ async function sendDuePushNotifications(): Promise<void> {
         }
       }
     }
-    const firedAt = new Date().toISOString();
-    const dueIds = new Set(reminders.map(reminder => reminder.id));
-    const data = {
-      ...snapshot.data,
-      reminders: snapshot.data.reminders.map(reminder => dueIds.has(reminder.id) ? { ...reminder, firedAt } : reminder),
-    };
-    const saved = store.save(snapshot.revision, data);
-    console.log(`Push tick: ${reminders.length} due, ${sent} sent, ${failed} failed, ${removed} removed, ${saved ? 1 : 0} saved.`);
+    store.markPushDelivered(reminders.map(deliveryKey), snapshot.data.reminders.map(deliveryKey));
+    console.log(`Push tick: ${reminders.length} due, ${sent} sent, ${failed} failed, ${removed} removed.`);
   } catch {
     console.error('Push tick failed.');
   } finally {
