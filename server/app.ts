@@ -4,6 +4,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
 import { isPrototypeData, isRecord } from '../src/model.ts';
+import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
 import type { HermesFeed } from '../src/hermes-model.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
@@ -30,6 +31,7 @@ export function createApp(
   password: string,
   hermes?: () => HermesFeed,
   integrations?: IntegrationService,
+  pushPublicKey?: string,
 ) {
   if (password.length < 8) throw new Error('Workspace password must have at least 8 characters');
   const app = new Hono();
@@ -38,6 +40,8 @@ export function createApp(
   app.use('/', auth);
   app.use('/app', auth);
   app.use('/app/*', auth);
+  app.use('/sw.js', auth);
+  app.use('/manifest.webmanifest', auth);
   app.use('/api/*', auth);
   app.use('/api/*', async (c, next) => {
     c.header('Cache-Control', 'no-store');
@@ -56,6 +60,29 @@ export function createApp(
   app.get('/healthz', (c) => c.json({ ok: true, mode: 'workspace' }));
   app.get('/app', (c) => c.redirect('/', 302));
   app.get('/api/v1/workspace', (c) => c.json(store.read()));
+  app.get('/api/v1/push/public-key', (c) => pushPublicKey
+    ? c.json({ publicKey: pushPublicKey })
+    : c.json({ error: 'Push notifications are unavailable' }, 503));
+  app.post('/api/v1/push/subscriptions', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    const text = await c.req.text();
+    if (Buffer.byteLength(text, 'utf8') > 16 * 1024) return c.json({ error: 'Subscription is too large' }, 413);
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isPushSubscription(body)) return c.json({ error: 'Invalid push subscription' }, 400);
+    store.savePushSubscription(body, c.req.header('User-Agent')?.slice(0, 500) ?? null);
+    return c.json({ ok: true }, 201);
+  });
+  app.delete('/api/v1/push/subscriptions', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isRecord(body) || typeof body.endpoint !== 'string' || body.endpoint.length > 4096) {
+      return c.json({ error: 'Invalid endpoint' }, 400);
+    }
+    store.deletePushSubscription(body.endpoint);
+    return c.json({ ok: true });
+  });
   app.get('/api/v1/hermes', (c) => c.json(hermes?.() ?? { state: 'unavailable', checkedAt: new Date().toISOString(), board: null }));
   app.get('/api/v1/integrations', (c) => c.json(integrations?.overview() ?? emptyIntegrations));
   app.get('/api/v1/integrations/:provider/connect', (c) => {

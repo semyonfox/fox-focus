@@ -310,6 +310,14 @@ type ServerSnapshot = { revision: number; data: PrototypeData };
 type CompletionUndo = { taskId: string; state: ActiveTaskState; reminder?: Reminder };
 type ReviewUndo = { itemId: string; status: InboxStatus };
 
+function urlBase64ToArrayBuffer(value: string): ArrayBuffer {
+  const padding = "=".repeat((4 - value.length % 4) % 4);
+  const decoded = window.atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+  return bytes.buffer;
+}
+
 const allTaskSources = "__all_task_sources__";
 const localTaskSource = "__local_task_source__";
 const allTaskCategories = "__all_task_categories__";
@@ -357,6 +365,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(() =>
     typeof window !== "undefined" && "Notification" in window ? Notification.permission : "unsupported",
   );
+  const [pushSupported, setPushSupported] = useState<boolean | null>(null);
+  const [pushSubscribed, setPushSubscribed] = useState(false);
+  const serviceWorkerRegistration = useRef<ServiceWorkerRegistration | null>(null);
   const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
   const [showIntegrations, setShowIntegrations] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("integration"));
@@ -446,6 +457,29 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [isOverlayOpen]);
 
   useEffect(() => {
+    if (!("Notification" in window)) {
+      setPushSupported(false);
+      setNotificationPermission("unsupported");
+      return;
+    }
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+      setPushSupported(false);
+      return;
+    }
+    let active = true;
+    void navigator.serviceWorker.register("/sw.js").then(async (registration) => {
+      if (!active) return;
+      serviceWorkerRegistration.current = registration;
+      setPushSupported(true);
+      setNotificationPermission(Notification.permission);
+      setPushSubscribed(Boolean(await registration.pushManager.getSubscription()));
+    }).catch(() => {
+      if (active) setPushSupported(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
     let timeout: number | undefined;
     const scheduleNext = () => {
       if (timeout !== undefined) window.clearTimeout(timeout);
@@ -461,20 +495,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           scheduleNext();
           return;
         }
-        const firedAt = new Date().toISOString();
-        setData((current) => ({
-          ...current,
-          reminders: current.reminders.map((reminder) => reminder.id === nextReminder.id && !reminder.firedAt
-            ? { ...reminder, firedAt }
-            : reminder),
-        }));
         setActiveReminderId(nextReminder.id);
-        if ("Notification" in window && Notification.permission === "granted") {
+        let showedNotification = false;
+        if (!pushSubscribed && "Notification" in window && Notification.permission === "granted") {
           try {
             new Notification(nextReminder.title, { body: nextReminder.when, tag: nextReminder.id });
+            showedNotification = true;
           } catch {
             // the in-app reminder still fires if the browser notification fails
           }
+        }
+        if (showedNotification) {
+          const firedAt = new Date().toISOString();
+          setData((current) => ({
+            ...current,
+            reminders: current.reminders.map((reminder) => reminder.id === nextReminder.id && !reminder.firedAt
+              ? { ...reminder, firedAt }
+              : reminder),
+          }));
         }
       }, Math.min(fireTime - now, 6 * 60 * 60 * 1000));
     };
@@ -485,7 +523,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (timeout !== undefined) window.clearTimeout(timeout);
       window.clearInterval(interval);
     };
-  }, [data.reminders]);
+  }, [data.reminders, pushSubscribed]);
 
   const resolvedTheme: ResolvedTheme = themeMode === "system" ? systemTheme : themeMode;
 
@@ -1158,21 +1196,75 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   async function requestNotificationPermission() {
     if (!("Notification" in window)) {
       setNotificationPermission("unsupported");
+      setPushSupported(false);
       return;
     }
     try {
-      setNotificationPermission(await Notification.requestPermission());
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      if (permission !== "granted") return;
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+        setPushSupported(false);
+        return;
+      }
+      const registration = serviceWorkerRegistration.current ?? await navigator.serviceWorker.register("/sw.js");
+      serviceWorkerRegistration.current = registration;
+      const keyResponse = await fetch("/api/v1/push/public-key");
+      if (!keyResponse.ok) throw new Error("Could not load the notification key");
+      const keyBody: unknown = await keyResponse.json();
+      if (!isRecord(keyBody) || typeof keyBody.publicKey !== "string") throw new Error("Invalid notification key");
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToArrayBuffer(keyBody.publicKey),
+      });
+      const response = await fetch("/api/v1/push/subscriptions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(subscription.toJSON()),
+      });
+      if (!response.ok) {
+        await subscription.unsubscribe();
+        throw new Error("Could not save this browser subscription");
+      }
+      setPushSupported(true);
+      setPushSubscribed(true);
     } catch {
       setNotificationPermission(Notification.permission);
+      setStatusMessage("Could not enable device notifications.");
+    }
+  }
+
+  async function turnOffDeviceNotifications() {
+    const subscription = await serviceWorkerRegistration.current?.pushManager.getSubscription();
+    if (!subscription) {
+      setPushSubscribed(false);
+      return;
+    }
+    const endpoint = subscription.endpoint;
+    const unsubscribed = await subscription.unsubscribe();
+    if (!unsubscribed) {
+      setStatusMessage("Could not turn off device notifications.");
+      return;
+    }
+    setPushSubscribed(false);
+    try {
+      const response = await fetch("/api/v1/push/subscriptions", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint }),
+      });
+      if (!response.ok) throw new Error("Delete failed");
+    } catch {
+      setStatusMessage("Notifications are off here. The server will remove the old subscription later.");
     }
   }
 
   const themeTarget = resolvedTheme === "black" ? "light" : "dark";
-  const notificationStatus = notificationPermission === "granted"
-    ? "Device notifications on"
-    : notificationPermission === "denied"
+  const notificationStatus = pushSubscribed
+    ? "Device notifications on for this browser"
+      : notificationPermission === "denied"
       ? "Blocked in browser settings"
-      : notificationPermission === "unsupported"
+      : notificationPermission === "unsupported" || pushSupported === false
         ? "Not supported in this browser"
         : null;
 
@@ -1512,12 +1604,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
       {showReminderTray ? (
         <DialogFrame title="Reminders" onClose={() => setShowReminderTray(false)} className="editor-dialog--tray">
-          <div className="editor-heading"><div className="composer-icon"><Bell size={17} /></div><div><p className="eyebrow">While this tab is open</p><h2>Reminders</h2></div><button className="close-composer" type="button" onClick={() => setShowReminderTray(false)} aria-label="Close reminders"><X size={17} /></button></div>
+          <div className="editor-heading"><div className="composer-icon"><Bell size={17} /></div><div><p className="eyebrow">On this device</p><h2>Reminders</h2></div><button className="close-composer" type="button" onClick={() => setShowReminderTray(false)} aria-label="Close reminders"><X size={17} /></button></div>
           <div className="reminder-list">
             {data.reminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.firedAt ? "fired" : reminder.fireAt ? "scheduled" : "needs a planned time"}</small></span></div>)}
             {!data.reminders.length ? <p className="empty-line">No local reminders yet.</p> : null}
           </div>
-          <div className="editor-footer"><span>Notifications fire while Fox Focus is open in a tab. Nothing is delivered when it is closed.</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}<button className="secondary-action" type="button" disabled={notificationPermission !== "default"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button><button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
+          <div className="editor-footer"><span>{pushSubscribed ? "Notifications can arrive when Fox Focus is closed." : "In-tab reminders still work while Fox Focus is open."}</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}{pushSubscribed ? <button className="mini-action" type="button" onClick={() => void turnOffDeviceNotifications()}>Turn off</button> : <button className="secondary-action" type="button" disabled={notificationPermission === "denied" || notificationPermission === "unsupported"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button>}<button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
         </DialogFrame>
       ) : null}
 

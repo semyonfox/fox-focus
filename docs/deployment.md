@@ -60,6 +60,12 @@ Back up a running database with SQLite's online backup API or `VACUUM INTO`. Val
 
 Before a destructive restore or a volume deletion, stop the container and make a verified copy. `docker compose down -v` deletes the workspace volume and the generated password.
 
+## Push notification keys
+
+The first startup creates `/data/vapid.json` with mode `0600`. Keep this file in the data volume and back it up with the SQLite workspace. Restoring the database without the same VAPID keys invalidates existing browser subscriptions.
+
+On iPhone and iPad, add Fox Focus to the Home Screen before enabling device notifications. iOS does not offer Web Push permission to a regular browser tab.
+
 ## Deployment checks
 
 After deploying a new image, check the container health endpoint locally and verify that anonymous requests to the workspace API receive `401`. Then sign in normally and make a small local edit to confirm the data volume is still mounted.

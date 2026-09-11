@@ -139,3 +139,21 @@ test('integration routes keep browser OAuth callbacks authenticated and expose n
     assert.deepEqual(await sync.json(), { outcome: 'synced', recordCount: 2 });
   } finally { store.close(); }
 });
+
+test('push subscription API accepts valid subscriptions and rejects non-HTTPS endpoints', async () => {
+  const store = openStore(':memory:');
+  try {
+    const app = createApp(store, password, undefined, undefined, 'test-public-key');
+    const request = (body: unknown) => app.request('/api/v1/push/subscriptions', {
+      method: 'POST',
+      headers: { authorization, 'Content-Type': 'application/json', 'User-Agent': 'test-browser' },
+      body: JSON.stringify(body),
+    });
+    const valid = { endpoint: 'https://push.example.test/subscription/1', keys: { p256dh: 'public-key', auth: 'auth-secret' } };
+    assert.equal((await request(valid)).status, 201);
+    assert.equal(store.listPushSubscriptions().length, 1);
+    assert.equal(store.listPushSubscriptions()[0].userAgent, 'test-browser');
+    assert.equal((await request({ ...valid, endpoint: 'http://push.example.test/insecure' })).status, 400);
+    assert.equal(store.listPushSubscriptions().length, 1);
+  } finally { store.close(); }
+});

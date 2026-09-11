@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createInitialData, isPrototypeData, type PrototypeData } from '../src/model.ts';
+import { isPushSubscription, type StoredPushSubscription } from './push.ts';
 
 export type Snapshot = { revision: number; data: PrototypeData };
 export type Provider = 'google' | 'microsoft';
@@ -62,6 +63,12 @@ export type SyncSummary = {
   completedAt: string | null;
   recordCount: number;
   lastError: string | null;
+};
+
+export type PushSubscriptionRecord = {
+  subscription: StoredPushSubscription;
+  userAgent: string | null;
+  createdAt: string;
 };
 
 const providers = new Set<Provider>(['google', 'microsoft']);
@@ -222,6 +229,12 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       completed_at TEXT,
       record_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT
+    );
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint TEXT PRIMARY KEY,
+      subscription_json TEXT NOT NULL CHECK(json_valid(subscription_json)),
+      user_agent TEXT,
+      created_at TEXT NOT NULL
     );`);
   // A short-lived development build used the initial provider table without
   // date-only all-day columns. Keep that private SQLite shape upgrade-safe.
@@ -430,6 +443,34 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     });
   }
 
+  function savePushSubscription(subscription: StoredPushSubscription, userAgent: string | null): void {
+    db.prepare(`INSERT INTO push_subscriptions (endpoint, subscription_json, user_agent, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(endpoint) DO UPDATE SET
+        subscription_json=excluded.subscription_json, user_agent=excluded.user_agent`)
+      .run(subscription.endpoint, JSON.stringify(subscription), userAgent, new Date().toISOString());
+  }
+
+  function listPushSubscriptions(): PushSubscriptionRecord[] {
+    const rows = db.prepare(`SELECT subscription_json, user_agent, created_at
+      FROM push_subscriptions ORDER BY created_at`).all() as Record<string, unknown>[];
+    return rows.flatMap(row => {
+      if (typeof row.subscription_json !== 'string' || typeof row.created_at !== 'string') return [];
+      try {
+        const subscription: unknown = JSON.parse(row.subscription_json);
+        return isPushSubscription(subscription)
+          ? [{ subscription, userAgent: stringOrNull(row.user_agent), createdAt: row.created_at }]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  function deletePushSubscription(endpoint: string): boolean {
+    return db.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').run(endpoint).changes === 1;
+  }
+
   return {
     read,
     save,
@@ -444,6 +485,9 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     replaceProviderRecords,
     clearProviderRecords,
     listProviderRecords,
+    savePushSubscription,
+    listPushSubscriptions,
+    deletePushSubscription,
     close: () => db.close(),
   };
 }
