@@ -21,6 +21,28 @@ To show a Hermes Personal Tasks board, mount that board directory read-only and 
 
 Visible list buttons switch directly between individual lists, including empty lists. My Tasks opens by default when present. Switching lists clears the search so items are not accidentally hidden. It does not copy Hermes records into local editable tasks. The Personal Tasks board remains canonical. Running without the mount simply leaves the Hermes panel unavailable.
 
+## Google and Microsoft are optional and read-only
+
+Provider OAuth is disabled unless `APP_BASE_URL`, an owner-only token-encryption
+key file, and at least one provider client file are mounted into the runtime.
+Do not put those files in this repository, an image layer, a Compose file, or a
+Docker environment variable. `compose.yaml` binds each named host file
+read-only at a fixed container path, so the application never receives a whole
+Hermes credential directory.
+
+The exact Google/Entra registration and private environment shape are in
+[Google and Microsoft connections](integrations.md). The production callback
+host must be the canonical HTTPS URL; never derive it from a request Host
+header. Reuse an OAuth client registration only if it is a Web client with the
+exact Fox Focus callback registered. Hermes refresh tokens are neither mounted
+nor reused.
+
+Connected providers poll every 15 minutes. The worker only makes provider
+reads: a rolling calendar-context window and task-list snapshots. It does not
+use public webhooks or perform calendar/task mutations. A refresh-token failure
+marks that provider as requiring reconnection without touching local workspace
+data or another provider connection.
+
 ## SQLite and backups
 
 The workspace opens SQLite with WAL mode, full synchronous writes, and a five-second busy timeout. WAL mode lets readers continue during short writes, but it does not make SQLite a multi-writer database. Keep one app replica and keep the database, `-wal`, and `-shm` files on local disk. Do not use an NFS or SMB share for the live database.

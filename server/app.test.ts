@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from './app.ts';
+import type { IntegrationService } from './integrations.ts';
 import { openStore } from './store.ts';
 import type { PrototypeData } from '../src/model.ts';
 
@@ -91,4 +92,50 @@ test('SQLite keeps edits across restart and preserves task/event transaction', (
     assert.equal(store.read().data.events.find(event => event.id === 'test-block')?.date, '2026-09-11');
     assert.equal(store.save(0, snapshot.data), null);
   } finally { store.close(); rmSync(dir, { recursive: true }); }
+});
+
+test('integration routes keep browser OAuth callbacks authenticated and expose no token material', async () => {
+  const store = openStore(':memory:');
+  let callbackQuery = '';
+  const integrations: IntegrationService = {
+    overview: () => ({
+      providers: [
+        {
+          provider: 'google', displayName: 'Google', configured: true, connection: null,
+          sync: { provider: 'google', state: 'idle', startedAt: null, completedAt: null, recordCount: 0, lastError: null },
+          calendarEventCount: 0, taskCount: 0,
+        },
+        {
+          provider: 'microsoft', displayName: 'Microsoft', configured: false, connection: null,
+          sync: { provider: 'microsoft', state: 'idle', startedAt: null, completedAt: null, recordCount: 0, lastError: null },
+          calendarEventCount: 0, taskCount: 0,
+        },
+      ], records: [],
+    }),
+    startAuthorization: provider => provider === 'google' ? 'https://accounts.example.test/authorize?state=opaque' : null,
+    completeAuthorization: async (_provider, search) => {
+      callbackQuery = search.toString();
+      return { outcome: 'connected', notice: 'Connected.' };
+    },
+    sync: async () => ({ outcome: 'synced', recordCount: 2 }),
+    syncConnected: async () => {},
+  };
+  try {
+    const app = createApp(store, password, undefined, integrations);
+    assert.equal((await app.request('/api/v1/integrations')).status, 401);
+    const overview = await app.request('/api/v1/integrations', { headers: { authorization } });
+    assert.equal(overview.status, 200);
+    assert.ok(!JSON.stringify(await overview.json()).includes('token'));
+    const connect = await app.request('/api/v1/integrations/google/connect', { headers: { authorization }, redirect: 'manual' });
+    assert.equal(connect.status, 302);
+    assert.equal(connect.headers.get('location'), 'https://accounts.example.test/authorize?state=opaque');
+    assert.equal((await app.request('/api/v1/integrations/microsoft/connect', { headers: { authorization } })).status, 404);
+    const callback = await app.request('/api/v1/integrations/google/callback?state=opaque&code=one-time', { headers: { authorization }, redirect: 'manual' });
+    assert.equal(callback.status, 303);
+    assert.equal(callback.headers.get('location'), '/?integration=google&result=connected');
+    assert.equal(callbackQuery, 'state=opaque&code=one-time');
+    const sync = await app.request('/api/v1/integrations/google/sync', { method: 'POST', headers: { authorization } });
+    assert.equal(sync.status, 200);
+    assert.deepEqual(await sync.json(), { outcome: 'synced', recordCount: 2 });
+  } finally { store.close(); }
 });
