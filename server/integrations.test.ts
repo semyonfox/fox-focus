@@ -108,14 +108,18 @@ test('a successful rolling snapshot removes provider records that are no longer 
   }
 });
 
-test('provider overview keeps tasks when calendar records fill the per-kind limit', () => {
+test('provider overview keeps ordinary-sized task collections when calendar records fill the other limit', () => {
   const store = openStore(':memory:');
   try {
     const events = Array.from({ length: 300 }, (_, index) => ({
       ...importedGoogleEvent(`Event ${index}`),
       externalId: `event-${index}`,
     }));
-    store.replaceProviderRecords('google', [...events, importedGoogleTask('Task after 300 events')]);
+    const tasks = Array.from({ length: 350 }, (_, index) => ({
+      ...importedGoogleTask(`Task ${index}`),
+      externalId: `task-${index}`,
+    }));
+    store.replaceProviderRecords('google', [...events, ...tasks]);
 
     const overview = createIntegrationService(store, {
       appBaseUrl: 'https://focus.example.test',
@@ -123,7 +127,7 @@ test('provider overview keeps tasks when calendar records fill the per-kind limi
       providers: {},
     }).overview();
     assert.equal(overview.records.filter(record => record.kind === 'calendar_event').length, 300);
-    assert.deepEqual(overview.records.filter(record => record.kind === 'task').map(record => record.title), ['Task after 300 events']);
+    assert.equal(overview.records.filter(record => record.kind === 'task').length, 350);
   } finally {
     store.close();
   }

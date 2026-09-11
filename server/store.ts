@@ -454,7 +454,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     }
   }
 
-  function listProviderRecords(limit = 300): StoredRecord[] {
+  function listProviderRecords(limit = 1000): StoredRecord[] {
     const safeLimit = Math.max(1, Math.min(limit, 1000));
     const query = db.prepare(`SELECT id, provider, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_url,
