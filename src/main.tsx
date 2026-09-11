@@ -591,6 +591,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function selectCalendarDate(date: string) {
     setSelectedDate(date);
+    setCalendarAnchor(date);
     setCalendarMode("day");
     setSelectedEventId(null);
   }
@@ -622,7 +623,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (!nextDate) return;
     event.preventDefault();
     selectCalendarDate(nextDate);
-    window.requestAnimationFrame(() => calendarTabRefs.current[nextIndex]?.focus({ preventScroll: true }));
+    window.requestAnimationFrame(() => calendarTabRefs.current[3]?.focus({ preventScroll: true }));
   }
 
   function openTaskComposer(task?: Task, inboxItem?: InboxItem) {
