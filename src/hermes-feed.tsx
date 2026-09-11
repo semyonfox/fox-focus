@@ -6,6 +6,8 @@ export const hermesLabels: Record<HermesStatus, string> = {
   running: 'In progress', blocked: 'Blocked', review: 'Needs review', done: 'Completed',
 };
 
+const allListsTab = "__all_lists__";
+
 export function useHermesFeed(enabled: boolean) {
   const [feed, setFeed] = useState<HermesFeed | null>(null);
   const [failed, setFailed] = useState(false);
@@ -38,17 +40,28 @@ export function HermesTaskList({ feed, embedded = false }: { feed: HermesFeed; e
   const [query, setQuery] = useState('');
   const [showCompleted, setShowCompleted] = useState(false);
   const [limit, setLimit] = useState(25);
-  const [list, setList] = useState('');
+  const [list, setList] = useState(allListsTab);
   if (feed.state !== 'connected') return <p>Hermes is unavailable.</p>;
-  const activeList = feed.board.lists.includes(list) ? list : feed.board.lists.includes('My Tasks') ? 'My Tasks' : feed.board.lists[0] ?? '';
+  const activeList = list === allListsTab || !feed.board.lists.includes(list) ? allListsTab : list;
   const tasks = feed.board.tasks.filter(task => (showCompleted || task.status !== 'done') &&
-    task.list === activeList &&
+    (activeList === allListsTab || task.list === activeList) &&
     task.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
   const groups = feed.board.lists;
-  const ordered = groups.flatMap(name => tasks.filter(task => task.list === name));
-  const visible = ordered.slice(0, limit);
+  const visible = tasks.slice(0, limit);
+  const checkedAt = new Intl.DateTimeFormat('en-IE', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: 'Europe/Dublin',
+  }).format(new Date(feed.checkedAt));
   return <div className={embedded ? 'hermes-task-list hermes-task-list--embedded' : 'hermes-task-list'}>
+    <div className="hermes-source-note">
+      <span>Read-only · from Hermes</span>
+      <time dateTime={feed.checkedAt}>Checked {checkedAt}</time>
+    </div>
     <nav className="hermes-list-tabs" aria-label="Task lists">
+      <button className={`filter-chip${activeList === allListsTab ? ' filter-chip--active' : ''}`} type="button" aria-pressed={activeList === allListsTab} onClick={() => { setList(allListsTab); setQuery(''); setLimit(25); }}>
+        <span>All</span><span className="hermes-list-count">{feed.board.tasks.filter(task => showCompleted || task.status !== 'done').length}</span>
+      </button>
       {groups.map(name => <button className={`filter-chip${activeList === name ? ' filter-chip--active' : ''}`} type="button" key={name} aria-pressed={activeList === name} onClick={() => { setList(name); setQuery(''); setLimit(25); }}>
         <span>{name}</span><span className="hermes-list-count">{feed.board.tasks.filter(task => task.list === name && (showCompleted || task.status !== 'done')).length}</span>
       </button>)}
@@ -57,19 +70,13 @@ export function HermesTaskList({ feed, embedded = false }: { feed: HermesFeed; e
       <label className="field"><span>Find a task</span><input type="search" value={query} onChange={event => { setQuery(event.target.value); setLimit(25); }} placeholder="Search task titles" /></label>
       <label className="hermes-completed"><input type="checkbox" checked={showCompleted} onChange={event => { setShowCompleted(event.target.checked); setLimit(25); }} /> Include completed</label>
     </div>
-    <p className="hermes-meta" role="status">{activeList} · {tasks.length} {query ? 'matching ' : ''}tasks</p>
+    <p className="hermes-meta" role="status">{activeList === allListsTab ? 'All lists' : activeList} · {tasks.length} {query ? 'matching ' : ''}tasks</p>
     <div className="hermes-feed hermes-feed--live">
-      {groups.map(name => {
-        const group = visible.filter(task => task.list === name);
-        return group.length ? <section key={name} aria-label={name}>
-          <h3>{name}</h3>
-          {group.map(task => <article key={task.id}>
-            <strong>{task.title}</strong>
-            <p>{hermesLabels[task.status]} · {task.owner === 'human' ? 'For you' : task.owner === 'agent' ? 'Assigned to an agent' : 'Unassigned'} · {task.priority !== 0 ? `Priority ${task.priority}` : 'Default priority'}</p>
-            {task.parentTitle && <p>Part of: {task.parentTitle}</p>}
-          </article>)}
-        </section> : null;
-      })}
+      {visible.map(task => <article key={task.id}>
+        <strong>{task.title}</strong>
+        <p>{activeList === allListsTab ? `${task.list} · ` : ''}{hermesLabels[task.status]} · {task.owner === 'human' ? 'For you' : task.owner === 'agent' ? 'Assigned to an agent' : 'Unassigned'} · {task.priority !== 0 ? `Priority ${task.priority}` : 'Default priority'}</p>
+        {task.parentTitle && <p>Part of: {task.parentTitle}</p>}
+      </article>)}
       {!tasks.length ? <p>No tasks match this view.</p> : null}
     </div>
     {tasks.length > limit ? <button className="secondary-action" type="button" onClick={() => setLimit(current => current + 25)}>Show 25 more</button> : null}

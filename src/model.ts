@@ -3,7 +3,7 @@ export type Priority = "high" | "medium" | "low";
 export type TaskState = "up-next" | "scheduled" | "waiting" | "done";
 export type ActiveTaskState = Exclude<TaskState, "done">;
 export type InboxStatus = "new" | "draft-ready" | "waiting-on-agent";
-export type ThemeMode = "system" | "graphite" | "black";
+export type ThemeMode = "system" | "light" | "black";
 export type ResolvedTheme = Exclude<ThemeMode, "system">;
 export type SectionAnchor = "today" | "agenda" | "tasks" | "review" | "signals";
 export type TaskOrigin = "manual" | "inbox";
@@ -12,8 +12,8 @@ export type ReminderMode = "none" | "one-hour" | "morning";
 export type ActiveReminderMode = Exclude<ReminderMode, "none">;
 export type ReminderState = "scheduled" | "snoozed";
 export type InboxDestination = "task" | "event";
-export type TaskFilter = "all" | "today" | "waiting";
-export type TaskSort = "priority" | "deadline" | "area";
+export type TaskFilter = "all" | "due-today" | "planned" | "waiting" | "done";
+export type TaskSort = "due" | "created";
 
 export type Task = {
   id: string;
@@ -28,6 +28,8 @@ export type Task = {
   linkedEventId?: string;
   origin: TaskOrigin;
   source?: string;
+  /** Creation instant for ordering; omitted on legacy workspace records. */
+  createdAt?: string;
 };
 
 export type TimelineEvent = {
@@ -109,8 +111,8 @@ export const taskOrigins = ["manual", "inbox"] as const;
 export const reminderModes = ["none", "one-hour", "morning"] as const;
 export const activeReminderModes = ["one-hour", "morning"] as const;
 export const reminderStates = ["scheduled", "snoozed"] as const;
-export const taskFilters = ["all", "today", "waiting"] as const;
-export const taskSorts = ["priority", "deadline", "area"] as const;
+export const taskFilters = ["all", "due-today", "planned", "waiting", "done"] as const;
+export const taskSorts = ["due", "created"] as const;
 export const storageKey = "fox-focus-prototype-v2";
 
 export const defaultTaskDraft: TaskDraft = {
@@ -141,6 +143,18 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const isoInstantPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function isIsoInstant(value: unknown): value is string {
+  if (typeof value !== "string" || !isoInstantPattern.test(value) || !Number.isFinite(Date.parse(value))) return false;
+  const [, year, month, day] = value.match(/^(\d{4})-(\d{2})-(\d{2})T/) ?? [];
+  if (!year || !month || !day) return false;
+  const calendarDate = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return calendarDate.getUTCFullYear() === Number(year) &&
+    calendarDate.getUTCMonth() === Number(month) - 1 &&
+    calendarDate.getUTCDate() === Number(day);
+}
+
 export function isTask(value: unknown): value is Task {
   if (!isRecord(value)) return false;
 
@@ -156,8 +170,34 @@ export function isTask(value: unknown): value is Task {
     (value.scheduledTime === null || typeof value.scheduledTime === "string") &&
     (value.linkedEventId === undefined || typeof value.linkedEventId === "string") &&
     isOneOf(value.origin, taskOrigins) &&
-    (value.source === undefined || typeof value.source === "string")
+    (value.source === undefined || typeof value.source === "string") &&
+    (value.createdAt === undefined || isIsoInstant(value.createdAt))
   );
+}
+
+const dueOrdering: Record<string, number> = {
+  Today: 0,
+  Tomorrow: 1,
+  Friday: 2,
+  Waiting: 4,
+  "No deadline": 5,
+};
+
+/** Keeps the existing human-readable deadline ordering used by the task UI. */
+export function taskDueWeight(due: string): number {
+  return dueOrdering[due] ?? 3;
+}
+
+/** Sorts earlier/current deadlines first, with task ID as a stable tie-breaker. */
+export function compareTasksByDue(first: Task, second: Task): number {
+  return taskDueWeight(first.due) - taskDueWeight(second.due) || first.id.localeCompare(second.id);
+}
+
+/** Sorts newest tasks first; legacy tasks without timestamps sort after timestamped ones. */
+export function compareTasksByCreatedAt(first: Task, second: Task): number {
+  const firstTime = first.createdAt === undefined ? Number.NEGATIVE_INFINITY : Date.parse(first.createdAt);
+  const secondTime = second.createdAt === undefined ? Number.NEGATIVE_INFINITY : Date.parse(second.createdAt);
+  return secondTime - firstTime || first.id.localeCompare(second.id);
 }
 
 export function isTimelineEvent(value: unknown): value is TimelineEvent {
