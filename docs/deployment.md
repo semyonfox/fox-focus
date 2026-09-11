@@ -8,7 +8,7 @@ Use the Docker quick start in the [README](../README.md) for a clean local insta
 
 For an internet-facing installation, keep port 8789 on loopback or a private network. Put a TLS reverse proxy, Tailscale, or another private access layer in front of it. Do not publish the container port directly to the public internet.
 
-The first startup creates a random password at `/data/workspace-password` with mode `0600`. Sign in with the fixed username `fox`. This is a temporary single-user privacy gate, not account management. The homepage and workspace API use the same credentials.
+The first startup creates a random password at `/data/workspace-password` with mode `0600`. Sign in with the fixed username `fox`. To choose your own password, overwrite that file (at least 8 characters) and restart the container. This is a temporary single-user privacy gate, not account management. The homepage and workspace API use the same credentials.
 
 - `/` is the password-protected workspace.
 - `/app` redirects to `/` for older bookmarks.

@@ -31,7 +31,7 @@ export function createApp(
   hermes?: () => HermesFeed,
   integrations?: IntegrationService,
 ) {
-  if (password.length < 24) throw new Error('Workspace password must have at least 24 characters');
+  if (password.length < 8) throw new Error('Workspace password must have at least 8 characters');
   const app = new Hono();
   app.use('*', secureHeaders());
   const auth = basicAuth({ username: 'fox', password, realm: 'Fox Focus workspace' });
