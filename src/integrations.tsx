@@ -1,7 +1,7 @@
 import { CalendarDays, CheckCircle2, CircleAlert, Link2, ListTodo, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { dublinDateKey, isDateKey } from './calendar-time.ts';
-import { areaForList, filterCalendarContextByDateRange } from './integration-model.ts';
+import { areaForList, filterCalendarContextByDateRange, listAreaKey } from './integration-model.ts';
 import { areas, isOneOf, type Area } from './model.ts';
 
 export type Provider = 'google' | 'microsoft';
@@ -29,6 +29,7 @@ export type ImportedRecord = {
   id: number;
   provider: Provider;
   kind: 'calendar_event' | 'task';
+  containerId: string;
   containerName: string;
   title: string;
   status: string | null;
@@ -75,7 +76,7 @@ function isProviderStatus(value: unknown): value is ProviderStatus {
 function isImportedRecord(value: unknown): value is ImportedRecord {
   return isRecord(value) && typeof value.id === 'number' && Number.isSafeInteger(value.id) &&
     isProvider(value.provider) && (value.kind === 'calendar_event' || value.kind === 'task') &&
-    typeof value.containerName === 'string' && typeof value.title === 'string' &&
+    typeof value.containerId === 'string' && typeof value.containerName === 'string' && typeof value.title === 'string' &&
     (value.status === null || typeof value.status === 'string') &&
     (value.startsAt === null || typeof value.startsAt === 'string') &&
     (value.startsOn === null || typeof value.startsOn === 'string') &&
@@ -183,16 +184,17 @@ export function IntegrationsDrawer({
   const events = records.filter(record => record.kind === 'calendar_event');
   const tasks = records.filter(record => record.kind === 'task');
   const taskLists = [...tasks.reduce((lists, task) => {
-    const key = `${task.provider}:${task.containerName}`;
+    const key = listAreaKey(task.provider, task.containerId);
     const existing = lists.get(key);
     lists.set(key, existing ? { ...existing, count: existing.count + 1 } : {
       key,
       provider: task.provider,
+      containerId: task.containerId,
       name: task.containerName,
       count: 1,
     });
     return lists;
-  }, new Map<string, { key: string; provider: Provider; name: string; count: number }>()).values()];
+  }, new Map<string, { key: string; provider: Provider; containerId: string; name: string; count: number }>()).values()];
 
   return (
     <div className="overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -229,7 +231,7 @@ export function IntegrationsDrawer({
           <div><ListTodo size={15} /><strong>Task lists</strong></div>
           {taskLists.map(list => <article className="integration-record" key={list.key}>
             <span><strong>{list.name}</strong><small>{providerLabel(list.provider)} · {list.count} {list.count === 1 ? 'task' : 'tasks'}</small></span>
-            <label className="field"><span className="visually-hidden">Area for {providerLabel(list.provider)} {list.name}</span><select value={areaForList(listAreas, list.provider, list.name)} onChange={(event) => { const area = event.target.value; if (isOneOf(area, areas)) onListAreaChange(list.key, area); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
+            <label className="field"><span className="visually-hidden">Area for {providerLabel(list.provider)} {list.name}</span><select value={areaForList(listAreas, list.provider, list.containerId, list.name)} onChange={(event) => { const area = event.target.value; if (isOneOf(area, areas)) onListAreaChange(list.key, area); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
           </article>)}
         </div> : null}
         <div className="integration-records">

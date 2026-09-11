@@ -39,9 +39,16 @@ jobs:
               "integrations.ts",
               "oauth.ts",
               "providers.ts",
+              "push.ts",
               "store.ts",
             ]);
-            assert.ok(Object.values(createInitialData()).every(items => Array.isArray(items) && items.length === 0));
+            assert.deepEqual(createInitialData(), {
+              tasks: [],
+              events: [],
+              inboxItems: [],
+              reminders: [],
+              listAreas: {},
+            });
           '
           docker run --detach --name fox-focus-check --network none fox-focus:test
           trap 'docker rm --force fox-focus-check >/dev/null' EXIT

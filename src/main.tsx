@@ -330,8 +330,8 @@ function hermesSourceId(source: string): string {
   return `hermes:${source}`;
 }
 
-function importedSourceId(provider: string, name: string): string {
-  return `imported:${provider}:${name}`;
+function importedSourceId(provider: string, containerId: string): string {
+  return `imported:${provider}:${containerId}`;
 }
 
 function App({ initial }: { initial?: ServerSnapshot }) {
@@ -598,10 +598,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const hermesSources = hermesBoard?.sources ?? [];
   const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
   const importedLists = [...importedTasks.reduce((lists, task) => {
-    const id = importedSourceId(task.provider, task.containerName);
-    if (!lists.has(id)) lists.set(id, { id, provider: task.provider, name: task.containerName });
+    const id = importedSourceId(task.provider, task.containerId);
+    if (!lists.has(id)) lists.set(id, { id, provider: task.provider, containerId: task.containerId, name: task.containerName });
     return lists;
-  }, new Map<string, { id: string; provider: ImportedRecord["provider"]; name: string }>()).values()];
+  }, new Map<string, { id: string; provider: ImportedRecord["provider"]; containerId: string; name: string }>()).values()];
   const categoryLocalTasks = taskCategory === allTaskCategories
     ? data.tasks
     : taskCategory === unclassifiedTaskCategory
@@ -614,7 +614,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     ? importedTasks
     : taskCategory === unclassifiedTaskCategory
       ? []
-      : importedTasks.filter((task) => areaForList(data.listAreas, task.provider, task.containerName) === taskCategory);
+      : importedTasks.filter((task) => areaForList(data.listAreas, task.provider, task.containerId, task.containerName) === taskCategory);
   const taskCategoryOptions: Array<{ id: TaskCategory; label: string }> = [
     { id: allTaskCategories, label: "All" },
     ...areas.map((area) => ({ id: area, label: area })),
@@ -665,7 +665,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     ...importedLists.map((list) => ({
       id: list.id,
       label: `${providerLabel(list.provider)} · ${list.name}`,
-      count: visibleImportedTasks.filter((task) => importedSourceId(task.provider, task.containerName) === list.id).length,
+      count: visibleImportedTasks.filter((task) => importedSourceId(task.provider, task.containerId) === list.id).length,
     })),
   ];
   const isHermesOnlyScope = taskSource.startsWith("hermes:");
@@ -679,7 +679,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const shownImportedTasks = taskSource === allTaskSources
     ? visibleImportedTasks
     : taskSource.startsWith("imported:")
-      ? visibleImportedTasks.filter((task) => importedSourceId(task.provider, task.containerName) === taskSource)
+      ? visibleImportedTasks.filter((task) => importedSourceId(task.provider, task.containerId) === taskSource)
       : [];
 
   const reminderCount = data.reminders.length;
@@ -1415,7 +1415,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`} tabIndex={0}>
               {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)}
               {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} />)}
-              {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerName)} />)}
+              {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
               {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "Nothing completed yet" : "Nothing here"}</strong><p>{taskFilter === "done" ? "Completed tasks will show up here." : "Try another category or add a task."}</p></div> : null}
             </div>
           </article>

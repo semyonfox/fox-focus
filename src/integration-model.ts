@@ -5,16 +5,25 @@ const areaKeywords: Array<[Area, readonly string[]]> = [
   ['University', ['university', 'uni', 'college', 'study', 'exam', 'lecture']],
   ['Work', ['work', 'job', 'office', 'client']],
   ['Health', ['health', 'gym', 'fitness', 'doctor']],
-  ['Admin', ['admin', 'bills', 'errand', 'finance', 'tax']],
+  ['Admin', ['admin', 'bill', 'bills', 'errand', 'errands', 'finance', 'tax']],
 ];
 
 export function defaultAreaForList(name: string): Area {
-  const normalized = name.toLocaleLowerCase();
-  return areaKeywords.find(([, keywords]) => keywords.some(keyword => normalized.includes(keyword)))?.[0] ?? 'Personal';
+  const words = new Set(name.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+  return areaKeywords.find(([, keywords]) => keywords.some(keyword => words.has(keyword)))?.[0] ?? 'Personal';
 }
 
-export function areaForList(listAreas: Record<string, Area> | undefined, provider: string, name: string): Area {
-  return listAreas?.[`${provider}:${name}`] ?? defaultAreaForList(name);
+export function listAreaKey(provider: string, containerId: string): string {
+  return `${provider}:id:${containerId}`;
+}
+
+export function areaForList(
+  listAreas: Record<string, Area> | undefined,
+  provider: string,
+  containerId: string,
+  name: string,
+): Area {
+  return listAreas?.[listAreaKey(provider, containerId)] ?? listAreas?.[`${provider}:${name}`] ?? defaultAreaForList(name);
 }
 
 export type CalendarContextItem = {

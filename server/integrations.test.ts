@@ -35,6 +35,20 @@ function importedGoogleEvent(title = 'Imported event') {
   };
 }
 
+function importedGoogleTask(title = 'Imported task') {
+  return {
+    ...importedGoogleEvent(title),
+    kind: 'task' as const,
+    containerId: 'task-list',
+    containerName: 'Tasks',
+    externalId: 'task-1',
+    status: 'needsAction',
+    startsAt: null,
+    endsAt: null,
+    dueOn: '2026-09-14',
+  };
+}
+
 test('runtime configuration accepts mounted files and rejects credential environment variables', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fox-focus-oauth-config-'));
   const googleFile = join(dir, 'google.json');
@@ -89,6 +103,27 @@ test('a successful rolling snapshot removes provider records that are no longer 
     assert.equal(store.listProviderRecords().length, 1);
     store.replaceProviderRecords('google', []);
     assert.deepEqual(store.listProviderRecords(), []);
+  } finally {
+    store.close();
+  }
+});
+
+test('provider overview keeps tasks when calendar records fill the per-kind limit', () => {
+  const store = openStore(':memory:');
+  try {
+    const events = Array.from({ length: 300 }, (_, index) => ({
+      ...importedGoogleEvent(`Event ${index}`),
+      externalId: `event-${index}`,
+    }));
+    store.replaceProviderRecords('google', [...events, importedGoogleTask('Task after 300 events')]);
+
+    const overview = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test',
+      tokenMasterKey: masterKey,
+      providers: {},
+    }).overview();
+    assert.equal(overview.records.filter(record => record.kind === 'calendar_event').length, 300);
+    assert.deepEqual(overview.records.filter(record => record.kind === 'task').map(record => record.title), ['Task after 300 events']);
   } finally {
     store.close();
   }

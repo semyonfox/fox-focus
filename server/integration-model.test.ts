@@ -8,8 +8,13 @@ test('maps provider task lists to areas with saved choices taking priority', () 
   assert.equal(defaultAreaForList('Gym plan'), 'Health');
   assert.equal(defaultAreaForList('Bills and tax'), 'Admin');
   assert.equal(defaultAreaForList('Groceries'), 'Personal');
-  assert.equal(areaForList({ 'google:Groceries': 'Admin' }, 'google', 'Groceries'), 'Admin');
-  assert.equal(areaForList({}, 'microsoft', 'Office'), 'Work');
+  assert.equal(defaultAreaForList('Homework'), 'Personal');
+  assert.equal(defaultAreaForList('Community'), 'Personal');
+  assert.equal(areaForList({ 'google:id:list-1': 'University' }, 'google', 'list-1', 'Renamed list'), 'University');
+  assert.equal(areaForList({ 'google:Old name': 'Admin' }, 'google', 'list-1', 'Old name'), 'Admin');
+  assert.equal(areaForList({ 'google:id:list-1': 'Work', 'google:id:list-2': 'Health' }, 'google', 'list-1', 'Tasks'), 'Work');
+  assert.equal(areaForList({ 'google:id:list-1': 'Work', 'google:id:list-2': 'Health' }, 'google', 'list-2', 'Tasks'), 'Health');
+  assert.equal(areaForList({}, 'microsoft', 'office-list', 'Office'), 'Work');
 });
 
 test('selected calendar day includes Dublin-local timed starts and puts all-day records first', () => {

@@ -434,13 +434,16 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
 
   function listProviderRecords(limit = 300): StoredRecord[] {
     const safeLimit = Math.max(1, Math.min(limit, 1000));
-    const rows = db.prepare(`SELECT id, provider, kind, container_id, container_name, external_id, title, status,
+    const query = db.prepare(`SELECT id, provider, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_url,
       source_time_zone, imported_at
-      FROM provider_records WHERE deleted_at IS NULL
-      ORDER BY CASE kind WHEN 'calendar_event' THEN 0 ELSE 1 END,
-        COALESCE(starts_at, due_on, source_updated_at, imported_at), title COLLATE NOCASE
-      LIMIT ?`).all(safeLimit) as Record<string, unknown>[];
+      FROM provider_records WHERE deleted_at IS NULL AND kind=?
+      ORDER BY COALESCE(starts_at, due_on, source_updated_at, imported_at), title COLLATE NOCASE
+      LIMIT ?`);
+    const rows = [
+      ...query.all('calendar_event', safeLimit),
+      ...query.all('task', safeLimit),
+    ] as Record<string, unknown>[];
     return rows.flatMap(row => {
       const record = rowToRecord(row);
       return record ? [record] : [];
