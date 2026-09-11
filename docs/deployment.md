@@ -33,6 +33,6 @@ Before a destructive restore or a volume deletion, stop the container and make a
 
 After deploying a new image, check the container health endpoint locally and verify that anonymous requests to the workspace API receive `401`. Then sign in normally and make a small local edit to confirm the data volume is still mounted.
 
-The repository's Jenkins pipeline builds an image, runs tests, starts an isolated candidate, then deploys only the app container. It must not recreate the persistent data volume or any separately managed reverse proxy or tunnel. Once the public repository is connected to Jenkins, the job should read the checked-in `Jenkinsfile` from source control rather than a copied working tree.
+GitHub Actions validates the source independently, but Jenkins is the release authority. A `main` push reaches Jenkins through its GitHub webhook, with a ten-minute source poll as a missed-webhook fallback; Jenkins builds its own image, runs tests, starts an isolated candidate, then deploys only the app container. This keeps deployments available when GitHub Actions or GitHub Container Registry is unavailable. It uses an operator-owned Compose specification so source changes cannot replace the persistent data volume or Hermes mount, and it must not recreate either those resources or a separately managed reverse proxy or tunnel.
 
 No release process should package the SQLite file, password file, Hermes database, or provider credentials into an image or repository.
