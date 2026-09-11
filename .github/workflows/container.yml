@@ -32,7 +32,15 @@ jobs:
             import { readdirSync } from "node:fs";
             import { createInitialData } from "./src/model.ts";
             assert.deepEqual(readdirSync("/data"), []);
-            assert.deepEqual(readdirSync("/app/server").sort(), ["app.ts", "hermes.ts", "index.ts", "store.ts"]);
+            assert.deepEqual(readdirSync("/app/server").sort(), [
+              "app.ts",
+              "hermes.ts",
+              "index.ts",
+              "integrations.ts",
+              "oauth.ts",
+              "providers.ts",
+              "store.ts",
+            ]);
             assert.ok(Object.values(createInitialData()).every(items => Array.isArray(items) && items.length === 0));
           '
           docker run --detach --name fox-focus-check --network none fox-focus:test
@@ -41,7 +49,7 @@ jobs:
             if docker exec fox-focus-check node --input-type=module -e '
               import assert from "node:assert/strict";
               assert.equal((await fetch("http://127.0.0.1:8789/healthz")).status, 200);
-              for (const path of ["/", "/app", "/api/v1/workspace", "/api/v1/hermes"]) {
+              for (const path of ["/", "/app", "/api/v1/workspace", "/api/v1/hermes", "/api/v1/integrations"]) {
                 assert.equal((await fetch(`http://127.0.0.1:8789${path}`, { redirect: "manual" })).status, 401);
               }
             ' 2>/dev/null; then
