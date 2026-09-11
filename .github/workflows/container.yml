@@ -1,0 +1,93 @@
+name: Test and publish container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build and test
+        run: docker build --tag fox-focus:test .
+      - name: Check isolated runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint node fox-focus:test --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { readdirSync } from "node:fs";
+            import { createInitialData } from "./src/model.ts";
+            assert.deepEqual(readdirSync("/data"), []);
+            assert.deepEqual(readdirSync("/app/server").sort(), ["app.ts", "hermes.ts", "index.ts", "store.ts"]);
+            assert.ok(Object.values(createInitialData()).every(items => Array.isArray(items) && items.length === 0));
+          '
+          docker run --detach --name fox-focus-check --network none fox-focus:test
+          trap 'docker rm --force fox-focus-check >/dev/null' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec fox-focus-check node --input-type=module -e '
+              import assert from "node:assert/strict";
+              assert.equal((await fetch("http://127.0.0.1:8789/healthz")).status, 200);
+              for (const path of ["/", "/app", "/api/v1/workspace", "/api/v1/hermes"]) {
+                assert.equal((await fetch(`http://127.0.0.1:8789${path}`, { redirect: "manual" })).status, 401);
+              }
+            ' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'Container did not become healthy with protected workspace routes.' >&2
+          exit 1
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build release image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: docker build --label "org.opencontainers.image.revision=$GITHUB_SHA" --tag "${IMAGE,,}:sha-$GITHUB_SHA" .
+      - name: Publish to GitHub Container Registry
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${IMAGE,,}"
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            tag=latest
+          else
+            tag="$GITHUB_REF_NAME"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9_.-]+)?$ ]]; then
+              echo 'Release tags must be vMAJOR.MINOR.PATCH, optionally with a prerelease suffix.' >&2
+              exit 1
+            fi
+          fi
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          docker push "$image:sha-$GITHUB_SHA"
+          docker tag "$image:sha-$GITHUB_SHA" "$image:$tag"
+          docker push "$image:$tag"

@@ -1,0 +1,34 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and builds
+node_modules/
+.next/
+dist/
+coverage/
+
+# Local runtime data
+*.log
+data/
+postgres-data/
+backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.sql
+*.dump
+*.bak
+*.pem
+*.key
+workspace-password
+tunnel-token
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

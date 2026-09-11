@@ -1,0 +1,29 @@
+name: fox-focus
+services:
+  app:
+    build: .
+    image: ${FOX_FOCUS_IMAGE:-fox-focus-app}
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: production
+      PORT: 8789
+      DATA_DIR: /data
+      HERMES_KANBAN_DB: ${HERMES_KANBAN_DB:-}
+    volumes:
+      - focus-data:/data
+      # Set HERMES_BOARD_DIR to a board directory to enable the optional feed.
+      # The empty default keeps this public Compose file portable.
+      - ${HERMES_BOARD_DIR:-./empty-hermes-board}:/hermes/personal-tasks:ro
+    ports:
+      - "127.0.0.1:8789:8789"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  focus-data:
