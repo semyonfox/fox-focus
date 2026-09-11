@@ -3510,6 +3510,13 @@ body {
   margin-top: 20px;
 }
 
+.integration-task-lists-note {
+  margin: -2px 0 4px 23px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .integration-task-lists .integration-record {
   display: flex;
 }

@@ -252,7 +252,7 @@ function HermesTaskRow({ task }: { task: HermesTask }) {
       <div className="task-copy">
         <strong className={task.status === "done" ? "task-title--done" : undefined}>{task.title}</strong>
         <span>
-          <em className="source-chip source-chip--hermes">Hermes</em>
+          <em className="source-chip source-chip--hermes" title={`Hermes · ${task.source}`}>Hermes · {task.source}</em>
           <em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>
           {task.priority > 0 ? <em className="task-created">Priority {task.priority}</em> : null}
           {task.parentTitle ? <em className="task-created" title={`Part of ${task.parentTitle}`}>Part of {task.parentTitle}</em> : null}
@@ -274,7 +274,7 @@ function ImportedTaskRow({ task, area }: { task: ImportedRecord; area: Area }) {
       <span className="imported-task-mark" title="Read-only, managed by the provider"><i className={`area-dot area-dot--${areaClass(area)}`} /></span>
       <div className="task-copy">
         <strong className={completed ? "task-title--done" : undefined}>{task.title}</strong>
-        <span>{area}<em className="source-chip">{providerLabel(task.provider)} · {task.containerName}</em></span>
+        <span>{area}<em className="source-chip" title={`${providerLabel(task.provider)} · ${task.containerName}`}>{providerLabel(task.provider)} · {task.containerName}</em></span>
       </div>
       <time dateTime={task.dueOn ?? undefined}>{status}</time>
     </article>
@@ -321,17 +321,22 @@ function urlBase64ToArrayBuffer(value: string): ArrayBuffer {
 
 const allTaskSources = "__all_task_sources__";
 const localTaskSource = "__local_task_source__";
+const hermesTaskSource = "__hermes_task_source__";
+const googleTaskSource = "__google_task_source__";
+const microsoftTaskSource = "__microsoft_task_source__";
+const taskSources = [allTaskSources, localTaskSource, hermesTaskSource, googleTaskSource, microsoftTaskSource] as const;
 const allTaskCategories = "__all_task_categories__";
 const unclassifiedTaskCategory = "__unclassified_task_category__";
 
+type TaskSource = (typeof taskSources)[number];
 type TaskCategory = typeof allTaskCategories | typeof unclassifiedTaskCategory | Area;
 
-function hermesSourceId(source: string): string {
-  return `hermes:${source}`;
+function providerTaskSource(provider: ImportedRecord["provider"]): TaskSource {
+  return provider === "google" ? googleTaskSource : microsoftTaskSource;
 }
 
-function importedSourceId(provider: string, containerId: string): string {
-  return `imported:${provider}:${containerId}`;
+function taskSourceIdentity(title: string, source: string): string {
+  return `${title.trim().toLocaleLowerCase()}\u0000${source.trim().toLocaleLowerCase()}`;
 }
 
 function App({ initial }: { initial?: ServerSnapshot }) {
@@ -354,7 +359,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("open");
-  const [taskSource, setTaskSource] = useState(allTaskSources);
+  const [taskSource, setTaskSource] = useState<TaskSource>(allTaskSources);
   const [taskCategory, setTaskCategory] = useState<TaskCategory>(allTaskCategories);
   const [taskSort, setTaskSort] = useState<TaskSort>("due");
   const [calendarMode, setCalendarMode] = useState<CalendarMode>("day");
@@ -595,13 +600,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const activeReminder = data.reminders.find((reminder) => reminder.id === activeReminderId) ?? null;
   const hermesBoard = hermes.feed?.state === "connected" ? hermes.feed.board : null;
   const hermesTasks = hermesBoard?.tasks ?? [];
-  const hermesSources = hermesBoard?.sources ?? [];
   const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
-  const importedLists = [...importedTasks.reduce((lists, task) => {
-    const id = importedSourceId(task.provider, task.containerId);
-    if (!lists.has(id)) lists.set(id, { id, provider: task.provider, containerId: task.containerId, name: task.containerName });
-    return lists;
-  }, new Map<string, { id: string; provider: ImportedRecord["provider"]; containerId: string; name: string }>()).values()];
+  const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
+    importedTasks.some((task) => task.provider === provider) ||
+    integrations.overview?.providers.some((status) => status.provider === provider && status.connection?.state === "connected") === true;
+  const googleTasksAvailable = providerIsAvailable("google");
+  const microsoftTasksAvailable = providerIsAvailable("microsoft");
   const categoryLocalTasks = taskCategory === allTaskCategories
     ? data.tasks
     : taskCategory === unclassifiedTaskCategory
@@ -654,64 +658,52 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : [];
   }, [categoryImportedTasks, taskFilter, todayDate]);
 
-  const taskSourceOptions = [
-    { id: allTaskSources, label: "Everything", count: visibleTasks.length + visibleHermesTasks.length + visibleImportedTasks.length },
-    { id: localTaskSource, label: "Local", count: visibleTasks.length },
-    ...hermesSources.map((source) => ({
-      id: hermesSourceId(source),
-      label: source,
-      count: visibleHermesTasks.filter((task) => task.source === source).length,
-    })),
-    ...importedLists.map((list) => ({
-      id: list.id,
-      label: `${providerLabel(list.provider)} · ${list.name}`,
-      count: visibleImportedTasks.filter((task) => importedSourceId(task.provider, task.containerId) === list.id).length,
-    })),
+  // Hermes is the canonical personal-task board. Hide its Google-backed
+  // duplicates in the combined view, while keeping the complete Google view
+  // available from the source selector.
+  const visibleHermesIdentities = new Set(visibleHermesTasks.map((task) => taskSourceIdentity(task.title, task.source)));
+  const combinedImportedTasks = visibleImportedTasks.filter((task) =>
+    task.provider !== "google" || !visibleHermesIdentities.has(taskSourceIdentity(task.title, task.containerName)));
+  const taskSourceOptions: Array<{ id: TaskSource; label: string; count: number }> = [
+    { id: allTaskSources, label: "All sources", count: visibleTasks.length + visibleHermesTasks.length + combinedImportedTasks.length },
+    { id: localTaskSource, label: "Fox Focus", count: visibleTasks.length },
   ];
-  const isHermesOnlyScope = taskSource.startsWith("hermes:");
+  if (hermesBoard) taskSourceOptions.push({ id: hermesTaskSource, label: "Hermes", count: visibleHermesTasks.length });
+  if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleImportedTasks.filter((task) => task.provider === "google").length });
+  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
+  const isExternalOnlyScope = taskSource !== allTaskSources && taskSource !== localTaskSource;
 
   const shownLocalTasks = taskSource === allTaskSources || taskSource === localTaskSource ? visibleTasks : [];
-  const shownHermesTasks = taskSource === allTaskSources
-    ? visibleHermesTasks
-    : taskSource.startsWith("hermes:")
-      ? visibleHermesTasks.filter((task) => task.source === taskSource.slice("hermes:".length))
-      : [];
+  const shownHermesTasks = taskSource === allTaskSources || taskSource === hermesTaskSource ? visibleHermesTasks : [];
   const shownImportedTasks = taskSource === allTaskSources
-    ? visibleImportedTasks
-    : taskSource.startsWith("imported:")
-      ? visibleImportedTasks.filter((task) => importedSourceId(task.provider, task.containerId) === taskSource)
+    ? combinedImportedTasks
+    : taskSource === googleTaskSource || taskSource === microsoftTaskSource
+      ? visibleImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
       : [];
 
   const reminderCount = data.reminders.length;
   const reviewCount = data.inboxItems.filter((item) => item.status !== "handled").length;
   const plannedTaskCount = activeTasks.filter((task) => Boolean(task.linkedEventId && eventById.has(task.linkedEventId))).length;
   const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
-  const activeImportedTaskCount = importedTasks.filter((task) => task.status !== "completed").length;
-  const taskFilterCounts: Record<TaskFilter, number> = {
-    all: categoryLocalTasks.length + categoryHermesTasks.length + categoryImportedTasks.length,
-    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length + categoryImportedTasks.filter((task) => task.status !== "completed").length,
-    "due-today": categoryLocalTasks.filter((task) => task.due === "Today" && !task.completed).length + categoryImportedTasks.filter((task) => task.status !== "completed" && task.dueOn === todayDate).length,
-    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length,
-    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length,
-    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length + categoryImportedTasks.filter((task) => task.status === "completed").length,
-  };
+  const activeHermesIdentities = new Set(hermesTasks
+    .filter((task) => task.status !== "done")
+    .map((task) => taskSourceIdentity(task.title, task.source)));
+  const activeImportedTaskCount = importedTasks.filter((task) => task.status !== "completed" &&
+    (task.provider !== "google" || !activeHermesIdentities.has(taskSourceIdentity(task.title, task.containerName)))).length;
   const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
   const openTaskCount = activeTasks.length + activeHermesTaskCount + activeImportedTaskCount;
+  const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
+  const selectedTaskCategoryLabel = taskCategory === allTaskCategories ? "all areas" : taskCategory === unclassifiedTaskCategory ? "uncategorised" : taskCategory;
 
   useEffect(() => {
-    if (!taskSource.startsWith("hermes:")) return;
-    const source = taskSource.slice("hermes:".length);
-    if (!hermesSources.includes(source)) setTaskSource(allTaskSources);
-  }, [hermesSources, taskSource]);
+    if ((taskSource === hermesTaskSource && !hermesBoard) ||
+      (taskSource === googleTaskSource && !googleTasksAvailable) ||
+      (taskSource === microsoftTaskSource && !microsoftTasksAvailable)) setTaskSource(allTaskSources);
+  }, [googleTasksAvailable, hermesBoard, microsoftTasksAvailable, taskSource]);
 
   useEffect(() => {
-    if (!taskSource.startsWith("imported:")) return;
-    if (!importedLists.some((list) => list.id === taskSource)) setTaskSource(allTaskSources);
-  }, [importedLists, taskSource]);
-
-  useEffect(() => {
-    if ((taskFilter === "all" || taskFilter === "open" || taskFilter === "done" || taskFilter === "due-today") || (!taskSource.startsWith("hermes:") && !taskSource.startsWith("imported:"))) return;
-    setTaskSource(allTaskSources);
+    if ((taskFilter === "planned" || taskFilter === "waiting") && isExternalOnlyScope) setTaskSource(localTaskSource);
+    if (taskFilter === "due-today" && taskSource === hermesTaskSource) setTaskSource(allTaskSources);
   }, [taskFilter, taskSource]);
 
   useEffect(() => {
@@ -725,17 +717,17 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function selectTaskFilter(filter: TaskFilter) {
     setTaskFilter(filter);
-    if ((filter === "planned" || filter === "waiting") && (taskSource.startsWith("hermes:") || taskSource.startsWith("imported:"))) setTaskSource(allTaskSources);
-    if (filter === "due-today" && taskSource.startsWith("hermes:")) setTaskSource(allTaskSources);
+    if ((filter === "planned" || filter === "waiting") && isExternalOnlyScope) setTaskSource(localTaskSource);
+    if (filter === "due-today" && taskSource === hermesTaskSource) setTaskSource(allTaskSources);
   }
 
   function selectTaskCategory(category: TaskCategory) {
     setTaskCategory(category);
-    if (category === unclassifiedTaskCategory && (taskSource === localTaskSource || taskSource.startsWith("imported:"))) {
-      setTaskSource(allTaskSources);
+    if (category === unclassifiedTaskCategory && taskSource !== allTaskSources && taskSource !== hermesTaskSource) {
+      setTaskSource(hermesBoard ? hermesTaskSource : allTaskSources);
       return;
     }
-    if (category !== allTaskCategories && category !== unclassifiedTaskCategory && taskSource.startsWith("hermes:")) {
+    if (category !== allTaskCategories && category !== unclassifiedTaskCategory && taskSource === hermesTaskSource) {
       setTaskSource(allTaskSources);
     }
   }
@@ -1404,19 +1396,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                 {taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}
               </nav>
               <div className="task-toolbar-controls">
-                <label className="task-select"><span className="visually-hidden">Show</span><select value={taskFilter} aria-label="Show" onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} ({taskFilterCounts[filter]})</option>)}</select></label>
-                {hermesBoard || importedTasks.length ? <label className="task-select"><span className="visually-hidden">Source</span><select value={taskSource} aria-label="Source" onChange={(event) => setTaskSource(event.target.value)}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id.startsWith("hermes:") && source.count === 0}>{source.label} ({source.count})</option>)}</select></label> : null}
-                <label className="task-select"><span className="visually-hidden">Sort</span><select value={taskSort} aria-label="Sort" disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>
+                <label className="task-select"><span className="visually-hidden">Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)}</option>)}</select></label>
+                {hermesBoard || googleTasksAvailable || microsoftTasksAvailable ? <label className="task-select"><span className="visually-hidden">Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id}>{source.label} ({source.count})</option>)}</select></label> : null}
+                <label className="task-select"><span className="visually-hidden">Sort</span><select value={taskSort} disabled={isExternalOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>
                 {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh} aria-label="Refresh Hermes"><RotateCcw size={13} /></button> : null}
               </div>
             </div>
             {initial && hermes.failed ? <p className="task-filter-boundary"><Bot size={13} /> Hermes could not be refreshed. Local tasks are unaffected.</p> : null}
             {(hermesTasks.length || importedTasks.length) && (taskFilter === "planned" || taskFilter === "waiting") ? <p className="task-filter-boundary"><Bot size={13} /> Hermes and imported tasks only appear under All, Open, Done and Due today.</p> : null}
-            <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`} tabIndex={0}>
+            <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks, ${selectedTaskCategoryLabel}, ${selectedTaskSourceLabel}`} tabIndex={0}>
               {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)}
               {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} />)}
               {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
-              {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "Nothing completed yet" : "Nothing here"}</strong><p>{taskFilter === "done" ? "Completed tasks will show up here." : "Try another category or add a task."}</p></div> : null}
+              {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "Nothing completed yet" : "Nothing here"}</strong><p>{taskFilter === "done" ? "Completed tasks will show up here." : "Try another area or source, or add a task."}</p></div> : null}
             </div>
           </article>
           </div>

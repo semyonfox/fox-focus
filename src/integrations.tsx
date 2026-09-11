@@ -228,10 +228,11 @@ export function IntegrationsDrawer({
         </div>
         {loading && !overview ? <p className="integration-loading">Checking connections…</p> : null}
         {taskLists.length ? <div className="integration-record-section integration-task-lists">
-          <div><ListTodo size={15} /><strong>Task lists</strong></div>
+          <div><ListTodo size={15} /><strong>List routing</strong></div>
+          <p className="integration-task-lists-note">Provider lists stay as projects. Choose which Fox Focus area each one belongs to.</p>
           {taskLists.map(list => <article className="integration-record" key={list.key}>
             <span><strong>{list.name}</strong><small>{providerLabel(list.provider)} · {list.count} {list.count === 1 ? 'task' : 'tasks'}</small></span>
-            <label className="field"><span className="visually-hidden">Area for {providerLabel(list.provider)} {list.name}</span><select value={areaForList(listAreas, list.provider, list.containerId, list.name)} onChange={(event) => { const area = event.target.value; if (isOneOf(area, areas)) onListAreaChange(list.key, area); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
+            <label className="field"><span className="visually-hidden">Show {providerLabel(list.provider)} list {list.name} in area</span><select value={areaForList(listAreas, list.provider, list.containerId, list.name)} onChange={(event) => { const area = event.target.value; if (isOneOf(area, areas)) onListAreaChange(list.key, area); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
           </article>)}
         </div> : null}
         <div className="integration-records">
