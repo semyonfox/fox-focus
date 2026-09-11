@@ -239,63 +239,8 @@ p {
   background: color-mix(in srgb, var(--header-text) 13%, transparent);
 }
 
-.theme-menu {
-  position: relative;
-}
-
-.theme-menu > summary {
-  list-style: none;
-  cursor: pointer;
-}
-
-.theme-menu > summary::-webkit-details-marker {
-  display: none;
-}
-
 .theme-action {
   padding: 0;
-}
-
-.theme-popover {
-  position: absolute;
-  top: calc(100% + 8px);
-  right: 0;
-  z-index: 40;
-  display: grid;
-  width: 164px;
-  gap: 3px;
-  padding: 5px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--panel-solid);
-  box-shadow: 0 14px 34px var(--shadow);
-  color: var(--text);
-}
-
-.theme-choice {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) 16px;
-  align-items: center;
-  gap: 7px;
-  min-height: 40px;
-  padding: 0 9px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 680;
-  text-align: left;
-}
-
-.theme-choice:hover,
-.theme-choice--selected {
-  background: var(--panel-muted);
-  color: var(--text);
-}
-
-.theme-choice svg:last-child {
-  justify-self: end;
 }
 
 .capture-button {

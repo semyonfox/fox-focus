@@ -13,7 +13,6 @@ import {
   Inbox,
   Link2,
   ListTodo,
-  Monitor,
   Moon,
   Pencil,
   Plus,
@@ -52,6 +51,19 @@ function loadData(): PrototypeData {
   } catch {
     return createInitialData();
   }
+}
+
+const themeStorageKey = "fox-focus-theme";
+
+function loadTheme(): ResolvedTheme {
+  if (typeof window === "undefined") return "light";
+  try {
+    const stored = window.localStorage.getItem(themeStorageKey);
+    if (stored === "light" || stored === "black") return stored;
+  } catch {
+    // use the system preference when storage is restricted
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "black" : "light";
 }
 
 function makeId(prefix: string): string {
@@ -291,7 +303,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const saveQueue = useRef(Promise.resolve());
   const saveFailed = useRef(false);
   const [activeSection, setActiveSection] = useState<SectionAnchor>("today");
-  const [themeMode, setThemeMode] = useState<ThemeMode>("system");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(loadTheme);
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() =>
     typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches ? "black" : "light",
   );
@@ -423,6 +435,16 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [data.reminders]);
 
   const resolvedTheme: ResolvedTheme = themeMode === "system" ? systemTheme : themeMode;
+
+  function toggleTheme() {
+    const nextTheme: ResolvedTheme = resolvedTheme === "black" ? "light" : "black";
+    setThemeMode(nextTheme);
+    try {
+      window.localStorage.setItem(themeStorageKey, nextTheme);
+    } catch {
+      // a restricted browser can still switch theme for this session
+    }
+  }
 
   useEffect(() => {
     document.documentElement.dataset.theme = resolvedTheme;
@@ -1036,8 +1058,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setStatusMessage(`Snoozed “${activeReminder.title}” for 30 minutes while this prototype stays open.`);
   }
 
-  const themeIcon = themeMode === "system" ? <Monitor size={15} /> : themeMode === "light" ? <Sun size={15} /> : <Moon size={15} />;
-  const themeLabel = themeMode === "system" ? `System (${systemTheme})` : themeMode === "light" ? "Light" : "Black";
+  const themeTarget = resolvedTheme === "black" ? "light" : "dark";
 
   function plannedDateForTask(task: Task): string | undefined {
     const linkedEvent = task.linkedEventId ? eventById.get(task.linkedEventId) : undefined;
@@ -1293,12 +1314,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </nav>
         <div className="command-actions">
           <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminder previews`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
-          <details className="theme-menu">
-            <summary className="quiet-action theme-action" aria-label={`Appearance: ${themeLabel}`} title={`Appearance: ${themeLabel}`}>{themeIcon}</summary>
-            <div className="theme-popover" role="group" aria-label="Appearance">
-              {(["system", "light", "black"] as const).map((mode) => <button className={themeMode === mode ? "theme-choice theme-choice--selected" : "theme-choice"} type="button" aria-pressed={themeMode === mode} key={mode} onClick={(event) => { setThemeMode(mode); event.currentTarget.closest("details")?.removeAttribute("open"); }}>{mode === "system" ? <Monitor size={14} /> : mode === "light" ? <Sun size={14} /> : <Moon size={14} />}<span>{mode === "system" ? "System" : mode === "light" ? "Light" : "Black"}</span>{themeMode === mode ? <Check size={13} /> : null}</button>)}
-            </div>
-          </details>
+          <button className="quiet-action theme-action" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeTarget} theme`} title={`Switch to ${themeTarget} theme`}>{resolvedTheme === "black" ? <Sun size={15} /> : <Moon size={15} />}</button>
           <button className="capture-button" type="button" onClick={() => openTaskComposer()}><Plus size={15} /><span>Add task</span></button>
         </div>
       </header>
