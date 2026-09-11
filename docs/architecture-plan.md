@@ -1,8 +1,10 @@
 # Fox Focus architecture and delivery plan
 
-Status: proposed, 10 September 2026.
+Status: living plan, updated 11 September 2026.
 
-This document describes the next product phases, not a list of features already shipped. The current prototype is a local React, Hono, and SQLite workspace with a read-only Hermes view. Google, Microsoft, MCP, durable jobs, provider OAuth, and notification delivery remain design work until they are implemented and tested.
+This document describes the next product phases, not a list of features already shipped. The current app is a local React, Hono, and SQLite workspace with a read-only Hermes view and implemented read-only Google and Microsoft OAuth/import paths. Real-account deployment validation, Gmail, MCP, durable jobs, provider writes, and notification delivery remain planned work.
+
+The approved [task organisation and sync handover](task-organisation-and-sync-handover.md) is authoritative for category navigation, task ownership, Hermes completion, and the later Microsoft-versus-Google task-home decision where older phase language below differs.
 
 This is the active plan for Fox Focus. It uses the existing project rules and the earlier Hermes handoff as input, but makes two deliberate changes:
 
@@ -15,7 +17,7 @@ Build Fox Focus as one self-hosted TypeScript application with a local SQLite da
 
 Fox Focus should be the place where you see, triage, plan, and approve work. It should not try to become Hermes, Gmail, Google Calendar, or Microsoft To Do. Every task or calendar event has one declared home system. Fox Focus mirrors it, links it, and can request an approved change. It must not copy one task automatically into Google Tasks, Microsoft To Do, and a Hermes board, because that produces loops and loses fields that the providers do not share.
 
-Use a dedicated `Fox Focus` Google Calendar and a dedicated `Fox Focus` Google Task list as the default writable targets. Existing calendars and task lists remain imported context until you explicitly opt them into write access. This gives the app a useful two-way path from the first release without treating shared appointments or the existing `personal-tasks` board as Fox Focus data.
+Use a dedicated `Fox Focus` Google Calendar as the eventual writable target for approved local calendar blocks. Do not choose a default external task home before the `personal-tasks` ownership decision; if one is later needed, the task handover recommends one dedicated Microsoft To Do list. Existing calendars and task lists remain imported context until explicitly opted into write access.
 
 ## What the app owns
 
@@ -164,7 +166,7 @@ PRAGMA synchronous = FULL;
 - Run one app replica. WAL permits concurrent readers and one writer, which is ample for a browser, a scheduler, and occasional sync work.
 - Keep write transactions short and indexed. The job loop must not hold a transaction open while it calls Google or Microsoft.
 - Back up through SQLite's online backup API or `VACUUM INTO`, not by copying only the main database file while WAL is active. Check the backup with `PRAGMA quick_check` before sending it to the existing backup system.
-- Store OAuth refresh tokens outside SQLite. The database contains connection metadata and a secret reference, never the secret itself.
+- Store only encrypted OAuth token envelopes in SQLite. Keep the separate encryption key outside the database and repository so a copied database cannot reveal a token by itself.
 
 Move to PostgreSQL only if one of these becomes real: multiple live application replicas, more than one active user with sustained writes, a requirement to run worker and database on separate hosts, or a proven SQLite write-contention problem. Do not migrate based on a vague fear that SQLite is small.
 
@@ -269,6 +271,12 @@ Google Tasks can round-trip title, notes, completion, list, parent, position, an
 
 ## Provider connections and sync design
 
+> Implementation status (2026-09-11): Google Calendar/Tasks and Microsoft
+> Calendar/To Do now have a server-side, read-only OAuth and polling path.
+> Provider writes, approval requests, webhooks, and disconnect/revocation stay
+> future work; this document's write-through rules remain the contract for
+> that later phase.
+
 ### OAuth and secret boundary
 
 Use delegated OAuth 2.0 authorization-code flow with PKCE for Google and Microsoft. Request the smallest scope that enables the selected capability, and request offline access only for the local background process that needs a refresh token.
@@ -277,10 +285,10 @@ Use delegated OAuth 2.0 authorization-code flow with PKCE for Google and Microso
 | --- | --- | --- | --- |
 | Google Calendar | Calendar-list discovery and read access to chosen calendars | `calendar.events.owned` for user-owned calendars. Broader event scope only after selecting a shared writable calendar. | Sync token per enabled calendar, scheduled reconciliation, optional watch channel. |
 | Google Tasks | `tasks.readonly` for an import-only trial | `tasks` for the selected writable list | Poll `updatedMin` with a safety overlap and periodic full reconciliation. There is no documented Tasks sync token or push channel. |
-| Microsoft To Do | Delegated `Tasks.ReadWrite` only when this phase starts | Same, with `offline_access` | Delta link per list, scheduled reconciliation, optional short-lived change subscription. |
+| Microsoft To Do | Delegated `Tasks.Read` for the current import-only path | `Tasks.ReadWrite` only after approved write-through exists, with `offline_access` | Delta link per list, scheduled reconciliation, optional short-lived change subscription. |
 | Hermes | A scoped Fox Focus client token plus Hermes's own documented read API or MCP contract | No provider credential sharing | Poll or receive its selected status feed. |
 
-The browser should complete OAuth. The application stores a secret reference in `connections`; the actual token belongs in the existing local credential boundary or an encrypted secret file mounted read-only where possible. No token appears in the database, API response, audit log, sample environment file, or repository.
+The browser completes OAuth. The current application stores a context-bound encrypted token envelope in SQLite and keeps its separate encryption key in a private mounted file. Plaintext tokens must never appear in the database, API response, audit log, sample environment file, or repository.
 
 Before relying on a long-lived Google connection, verify the OAuth consent-screen publishing state. Google projects left in external testing can issue refresh tokens that expire after seven days for these scopes. This needs a narrow real-account probe during implementation, not an assumption in a document.
 
