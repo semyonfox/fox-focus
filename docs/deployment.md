@@ -17,7 +17,7 @@ The first startup creates a random password at `/data/workspace-password` with m
 
 ## Hermes is optional and read-only
 
-To show a Hermes Personal Tasks board, mount that board directory read-only and set `HERMES_KANBAN_DB` to its SQLite database path. Mount the database's WAL and shared-memory sidecar files with it. The adapter opens SQLite in read-only mode and only returns task titles, status, numeric priority, derived update time, and ownership.
+To show a Hermes Personal Tasks board, mount that board directory read-only and set `HERMES_KANBAN_DB` to its SQLite database path. Mount the database's WAL and shared-memory sidecar files with it. The adapter opens SQLite in read-only mode and returns task titles, status, numeric priority, derived update time, ownership, source list names, and parent task titles. It reads explicit source metadata from task bodies internally to recover list names; it never returns the bodies. Structure-only list headings appear as filters, not actionable tasks. The default action view excludes wishlist lists; selecting a wishlist shows its items.
 
 It does not copy Hermes records into local editable tasks. The Personal Tasks board remains canonical. Running without the mount simply leaves the Hermes panel unavailable.
 

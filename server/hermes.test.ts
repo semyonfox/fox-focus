@@ -21,6 +21,7 @@ test("reads a bounded, redacted, human-readable Hermes feed", () => {
         started_at INTEGER, completed_at INTEGER
       );
       CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, created_at INTEGER);
+      CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
     `);
     const insert = db.prepare(`INSERT INTO tasks
       (id,title,body,result,workspace_path,session_id,assignee,status,priority,created_at)
@@ -40,7 +41,18 @@ test("reads a bounded, redacted, human-readable Hermes feed", () => {
       { title: "Prepare timetable", status: "scheduled", owner: "human", updatedAt: "1970-01-01T00:02:30.000Z" },
     ]);
     for (const task of feed.board.tasks) {
-      assert.deepEqual(Object.keys(task).sort(), ["id", "owner", "priority", "status", "title", "updatedAt"]);
+      assert.deepEqual(Object.keys(task).sort(), ["id", "list", "owner", "parentTitle", "priority", "status", "title", "updatedAt"]);
+    }
+    insert.run("list", "Google Tasks list — Wishlist", "structure only", null, null, null, null, "scheduled", 0, 50);
+    insert.run("child", "Future purchase", "Source: Google Tasks (Wishlist).\nNext action: private notes", null, null, null, null, "scheduled", 0, 50);
+    db.prepare("INSERT INTO task_links VALUES (?,?)").run("list", "child");
+    const grouped = readHermesFeed({ dbPath: path });
+    assert.equal(grouped.state, "connected");
+    if (grouped.state === "connected") {
+      assert.ok(grouped.board.lists.includes("Wishlist"));
+      assert.equal(grouped.board.tasks.find(task => task.id === "child")?.list, "Wishlist");
+      assert.ok(!grouped.board.tasks.some(task => task.id === "list"));
+      assert.ok(!JSON.stringify(grouped).includes("private notes"));
     }
   } finally {
     db.close();

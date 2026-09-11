@@ -38,25 +38,33 @@ export function HermesTaskList({ feed, embedded = false }: { feed: HermesFeed; e
   const [query, setQuery] = useState('');
   const [showCompleted, setShowCompleted] = useState(false);
   const [limit, setLimit] = useState(25);
+  const [list, setList] = useState('');
+  const [includeWishlist, setIncludeWishlist] = useState(false);
   if (feed.state !== 'connected') return <p>Hermes is unavailable.</p>;
-  const tasks = feed.board.tasks.filter(task => (showCompleted || task.status !== 'done') && task.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
-  const groups: HermesStatus[] = ['blocked', 'review', 'running', 'ready', 'triage', 'todo', 'scheduled', 'done'];
-  const ordered = groups.flatMap(status => tasks.filter(task => task.status === status));
+  const wishlist = (name: string) => /^(shit i want|wish\s?list|someday)$/i.test(name);
+  const tasks = feed.board.tasks.filter(task => (showCompleted || task.status !== 'done') &&
+    (list ? task.list === list : includeWishlist || !wishlist(task.list)) &&
+    task.title.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
+  const groups = feed.board.lists;
+  const ordered = groups.flatMap(name => tasks.filter(task => task.list === name));
   const visible = ordered.slice(0, limit);
   return <div className={embedded ? 'hermes-task-list hermes-task-list--embedded' : 'hermes-task-list'}>
     <div className="hermes-toolbar">
       <label className="field"><span>Find a task</span><input type="search" value={query} onChange={event => { setQuery(event.target.value); setLimit(25); }} placeholder="Search task titles" /></label>
+      <label className="field"><span>List</span><select value={list} onChange={event => { setList(event.target.value); setLimit(25); }}><option value="">Action lists</option>{groups.map(name => <option key={name} value={name}>{name} ({feed.board.tasks.filter(task => task.list === name && (showCompleted || task.status !== 'done')).length})</option>)}</select></label>
+      {!list && <label className="hermes-completed"><input type="checkbox" checked={includeWishlist} onChange={event => { setIncludeWishlist(event.target.checked); setLimit(25); }} /> Include wishlist / someday</label>}
       <label className="hermes-completed"><input type="checkbox" checked={showCompleted} onChange={event => { setShowCompleted(event.target.checked); setLimit(25); }} /> Include completed</label>
     </div>
-    <p className="hermes-meta">{tasks.length} matching tasks · {feed.board.name}{feed.board.total > feed.board.tasks.length ? ` · showing ${feed.board.tasks.length} of ${feed.board.total} source records` : ''}</p>
+    <p className="hermes-meta">{tasks.length} matching tasks · {feed.board.name} · Choose a list to see its items separately.</p>
     <div className="hermes-feed hermes-feed--live">
-      {groups.map(status => {
-        const group = visible.filter(task => task.status === status);
-        return group.length ? <section key={status} aria-label={hermesLabels[status]}>
-          <h3>{hermesLabels[status]}</h3>
+      {groups.map(name => {
+        const group = visible.filter(task => task.list === name);
+        return group.length ? <section key={name} aria-label={name}>
+          <h3>{name}</h3>
           {group.map(task => <article key={task.id}>
             <strong>{task.title}</strong>
-            <p>{task.owner === 'human' ? 'For you' : task.owner === 'agent' ? 'Assigned to an agent' : 'Unassigned'} · {task.priority !== 0 ? `Priority ${task.priority}` : 'Default priority'}</p>
+            <p>{hermesLabels[task.status]} · {task.owner === 'human' ? 'For you' : task.owner === 'agent' ? 'Assigned to an agent' : 'Unassigned'} · {task.priority !== 0 ? `Priority ${task.priority}` : 'Default priority'}</p>
+            {task.parentTitle && <p>Part of: {task.parentTitle}</p>}
           </article>)}
         </section> : null;
       })}

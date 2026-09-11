@@ -14,7 +14,21 @@ type HermesRow = {
   priority: unknown;
   assignee: unknown;
   updated_at: unknown;
+  body: unknown;
+  parent_title: unknown;
 };
+
+const listHeading = /^Google Tasks list\s*[—–-]\s*(.+)$/;
+
+function sourceList(row: HermesRow): string {
+  const body = typeof row.body === 'string' ? row.body.replace(/\\n/g, '\n') : '';
+  const source = body.match(/^Source: Google Tasks \(([^\n]+)\)\.?$/m);
+  if (source) return source[1];
+  const parent = typeof row.parent_title === 'string' ? row.parent_title.match(listHeading) : null;
+  if (parent) return parent[1];
+  if (/^Source: email triage/m.test(body)) return 'Email follow-ups';
+  return 'Other tasks';
+}
 
 export type HermesSource = {
   dbPath: string;
@@ -53,12 +67,14 @@ function toTask(row: HermesRow): HermesTask | null {
     priority: row.priority,
     updatedAt: new Date(row.updated_at * 1000).toISOString(),
     owner: ownerFor(row.assignee),
+    list: sourceList(row),
+    parentTitle: typeof row.parent_title === 'string' && !listHeading.test(row.parent_title) ? row.parent_title : null,
   };
 }
 
 export function readHermesFeed(source: HermesSource): HermesFeed {
   const checkedAt = (source.now ?? (() => new Date()))().toISOString();
-  const limit = Math.max(1, Math.min(source.limit ?? 200, 200));
+  const limit = Math.max(1, Math.min(source.limit ?? 2000, 2000));
   let db: DatabaseSync | undefined;
 
   try {
@@ -72,7 +88,9 @@ export function readHermesFeed(source: HermesSource): HermesFeed {
     ).get();
     const total = typeof totalRow?.total === "number" ? totalRow.total : 0;
     const rows = db.prepare(`
-      SELECT t.id, t.title, t.status, t.priority, t.assignee,
+      SELECT t.id, t.title, t.status, t.priority, t.assignee, t.body,
+             (SELECT p.title FROM task_links l JOIN tasks p ON p.id=l.parent_id
+               WHERE l.child_id=t.id ORDER BY p.id LIMIT 1) AS parent_title,
              COALESCE(
                (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id),
                t.completed_at,
@@ -91,6 +109,17 @@ export function readHermesFeed(source: HermesSource): HermesFeed {
        LIMIT ?
     `).all(limit) as HermesRow[];
 
+    // Bodies are used only to recover explicit source list metadata. They never
+    // leave this adapter or become part of the public source repository.
+    const lists = new Set<string>();
+    const tasks = rows.flatMap(row => {
+      const heading = typeof row.title === 'string' ? row.title.match(listHeading) : null;
+      if (heading) { lists.add(heading[1]); return []; }
+      const task = toTask(row);
+      if (!task) return [];
+      lists.add(task.list);
+      return [task];
+    });
     return {
       state: "connected",
       checkedAt,
@@ -98,10 +127,8 @@ export function readHermesFeed(source: HermesSource): HermesFeed {
         slug: source.boardSlug ?? "personal-tasks",
         name: source.boardName ?? "Personal Tasks",
         total,
-        tasks: rows.flatMap((row) => {
-          const task = toTask(row);
-          return task ? [task] : [];
-        }),
+        tasks,
+        lists: [...lists].sort((a, b) => a.localeCompare(b)),
       },
     };
   } catch {
