@@ -19,7 +19,7 @@ export type HermesTask = {
   priority: number;
   updatedAt: string;
   owner: HermesOwner;
-  list: string;
+  source: string;
   parentTitle: string | null;
 };
 
@@ -28,7 +28,7 @@ export type HermesBoard = {
   name: string;
   total: number;
   tasks: HermesTask[];
-  lists: string[];
+  sources: string[];
 };
 
 export type HermesFeed =
@@ -61,7 +61,7 @@ function isHermesTask(value: unknown): value is HermesTask {
     Number.isInteger(value.priority) &&
     isIsoInstant(value.updatedAt) &&
     isHermesOwner(value.owner) &&
-    typeof value.list === "string" &&
+    typeof value.source === "string" &&
     (value.parentTitle === null || typeof value.parentTitle === "string")
   );
 }
@@ -75,7 +75,7 @@ export function isHermesFeed(value: unknown): value is HermesFeed {
     typeof value.board.name === "string" &&
     typeof value.board.total === "number" &&
     Number.isInteger(value.board.total) &&
-    Array.isArray(value.board.lists) && value.board.lists.every(list => typeof list === "string") &&
+    Array.isArray(value.board.sources) && value.board.sources.every(source => typeof source === "string") &&
     Array.isArray(value.board.tasks) &&
     value.board.tasks.every(isHermesTask)
   );

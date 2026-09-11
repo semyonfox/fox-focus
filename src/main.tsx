@@ -1,6 +1,5 @@
 import "@fontsource-variable/instrument-sans";
 import {
-  ArrowUpRight,
   Bell,
   Bot,
   CalendarDays,
@@ -21,7 +20,8 @@ import {
 import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
-import { HermesTaskList, useHermesFeed } from './hermes-feed.tsx';
+import { hermesLabels, useHermesFeed } from './hermes-feed.tsx';
+import { type HermesTask } from "./hermes-model.ts";
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
@@ -133,17 +133,6 @@ function reminderModeFor(reminders: Reminder[], targetId: string): ReminderMode 
   return reminders.find((reminder) => reminder.targetId === targetId)?.mode ?? "none";
 }
 
-function Metric({ icon, label, value, detail, tone }: { icon: ReactNode; label: string; value: string; detail: string; tone: "stone" | "blue" | "amber" }) {
-  return (
-    <div className={`metric metric--${tone}`}>
-      {icon}
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
-    </div>
-  );
-}
-
 function PaneHeader({ eyebrow, title, action }: { eyebrow: string; title: string; action?: ReactNode }) {
   return (
     <header className="pane-header">
@@ -204,6 +193,26 @@ function TaskRow({
   );
 }
 
+function HermesTaskRow({ task }: { task: HermesTask }) {
+  const updatedAt = formatCreatedAt(task.updatedAt);
+
+  return (
+    <article className={`task-row hermes-task-row${task.status === "done" ? " hermes-task-row--done" : ""}`}>
+      <span className="hermes-task-mark" title="Managed in Hermes" aria-label="Managed in Hermes"><Bot size={16} /></span>
+      <div className="task-copy">
+        <strong className={task.status === "done" ? "task-title--done" : undefined}>{task.title}</strong>
+        <span>
+          <em className="source-chip source-chip--hermes">Hermes</em>
+          <em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>
+          {task.priority > 0 ? <em className="task-created">Priority {task.priority}</em> : null}
+          {task.parentTitle ? <em className="task-created" title={`Part of ${task.parentTitle}`}>Part of {task.parentTitle}</em> : null}
+        </span>
+      </div>
+      <time dateTime={task.updatedAt}>{updatedAt ? `Updated ${updatedAt}` : "Updated"}</time>
+    </article>
+  );
+}
+
 function DialogFrame({
   title,
   onClose,
@@ -233,6 +242,17 @@ function DialogFrame({
 type ServerSnapshot = { revision: number; data: PrototypeData };
 type CompletionUndo = { taskId: string; state: ActiveTaskState; reminder?: Reminder };
 
+const allTaskSources = "__all_task_sources__";
+const localTaskSource = "__local_task_source__";
+
+type TaskBrowserSection =
+  | { id: typeof localTaskSource; label: "Local"; kind: "local"; tasks: Task[] }
+  | { id: string; label: string; kind: "hermes"; tasks: HermesTask[] };
+
+function hermesSourceId(source: string): string {
+  return `hermes:${source}`;
+}
+
 function App({ initial }: { initial?: ServerSnapshot }) {
   const hermes = useHermesFeed(Boolean(initial));
   const [data, setData] = useState<PrototypeData>(() => initial?.data ?? loadData());
@@ -240,7 +260,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const lastSaved = useRef(data);
   const saveQueue = useRef(Promise.resolve());
   const saveFailed = useRef(false);
-  const [storageStatus, setStorageStatus] = useState(initial ? "Saved to SQLite" : "Stored on this device");
   const [activeSection, setActiveSection] = useState<SectionAnchor>("today");
   const [themeMode, setThemeMode] = useState<ThemeMode>("system");
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() =>
@@ -253,13 +272,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("all");
+  const [taskSource, setTaskSource] = useState(allTaskSources);
   const [taskSort, setTaskSort] = useState<TaskSort>("due");
   const [showReminderTray, setShowReminderTray] = useState(false);
   const [activeReminderId, setActiveReminderId] = useState<string | null>(null);
   const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
-  const [showHermes, setShowHermes] = useState(false);
   const [agentRequest, setAgentRequest] = useState("");
-  const [statusMessage, setStatusMessage] = useState(initial ? "Server sandbox ready. Calendar and email are not connected." : "Local prototype ready. No external services connected.");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState("");
   const focusBeforeOverlay = useRef<HTMLElement | null>(null);
   const taskTabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const taskTabStripRef = useRef<HTMLElement | null>(null);
@@ -269,7 +289,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (initial) {
       if (data === lastSaved.current) return;
       lastSaved.current = data;
-      setStorageStatus("Saving…");
       saveQueue.current = saveQueue.current.then(async () => {
         if (saveFailed.current) return;
         try {
@@ -281,11 +300,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           const saved: unknown = await response.json();
           if (!isRecord(saved) || typeof saved.revision !== "number") throw new Error("Invalid save response");
           revision.current = saved.revision;
-          if (lastSaved.current === data) setStorageStatus("Saved to SQLite");
         } catch (error) {
           saveFailed.current = true;
-          setStorageStatus("Not saved. Reload required.");
-          setStatusMessage(error instanceof Error ? error.message : "Save failed");
+          setSaveError(error instanceof Error ? error.message : "Save failed");
         }
       });
       return;
@@ -305,7 +322,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || showReminderTray || activeReminderId || showHermes);
+  const isOverlayOpen = Boolean(modal || showReminderTray || activeReminderId);
 
   useEffect(() => {
     if (!isOverlayOpen) {
@@ -380,7 +397,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (event.key !== "Escape") return;
       setModal(null);
       setShowReminderTray(false);
-      setShowHermes(false);
       setActiveReminderId(null);
     };
 
@@ -424,6 +440,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const activeTasks = data.tasks.filter((task) => !task.completed);
   const activeBlock = sortedEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
   const activeReminder = data.reminders.find((reminder) => reminder.id === activeReminderId) ?? null;
+  const hermesBoard = hermes.feed?.state === "connected" ? hermes.feed.board : null;
+  const hermesTasks = hermesBoard?.tasks ?? [];
+  const hermesSources = hermesBoard?.sources ?? [];
 
   const visibleTasks = useMemo(() => {
     const filtered = data.tasks.filter((task) => {
@@ -440,17 +459,66 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     });
   }, [data.tasks, taskFilter, taskSort]);
 
+  const visibleHermesTasks = useMemo(() => {
+    if (taskFilter === "done") return hermesTasks.filter((task) => task.status === "done");
+    return taskFilter === "all" ? hermesTasks : [];
+  }, [hermesTasks, taskFilter]);
+
+  const taskSourceTabs = [
+    { id: allTaskSources, label: "Everything", count: visibleTasks.length + visibleHermesTasks.length },
+    { id: localTaskSource, label: "Local", count: visibleTasks.length },
+    ...hermesSources.map((source) => ({
+      id: hermesSourceId(source),
+      label: source,
+      count: visibleHermesTasks.filter((task) => task.source === source).length,
+    })),
+  ];
+  const isHermesOnlyScope = taskSource.startsWith("hermes:");
+
+  const taskBrowserSections = useMemo<TaskBrowserSection[]>(() => {
+    const sections: TaskBrowserSection[] = [];
+    if ((taskSource === allTaskSources || taskSource === localTaskSource) && visibleTasks.length) {
+      sections.push({ id: localTaskSource, label: "Local", kind: "local", tasks: visibleTasks });
+    }
+    if (taskSource === allTaskSources) {
+      for (const source of hermesSources) {
+        const tasks = visibleHermesTasks.filter((task) => task.source === source);
+        if (tasks.length) sections.push({ id: hermesSourceId(source), label: source, kind: "hermes", tasks });
+      }
+      return sections;
+    }
+    if (taskSource.startsWith("hermes:")) {
+      const source = taskSource.slice("hermes:".length);
+      const tasks = visibleHermesTasks.filter((task) => task.source === source);
+      if (tasks.length) sections.push({ id: taskSource, label: source, kind: "hermes", tasks });
+    }
+    return sections;
+  }, [hermesSources, taskSource, visibleHermesTasks, visibleTasks]);
+
   const reminderCount = data.reminders.length;
   const reviewCount = data.inboxItems.length;
   const plannedTaskCount = activeTasks.filter((task) => Boolean(task.scheduledTime)).length;
-  const unplannedTaskCount = activeTasks.filter((task) => !task.scheduledTime).length;
+  const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
+  const activeTaskCount = activeTasks.length + activeHermesTaskCount;
   const taskFilterCounts: Record<TaskFilter, number> = {
-    all: data.tasks.length,
+    all: data.tasks.length + hermesTasks.length,
     "due-today": activeTasks.filter((task) => task.due === "Today").length,
     planned: plannedTaskCount,
     waiting: activeTasks.filter((task) => task.state === "waiting").length,
-    done: data.tasks.filter((task) => task.completed).length,
+    done: data.tasks.filter((task) => task.completed).length + hermesTasks.filter((task) => task.status === "done").length,
   };
+
+  useEffect(() => {
+    if (!taskSource.startsWith("hermes:")) return;
+    const source = taskSource.slice("hermes:".length);
+    if (!hermesSources.includes(source)) setTaskSource(allTaskSources);
+  }, [hermesSources, taskSource]);
+
+  useEffect(() => {
+    if ((taskFilter === "all" || taskFilter === "done") || !taskSource.startsWith("hermes:")) return;
+    setTaskSource(allTaskSources);
+  }, [taskFilter, taskSource]);
+
   const calendarDay = formatCalendarDay();
 
   function scrollToSection(section: SectionAnchor) {
@@ -460,6 +528,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function cycleTheme() {
     setThemeMode((current) => (current === "system" ? "light" : current === "light" ? "black" : "system"));
+  }
+
+  function selectTaskFilter(filter: TaskFilter) {
+    setTaskFilter(filter);
+    if (filter !== "all" && filter !== "done" && taskSource.startsWith("hermes:")) setTaskSource(allTaskSources);
   }
 
   function handleTaskTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, index: number) {
@@ -473,7 +546,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const nextFilter = taskFilters[nextIndex];
     if (!nextFilter) return;
     event.preventDefault();
-    setTaskFilter(nextFilter);
+    selectTaskFilter(nextFilter);
     window.requestAnimationFrame(() => taskTabRefs.current[nextIndex]?.focus({ preventScroll: true }));
   }
 
@@ -811,17 +884,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <div className="lifeboard-title">
             <p className="eyebrow">{initial ? "Personal workspace · private" : "Personal workspace · on this device"}</p>
             <h1>Today</h1>
-            <p>Time-bound plans, loose tasks, and decisions that need you. One scroll, no fake sync.</p>
-          </div>
-          <div className="metric-rack" aria-label="Today at a glance">
-            <Metric icon={<ListTodo size={15} />} label="Open local tasks" value={String(activeTasks.length)} detail={plannedTaskCount ? `${plannedTaskCount} in calendar` : `${unplannedTaskCount} unplanned`} tone="stone" />
-            <Metric icon={<Inbox size={15} />} label="Review queue" value={String(reviewCount)} detail="needs a decision" tone="blue" />
-            <Metric icon={<Bell size={15} />} label="Reminders" value={String(reminderCount)} detail="in-app only" tone="amber" />
+            <p>Tasks, calendar time, and decisions that need you—one surface, with no duplicate queues.</p>
           </div>
         </section>
 
         <section className="lifeboard-grid" aria-label="Fox Focus lifeboard">
-          <div className="lifeboard-column">
+          <div className="lifeboard-column lifeboard-column--agenda">
           <article className="pane lifeboard-agenda" id="agenda">
             <PaneHeader
               eyebrow="Calendar / local blocks"
@@ -890,10 +958,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               </div>
             ) : null}
           </article>
+          </div>
 
           <article className="pane lifeboard-tasks" id="tasks">
-            <PaneHeader eyebrow="Tasks / linked to your calendar" title="Task browser" action={<button className="pane-link" type="button" onClick={() => openTaskComposer()}><Plus size={12} /> Add task</button>} />
-            <p className="task-sync-note"><CalendarDays size={13} /> Local tasks and calendar blocks update together. Hermes Personal Tasks stays on its canonical board.</p>
+            <PaneHeader eyebrow="Tasks / local and Hermes" title="Task browser" action={<button className="pane-link" type="button" onClick={() => openTaskComposer()}><Plus size={12} /> Add local task</button>} />
+            <p className="task-sync-note"><CalendarDays size={13} /> {initial && hermes.failed ? "Hermes could not be refreshed; local tasks are still available." : initial && hermes.feed?.state === "unavailable" ? "Hermes is not connected. Local tasks can still be planned into the calendar." : initial && hermes.loading && !hermesBoard ? "Loading Hermes tasks into this browser…" : "Local tasks can be planned into the calendar. Hermes tasks stay managed on their source board."}</p>
             <nav className="task-tab-strip" aria-label="Task views" role="tablist" ref={taskTabStripRef}>
               {taskFilters.map((filter, index) => (
                 <button
@@ -906,33 +975,63 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                   aria-controls="task-browser-panel"
                   aria-selected={taskFilter === filter}
                   tabIndex={taskFilter === filter ? 0 : -1}
-                  onClick={() => setTaskFilter(filter)}
+                  onClick={() => selectTaskFilter(filter)}
                   onKeyDown={(event) => handleTaskTabKeyDown(event, index)}
                 >
                   <span>{taskFilterLabel(filter)}</span><b>{taskFilterCounts[filter]}</b>
                 </button>
               ))}
             </nav>
-            <div className="task-toolbar task-toolbar--lifeboard">
-              <span className="task-order-label">Order by</span>
-              <div className="filter-chips" aria-label="Task order">
-                {taskSorts.map((sort) => (
-                  <button className={`filter-chip${taskSort === sort ? " filter-chip--active" : ""}`} key={sort} type="button" aria-pressed={taskSort === sort} onClick={() => setTaskSort(sort)}>
-                    {taskSortLabel(sort)}
+            {hermesBoard ? (
+              <nav className="task-source-strip" aria-label="Task sources">
+                <span className="task-source-label">Source</span>
+                {taskSourceTabs.map((source) => (
+                  <button
+                    className={`task-source-tab${taskSource === source.id ? " task-source-tab--active" : ""}`}
+                    key={source.id}
+                    type="button"
+                    aria-pressed={taskSource === source.id}
+                    disabled={source.id.startsWith("hermes:") && source.count === 0}
+                    onClick={() => setTaskSource(source.id)}
+                  >
+                    <span>{source.label}</span><b>{source.count}</b>
                   </button>
                 ))}
-              </div>
-              <span className="task-view-count">{visibleTasks.length} shown</span>
+              </nav>
+            ) : null}
+            {hermesBoard && taskFilter !== "all" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> {activeHermesTaskCount} Hermes task{activeHermesTaskCount === 1 ? " is" : "s are"} in All. Hermes does not provide a due date or local plan for this view.</p> : null}
+            <div className="task-toolbar task-toolbar--lifeboard">
+              {isHermesOnlyScope ? <><span className="task-order-label">Hermes order</span><span className="task-source-order">Source priority</span></> : <>
+                <span className="task-order-label">{taskSource === allTaskSources ? "Order local" : "Order by"}</span>
+                <div className="filter-chips" aria-label="Local task order">
+                  {taskSorts.map((sort) => (
+                    <button className={`filter-chip${taskSort === sort ? " filter-chip--active" : ""}`} key={sort} type="button" aria-pressed={taskSort === sort} onClick={() => setTaskSort(sort)}>
+                      {taskSortLabel(sort)}
+                    </button>
+                  ))}
+                </div>
+              </>}
+              <span className="task-view-count">{taskBrowserSections.reduce((count, section) => count + section.tasks.length, 0)} shown</span>
+              {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
             </div>
             <p className="planned-note"><CalendarDays size={13} /> {plannedTaskCount ? `${plannedTaskCount} planned task${plannedTaskCount === 1 ? "" : "s"} appear in the calendar above.` : "Schedule a task to place it in the calendar."}</p>
             <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="tabpanel" aria-labelledby={`task-view-${taskFilter}`} tabIndex={0}>
-              {visibleTasks.map((task) => <TaskRow key={task.id} task={task} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)}
-              {!visibleTasks.length ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Checked-off tasks will stay here for review." : "Try another tab or add a task."}</p></div> : null}
+              {taskBrowserSections.map((section) => (
+                <section className="task-browser-section" key={section.id} aria-label={`${section.label} tasks`}>
+                  <header className="task-browser-section-heading">
+                    <div><span>{section.kind === "hermes" ? "Hermes" : "Your workspace"}</span><strong>{section.label}</strong></div>
+                    <small>{section.tasks.length} task{section.tasks.length === 1 ? "" : "s"}{section.kind === "hermes" ? " · read-only" : ""}</small>
+                  </header>
+                  {section.kind === "local"
+                    ? section.tasks.map((task) => <TaskRow key={task.id} task={task} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)
+                    : section.tasks.map((task) => <HermesTaskRow key={task.id} task={task} />)}
+                </section>
+              ))}
+              {!taskBrowserSections.length ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Try another tab or add a local task."}</p></div> : null}
             </div>
           </article>
 
-          </div>
-          <div className="lifeboard-column">
+          <div className="lifeboard-column lifeboard-column--review">
           <article className="pane lifeboard-review" id="review">
             <PaneHeader eyebrow="Review / your decision" title="Inbox" action={<span className="count-pill">{reviewCount}</span>} />
             {initial ? <p className="source-boundary">No inbox source connected yet.</p> : null}
@@ -986,29 +1085,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               ) : null}
             </div>
           </article>
-
-          <aside className="pane lifeboard-signals" id="signals">
-            <PaneHeader eyebrow="Signals / read-only where needed" title="Keep an eye on it" />
-            <div className="control-list">
-              <button className="control-row control-row--button" type="button" onClick={() => scrollToSection("agenda")}>
-                <span className="control-icon control-icon--stone"><CalendarDays size={14} /></span>
-                <span><strong>Calendar context</strong><small>Editable local blocks</small></span>
-                <b className="control-state control-state--stone">View</b>
-              </button>
-              <button className="control-row control-row--button" type="button" onClick={() => setShowReminderTray(true)}>
-                <span className="control-icon control-icon--amber"><Bell size={14} /></span>
-                <span><strong>Reminders</strong><small>{reminderCount} local alerts · in-app only</small></span>
-                <b className="control-state control-state--amber">Open</b>
-              </button>
-            </div>
-            <div className="signal-brief">
-              <div><span className="eyebrow">Hermes / Personal Tasks</span><strong>{initial ? hermes.feed?.state === 'connected' ? `${hermes.feed.board.tasks.filter(task => task.status !== 'done').length} active tasks` : hermes.loading ? 'Checking your board…' : 'Board unavailable' : 'Sample assistant activity'}</strong><small>{initial ? hermes.failed ? 'Could not refresh. Previous results may be out of date.' : 'Read-only · source board stays canonical' : 'Preview only · no private records'}</small></div>
-              <button className="secondary-action" type="button" onClick={() => setShowHermes(true)}>Open feed <ArrowUpRight size={13} /></button>
-            </div>
-            <div className="deadline-band deadline-band--lifeboard">
-              <div><span>Prototype state</span><strong>{storageStatus}</strong><small>{initial ? "SQLite sandbox · Hermes is read-only" : "Browser local storage only"}</small>{!initial && window.location.protocol !== "file:" ? <a className="secondary-action" href="/app">Open server workspace</a> : null}</div>
-            </div>
-          </aside>
           </div>
         </section>
       </>
@@ -1034,7 +1110,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <nav className="workspace-nav" aria-label="Jump to a section">
           <button className={activeSection === "today" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "today"} onClick={() => scrollToSection("today")}><Clock3 size={14} /><span>Today</span></button>
           <button className={activeSection === "agenda" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "agenda"} onClick={() => scrollToSection("agenda")}><CalendarDays size={14} /><span>Agenda</span></button>
-          <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "tasks"} onClick={() => scrollToSection("tasks")}><ListTodo size={14} /><span>Tasks</span><b>{activeTasks.length}</b></button>
+          <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "tasks"} onClick={() => scrollToSection("tasks")}><ListTodo size={14} /><span>Tasks</span><b>{activeTaskCount}</b></button>
           <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "review"} onClick={() => scrollToSection("review")}><Inbox size={14} /><span>Review</span><b>{reviewCount}</b></button>
         </nav>
         <div className="command-actions">
@@ -1044,11 +1120,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </div>
       </header>
 
-      <div className="status-footer" role="status" aria-live="polite" aria-hidden={isOverlayOpen}>
+      {saveError || statusMessage || completionUndo ? <div className={`status-footer${saveError ? " status-footer--error" : ""}`} role={saveError ? "alert" : "status"} aria-live={saveError ? "assertive" : "polite"} aria-hidden={isOverlayOpen}>
         <span />
-        <p>{statusMessage}</p>
+        <p>{saveError ?? statusMessage}</p>
         {completionUndo ? <button className="status-undo" type="button" onClick={undoTaskCompletion}>Undo</button> : null}
-      </div>
+      </div> : null}
       <main aria-hidden={isOverlayOpen}>{renderLifeboard()}</main>
 
       {taskModal ? (
@@ -1131,23 +1207,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </DialogFrame>
       ) : null}
 
-      {showHermes ? (
-        <DialogFrame title="Hermes work feed" onClose={() => setShowHermes(false)} className="editor-dialog--drawer">
-          <div className="editor-heading"><div className="composer-icon"><Bot size={17} /></div><div><p className="eyebrow">{initial ? 'Read-only · Personal Tasks' : 'Sample feed'}</p><h2>Hermes work feed</h2></div><button className="close-composer" type="button" onClick={() => setShowHermes(false)} aria-label="Close Hermes feed"><X size={17} /></button></div>
-          <p className="drawer-intro">{initial ? 'Your current board, with titles and ownership intact. Changes still belong in Hermes.' : 'Example activity only. Open the protected workspace to see your actual board.'}</p>
-          {initial ? <>
-            <div className="hermes-refresh"><p className="hermes-meta" role="status">{hermes.failed ? 'Refresh failed. Showing the last successful result, if available.' : hermes.loading ? 'Checking board…' : hermes.feed ? `Checked ${new Date(hermes.feed.checkedAt).toLocaleString('en-IE', { timeZone: 'Europe/Dublin', dateStyle: 'medium', timeStyle: 'short' })}` : 'No board loaded yet.'}</p><button className="secondary-action" type="button" disabled={hermes.loading} onClick={hermes.refresh}>Refresh</button></div>
-            {hermes.feed ? <HermesTaskList feed={hermes.feed} /> : <p className="empty-line">The board is not available. Your local workspace is unaffected.</p>}
-          </> : <>
-          <div className="hermes-feed">
-            <article><span className="feed-status feed-status--working">Working</span><strong>Compare accommodation options</strong><p>Preparing a compact summary for human review.</p></article>
-            <article><span className="feed-status feed-status--blocked">Blocked</span><strong>Room availability check</strong><p>Waiting for the follow-up request in the Inbox.</p></article>
-            <article><span className="feed-status feed-status--done">Completed</span><strong>Collect planning details</strong><p>Evidence was placed in the review queue.</p></article>
-          </div>
-          </>}
-          <div className="editor-footer"><span>{initial ? 'Read-only. No task copies or board writes.' : 'Sample data only.'}</span><button className="secondary-action" type="button" onClick={() => setShowHermes(false)}>Close</button></div>
-        </DialogFrame>
-      ) : null}
     </div>
   );
 }
