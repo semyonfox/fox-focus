@@ -14,20 +14,34 @@ type HermesRow = {
   priority: unknown;
   assignee: unknown;
   updated_at: unknown;
-  body: unknown;
+  source_metadata: unknown;
   parent_title: unknown;
 };
 
-const listHeading = /^Google Tasks list\s*[—–-]\s*(.+)$/;
+const listHeading = /^Google Tasks list\s*[—–-]\s*(.+?)\s*\.?$/;
 
-function sourceList(row: HermesRow): string {
-  const body = typeof row.body === 'string' ? row.body.replace(/\\n/g, '\n') : '';
-  const source = body.match(/^Source: Google Tasks \(([^\n]+)\)\.?$/m);
-  if (source) return source[1];
-  const parent = typeof row.parent_title === 'string' ? row.parent_title.match(listHeading) : null;
-  if (parent) return parent[1];
-  if (/^Source: email triage/m.test(body)) return 'Email follow-ups';
-  return 'Other tasks';
+function normalizeSource(value: string | undefined): string | null {
+  const source = value?.replace(/\s+/g, " ").trim().replace(/\.$/, "") ?? "";
+  return source || null;
+}
+
+function sourceFromHeading(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return normalizeSource(value.match(listHeading)?.[1]);
+}
+
+function sourceFromMetadata(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const metadata = value.replaceAll("\\n", "\n");
+  const googleList = metadata.match(/(?:^|\n)\s*Source:\s*Google\s+Tasks\s*\(([^)\r\n]+)\)\.?\s*(?:\n|$)/i);
+  if (googleList) return normalizeSource(googleList[1]);
+  if (/(?:^|\n)\s*Source:\s*email triage\b/i.test(metadata)) return "Email";
+  if (/(?:^|\n)\s*Source:\s*direct(?:\s+request)?\b/i.test(metadata)) return "Direct request";
+  return null;
+}
+
+function sourceFor(row: HermesRow): string {
+  return sourceFromMetadata(row.source_metadata) ?? sourceFromHeading(row.parent_title) ?? "Unsorted";
 }
 
 export type HermesSource = {
@@ -67,7 +81,7 @@ function toTask(row: HermesRow): HermesTask | null {
     priority: row.priority,
     updatedAt: new Date(row.updated_at * 1000).toISOString(),
     owner: ownerFor(row.assignee),
-    list: sourceList(row),
+    source: sourceFor(row),
     parentTitle: typeof row.parent_title === 'string' && !listHeading.test(row.parent_title) ? row.parent_title : null,
   };
 }
@@ -88,7 +102,8 @@ export function readHermesFeed(source: HermesSource): HermesFeed {
     ).get();
     const total = typeof totalRow?.total === "number" ? totalRow.total : 0;
     const rows = db.prepare(`
-      SELECT t.id, t.title, t.status, t.priority, t.assignee, t.body,
+      SELECT t.id, t.title, t.status, t.priority, t.assignee,
+             substr(t.body, 1, 512) AS source_metadata,
              (SELECT p.title FROM task_links l JOIN tasks p ON p.id=l.parent_id
                WHERE l.child_id=t.id ORDER BY p.id LIMIT 1) AS parent_title,
              COALESCE(
@@ -109,15 +124,15 @@ export function readHermesFeed(source: HermesSource): HermesFeed {
        LIMIT ?
     `).all(limit) as HermesRow[];
 
-    // Bodies are used only to recover explicit source list metadata. They never
-    // leave this adapter or become part of the public source repository.
-    const lists = new Set<string>();
+    // Hermes has not yet published source fields. Until it does, inspect only a
+    // small source-metadata prefix and never return it from this adapter.
+    const sources = new Set<string>();
     const tasks = rows.flatMap(row => {
-      const heading = typeof row.title === 'string' ? row.title.match(listHeading) : null;
-      if (heading) { lists.add(heading[1]); return []; }
+      const heading = sourceFromHeading(row.title);
+      if (heading) { sources.add(heading); return []; }
       const task = toTask(row);
       if (!task) return [];
-      lists.add(task.list);
+      sources.add(task.source);
       return [task];
     });
     return {
@@ -128,7 +143,7 @@ export function readHermesFeed(source: HermesSource): HermesFeed {
         name: source.boardName ?? "Personal Tasks",
         total,
         tasks,
-        lists: [...lists].sort((a, b) => a.localeCompare(b)),
+        sources: [...sources].sort((a, b) => a.localeCompare(b)),
       },
     };
   } catch {
