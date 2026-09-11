@@ -319,6 +319,15 @@ function urlBase64ToArrayBuffer(value: string): ArrayBuffer {
   return bytes.buffer;
 }
 
+async function saveDevicePushSubscription(subscription: PushSubscription): Promise<void> {
+  const response = await fetch("/api/v1/push/subscriptions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(subscription.toJSON()),
+  });
+  if (!response.ok) throw new Error("Could not save browser subscription");
+}
+
 const allTaskSources = "__all_task_sources__";
 const localTaskSource = "__local_task_source__";
 const hermesTaskSource = "__hermes_task_source__";
@@ -478,7 +487,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       serviceWorkerRegistration.current = registration;
       setPushSupported(true);
       setNotificationPermission(Notification.permission);
-      setPushSubscribed(Boolean(await registration.pushManager.getSubscription()));
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        try {
+          await saveDevicePushSubscription(subscription);
+        } catch {
+          if (active) {
+            setPushSubscribed(false);
+            setStatusMessage("Could not restore device notifications. Turn them on again to retry.");
+          }
+          return;
+        }
+      }
+      if (active) setPushSubscribed(Boolean(subscription));
     }).catch(() => {
       if (active) setPushSupported(false);
     });
@@ -1210,12 +1231,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         userVisibleOnly: true,
         applicationServerKey: urlBase64ToArrayBuffer(keyBody.publicKey),
       });
-      const response = await fetch("/api/v1/push/subscriptions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(subscription.toJSON()),
-      });
-      if (!response.ok) {
+      try {
+        await saveDevicePushSubscription(subscription);
+      } catch {
         await subscription.unsubscribe();
         throw new Error("Could not save this browser subscription");
       }
@@ -1481,7 +1499,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               </button>
               <button className="control-row control-row--button" type="button" onClick={() => setShowReminderTray(true)}>
                 <span className="control-icon control-icon--amber"><Bell size={14} /></span>
-                <span><strong>Reminders</strong><small>{reminderCount ? `${reminderCount} saved` : "None saved"} · while open</small></span>
+                <span><strong>Reminders</strong><small>{reminderCount ? `${reminderCount} saved` : "None saved"} · {pushSubscribed ? "device notifications on" : "while open"}</small></span>
                 <ChevronRight className="control-arrow" size={14} />
               </button>
             </div>

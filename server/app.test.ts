@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from './app.ts';
 import type { IntegrationService } from './integrations.ts';
 import { openStore } from './store.ts';
@@ -156,4 +157,61 @@ test('push subscription API accepts valid subscriptions and rejects non-HTTPS en
     assert.equal((await request({ ...valid, endpoint: 'http://push.example.test/insecure' })).status, 400);
     assert.equal(store.listPushSubscriptions().length, 1);
   } finally { store.close(); }
+});
+
+test('SQLite tracks push delivery per subscription and removes delivery state with its subscription', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fox-focus-push-delivery-'));
+  const path = join(dir, 'test.sqlite');
+  let store = openStore(path);
+  const first = { endpoint: 'https://push.example.test/first', keys: { p256dh: 'first-key', auth: 'first-auth' } };
+  const second = { endpoint: 'https://push.example.test/second', keys: { p256dh: 'second-key', auth: 'second-auth' } };
+  try {
+    store.savePushSubscription(first, null);
+    store.savePushSubscription(second, null);
+    store.markPushDelivered('reminder-1@2026-09-11T10:00:00.000Z', first.endpoint);
+    store.markPushDelivered('reminder-1@2026-09-11T10:00:00.000Z', first.endpoint);
+    store.markPushDelivered('reminder-1@2026-09-11T10:00:00.000Z', second.endpoint);
+    store.close();
+    store = openStore(path);
+    assert.deepEqual(store.listPushDeliveries(), [
+      { deliveryKey: 'reminder-1@2026-09-11T10:00:00.000Z', endpoint: first.endpoint },
+      { deliveryKey: 'reminder-1@2026-09-11T10:00:00.000Z', endpoint: second.endpoint },
+    ]);
+    assert.equal(store.deletePushSubscription(first.endpoint), true);
+    assert.deepEqual(store.listPushDeliveries(), [{
+      deliveryKey: 'reminder-1@2026-09-11T10:00:00.000Z', endpoint: second.endpoint,
+    }]);
+  } finally { store.close(); rmSync(dir, { recursive: true }); }
+});
+
+test('SQLite migrates the global delivery ledger without dropping its table', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fox-focus-push-migration-'));
+  const path = join(dir, 'test.sqlite');
+  const endpoint = 'https://push.example.test/existing';
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`PRAGMA user_version=3;
+    CREATE TABLE push_deliveries (delivery_key TEXT PRIMARY KEY, fired_at TEXT NOT NULL);
+    CREATE TABLE push_subscriptions (
+      endpoint TEXT PRIMARY KEY,
+      subscription_json TEXT NOT NULL CHECK(json_valid(subscription_json)),
+      user_agent TEXT,
+      created_at TEXT NOT NULL
+    );`);
+  legacy.prepare('INSERT INTO push_deliveries VALUES (?, ?)')
+    .run('reminder-1@2026-09-11T10:00:00.000Z', '2026-09-11T10:00:01.000Z');
+  legacy.prepare('INSERT INTO push_subscriptions VALUES (?, ?, NULL, ?)')
+    .run(endpoint, JSON.stringify({ endpoint, keys: { p256dh: 'public-key', auth: 'auth-secret' } }), '2026-09-11T09:00:00.000Z');
+  legacy.close();
+
+  const store = openStore(path);
+  try {
+    assert.deepEqual(store.listPushDeliveries(), [{
+      deliveryKey: 'reminder-1@2026-09-11T10:00:00.000Z', endpoint,
+    }]);
+    const db = new DatabaseSync(path);
+    try {
+      assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
+      assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='push_deliveries'").get());
+    } finally { db.close(); }
+  } finally { store.close(); rmSync(dir, { recursive: true }); }
 });

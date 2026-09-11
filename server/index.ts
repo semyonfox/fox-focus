@@ -7,8 +7,10 @@ import { createApp } from './app.ts';
 import { createIntegrationService, integrationConfigFromEnvironment } from './integrations.ts';
 import { openStore } from './store.ts';
 import { readHermesFeed } from './hermes.ts';
-import webPush, { type WebPushError } from 'web-push';
-import { deliveryKey, dueReminders } from './push.ts';
+import webPush from 'web-push';
+import { deliverDuePushNotifications, deliveryKey, subscriptionDeliveryKey } from './push.ts';
+
+const PUSH_REQUEST_TIMEOUT_MS = 10_000;
 
 const dataDir = process.env.DATA_DIR ?? './data';
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -59,28 +61,19 @@ async function sendDuePushNotifications(): Promise<void> {
   pushTickRunning = true;
   try {
     const snapshot = store.read();
-    const reminders = dueReminders(snapshot.data, new Date(), store.listPushDeliveries());
-    if (!reminders.length) return;
-    const subscriptions = store.listPushSubscriptions();
-    let sent = 0;
-    let removed = 0;
-    let failed = 0;
-    for (const reminder of reminders) {
-      const payload = JSON.stringify({ title: reminder.title, body: reminder.when, tag: reminder.id, url: '/' });
-      for (const { subscription } of subscriptions) {
-        try {
-          await webPush.sendNotification(subscription, payload);
-          sent += 1;
-        } catch (error) {
-          const statusCode = (error as WebPushError).statusCode;
-          if (statusCode === 404 || statusCode === 410) {
-            if (store.deletePushSubscription(subscription.endpoint)) removed += 1;
-          } else failed += 1;
-        }
-      }
+    store.prunePushDeliveries(snapshot.data.reminders.map(deliveryKey));
+    const summary = await deliverDuePushNotifications({
+      data: snapshot.data,
+      now: new Date(),
+      subscriptions: store.listPushSubscriptions().map(record => record.subscription),
+      delivered: new Set(store.listPushDeliveries().map(subscriptionDeliveryKey)),
+      send: (subscription, payload) => webPush.sendNotification(subscription, payload, { timeout: PUSH_REQUEST_TIMEOUT_MS }).then(() => undefined),
+      markDelivered: store.markPushDelivered,
+      deleteSubscription: store.deletePushSubscription,
+    });
+    if (summary.due > 0) {
+      console.log(`Push tick: ${summary.due} due, ${summary.sent} sent, ${summary.failed} failed, ${summary.removed} removed.`);
     }
-    store.markPushDelivered(reminders.map(deliveryKey), snapshot.data.reminders.map(deliveryKey));
-    console.log(`Push tick: ${reminders.length} due, ${sent} sent, ${failed} failed, ${removed} removed.`);
   } catch {
     console.error('Push tick failed.');
   } finally {
@@ -89,6 +82,7 @@ async function sendDuePushNotifications(): Promise<void> {
 }
 const pushTimer = setInterval(() => { void sendDuePushNotifications(); }, 60_000);
 pushTimer.unref();
+void sendDuePushNotifications();
 if (integrations) {
   // Polling keeps this private deployment read-only and avoids public webhooks.
   const initialSync = setTimeout(() => { void integrations.syncConnected(); }, 5_000);

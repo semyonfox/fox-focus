@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { createInitialData, isPrototypeData, type PrototypeData } from '../src/model.ts';
-import { isPushSubscription, type StoredPushSubscription } from './push.ts';
+import { isPushSubscription, type StoredPushDelivery, type StoredPushSubscription } from './push.ts';
 
 export type Snapshot = { revision: number; data: PrototypeData };
 export type Provider = 'google' | 'microsoft';
@@ -174,6 +174,8 @@ function rowToSync(row: Record<string, unknown> | undefined, provider: Provider)
 // normal tables, so an import cannot be edited through the workspace PUT route.
 export function openStore(path: string, initialData: PrototypeData = createInitialData()) {
   const db = new DatabaseSync(path);
+  const versionRow = db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined;
+  const previousSchemaVersion = typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS workspace (
       id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL,
@@ -239,14 +241,34 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       subscription_json TEXT NOT NULL CHECK(json_valid(subscription_json)),
       user_agent TEXT,
       created_at TEXT NOT NULL
-    );`);
+    );
+    CREATE TABLE IF NOT EXISTS push_subscription_deliveries (
+      delivery_key TEXT NOT NULL,
+      endpoint TEXT NOT NULL REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+      fired_at TEXT NOT NULL,
+      PRIMARY KEY(delivery_key, endpoint)
+    );
+    CREATE INDEX IF NOT EXISTS push_subscription_deliveries_endpoint
+      ON push_subscription_deliveries(endpoint);`);
   // A short-lived development build used the initial provider table without
   // date-only all-day columns. Keep that private SQLite shape upgrade-safe.
   const recordColumns = new Set((db.prepare('PRAGMA table_info(provider_records)').all() as Record<string, unknown>[])
     .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
   if (!recordColumns.has('starts_on')) db.exec('ALTER TABLE provider_records ADD COLUMN starts_on TEXT');
   if (!recordColumns.has('ends_on')) db.exec('ALTER TABLE provider_records ADD COLUMN ends_on TEXT');
-  db.exec('PRAGMA user_version=3;');
+  if (previousSchemaVersion < 4) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`INSERT OR IGNORE INTO push_subscription_deliveries (delivery_key, endpoint, fired_at)
+        SELECT deliveries.delivery_key, subscriptions.endpoint, deliveries.fired_at
+        FROM push_deliveries AS deliveries CROSS JOIN push_subscriptions AS subscriptions;
+        PRAGMA user_version=4;`);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
   db.prepare('INSERT OR IGNORE INTO workspace VALUES (1, 0, ?, ?)')
     .run(JSON.stringify(initialData), new Date().toISOString());
 
@@ -478,21 +500,29 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     return db.prepare('DELETE FROM push_subscriptions WHERE endpoint=?').run(endpoint).changes === 1;
   }
 
-  // server-side delivery state lives here so firing never bumps the workspace revision
-  function listPushDeliveries(): Set<string> {
-    const rows = db.prepare('SELECT delivery_key FROM push_deliveries').all() as Record<string, unknown>[];
-    return new Set(rows.flatMap(row => typeof row.delivery_key === 'string' ? [row.delivery_key] : []));
+  // Per-subscription state lets a failed device retry without duplicating a successful one.
+  function listPushDeliveries(): StoredPushDelivery[] {
+    const rows = db.prepare(`SELECT delivery_key, endpoint FROM push_subscription_deliveries
+      ORDER BY delivery_key, endpoint`).all() as Record<string, unknown>[];
+    return rows.flatMap(row => typeof row.delivery_key === 'string' && typeof row.endpoint === 'string'
+      ? [{ deliveryKey: row.delivery_key, endpoint: row.endpoint }]
+      : []);
   }
 
-  function markPushDelivered(keys: string[], keepKeys: string[]): void {
-    const firedAt = new Date().toISOString();
-    const insert = db.prepare('INSERT OR IGNORE INTO push_deliveries (delivery_key, fired_at) VALUES (?, ?)');
+  function markPushDelivered(key: string, endpoint: string): void {
+    db.prepare(`INSERT OR IGNORE INTO push_subscription_deliveries (delivery_key, endpoint, fired_at)
+      VALUES (?, ?, ?)`).run(key, endpoint, new Date().toISOString());
+  }
+
+  function prunePushDeliveries(keepKeys: string[]): void {
     const keep = new Set(keepKeys);
     db.exec('BEGIN');
     try {
-      for (const key of keys) insert.run(key, firedAt);
-      for (const key of listPushDeliveries()) {
-        if (!keep.has(key)) db.prepare('DELETE FROM push_deliveries WHERE delivery_key=?').run(key);
+      for (const delivery of listPushDeliveries()) {
+        if (!keep.has(delivery.deliveryKey)) {
+          db.prepare('DELETE FROM push_subscription_deliveries WHERE delivery_key=? AND endpoint=?')
+            .run(delivery.deliveryKey, delivery.endpoint);
+        }
       }
       db.exec('COMMIT');
     } catch (error) {
@@ -520,6 +550,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     deletePushSubscription,
     listPushDeliveries,
     markPushDelivered,
+    prunePushDeliveries,
     close: () => db.close(),
   };
 }
