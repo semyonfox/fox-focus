@@ -109,7 +109,8 @@ function taskFilterLabel(filter: TaskFilter): string {
 }
 
 function eventDateKey(event: TimelineEvent, legacyDate: string): string {
-  return typeof event.startsAt === "string" ? dublinDateKey(new Date(event.startsAt)) : legacyDate;
+  if (typeof event.startsAt === "string") return dublinDateKey(new Date(event.startsAt));
+  return event.date && isDateKey(event.date) ? event.date : legacyDate;
 }
 
 function eventTimeValue(event: TimelineEvent): string {

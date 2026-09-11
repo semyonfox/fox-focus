@@ -1,4 +1,4 @@
-import { isTimeValue } from "./calendar-time.ts";
+import { isDateKey, isTimeValue } from "./calendar-time.ts";
 
 export type Area = "University" | "Work" | "Personal" | "Health" | "Admin";
 export type Priority = "high" | "medium" | "low";
@@ -28,6 +28,8 @@ export type Task = {
   priority: Priority;
   completed: boolean;
   scheduledTime: string | null;
+  /** Retained while dated week-planning rows are migrated to exact event instants. */
+  scheduledDate?: string;
   linkedEventId?: string;
   origin: TaskOrigin;
   source?: string;
@@ -47,10 +49,10 @@ type TimelineEventBase = {
   taskId?: string;
 };
 
-/** New calendar blocks store an exact instant. `start` remains readable for legacy workspace rows. */
+/** New calendar blocks store an exact instant. Dated and time-only legacy rows remain readable. */
 export type TimelineEvent = TimelineEventBase & (
-  | { startsAt: string; start?: never }
-  | { startsAt?: never; start: string }
+  | { startsAt: string; start?: never; date?: never }
+  | { startsAt?: never; start: string; date?: string }
 );
 
 export type InboxItem = {
@@ -180,6 +182,7 @@ export function isTask(value: unknown): value is Task {
     isOneOf(value.priority, priorities) &&
     typeof value.completed === "boolean" &&
     (value.scheduledTime === null || typeof value.scheduledTime === "string") &&
+    (value.scheduledDate === undefined || isDateKey(value.scheduledDate)) &&
     (value.linkedEventId === undefined || typeof value.linkedEventId === "string") &&
     isOneOf(value.origin, taskOrigins) &&
     (value.source === undefined || typeof value.source === "string") &&
@@ -218,6 +221,7 @@ export function isTimelineEvent(value: unknown): value is TimelineEvent {
 
   const hasInstant = isIsoInstant(value.startsAt);
   const hasLegacyTime = isTimeValue(value.start);
+  const hasValidLegacyDate = value.date === undefined || isDateKey(value.date);
 
   return (
     typeof value.id === "string" &&
@@ -225,7 +229,8 @@ export function isTimelineEvent(value: unknown): value is TimelineEvent {
     typeof value.subtitle === "string" &&
     isOneOf(value.area, areas) &&
     typeof value.duration === "number" && Number.isFinite(value.duration) && value.duration > 0 && value.duration <= 1440 &&
-    ((hasInstant && value.start === undefined) || (hasLegacyTime && value.startsAt === undefined)) &&
+    ((hasInstant && value.start === undefined && value.date === undefined) ||
+      (hasLegacyTime && value.startsAt === undefined && hasValidLegacyDate)) &&
     typeof value.editable === "boolean" &&
     isOneOf(value.origin, eventOrigins) &&
     (value.source === undefined || typeof value.source === "string") &&

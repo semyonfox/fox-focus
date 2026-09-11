@@ -28,6 +28,8 @@ function task(id: string, overrides: Partial<Task> = {}): Task {
 test("accepts valid optional creation instants and preserves legacy tasks", () => {
   assert.equal(isTask(task("legacy")), true);
   assert.equal(isTask(task("offset", { createdAt: "2026-09-11T10:00:00+01:00" })), true);
+  assert.equal(isTask(task("dated-plan", { scheduledDate: "2026-09-11", scheduledTime: "10:00" })), true);
+  assert.equal(isTask(task("bad-plan-date", { scheduledDate: "2026-02-30", scheduledTime: "10:00" })), false);
   assert.equal(isTask(task("bad-date", { createdAt: "2026-02-30T10:00:00Z" })), false);
   assert.equal(isTask(task("date-only", { createdAt: "2026-09-11" })), false);
   assert.equal(isTask(task("not-an-instant", { createdAt: "yesterday" })), false);
@@ -67,7 +69,7 @@ test("uses newest-created as the secondary due-ordering rule", () => {
   assert.deepEqual(tasks.sort(compareTasksByDue).map(({ id }) => id), ["newer", "older", "legacy"]);
 });
 
-test("accepts exact calendar instants while preserving time-only legacy rows", () => {
+test("accepts exact calendar instants while preserving dated and time-only legacy rows", () => {
   const base = {
     id: "event-1",
     title: "Focus block",
@@ -80,8 +82,11 @@ test("accepts exact calendar instants while preserving time-only legacy rows", (
 
   assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11T08:30:00.000Z" }), true);
   assert.equal(isTimelineEvent({ ...base, start: "09:30" }), true);
+  assert.equal(isTimelineEvent({ ...base, date: "2026-09-11", start: "09:30" }), true);
+  assert.equal(isTimelineEvent({ ...base, date: "2026-02-30", start: "09:30" }), false);
   assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11", start: "09:30" }), false);
   assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11T08:30:00.000Z", start: "09:30" }), false);
+  assert.equal(isTimelineEvent({ ...base, startsAt: "2026-09-11T08:30:00.000Z", date: "2026-09-11" }), false);
 });
 
 test("accepts handled inbox records", () => {

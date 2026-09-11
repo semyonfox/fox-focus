@@ -12,7 +12,7 @@ This release establishes the focused daily workflow without changing task owners
 - Inbox review presents one selected item at a time with previous and next controls, local task/calendar/draft/no-action outcomes, reversible handled state, and a local feedback note. No email or Hermes action is sent.
 - Task capture starts with a title and deadline; area, priority, duration, planning, and reminder preview live under `More options`.
 - The fixed header no longer changes position while scrolling, uses a slightly translucent surface, and reduces appearance selection to one icon with `System` as the default.
-- New local calendar blocks store UTC instants and render against `Europe/Dublin`; legacy time-only rows remain readable. Spring-forward gaps and fall-back ambiguities are rejected rather than silently shifted.
+- New local calendar blocks store UTC instants and render against `Europe/Dublin`; dated and time-only legacy rows remain readable. Spring-forward gaps and fall-back ambiguities are rejected rather than silently shifted.
 - Connections and reminder prototypes sit at the end of the working flow. Reminder controls are explicitly manual in-app previews because no scheduler or system-notification delivery exists yet.
 
 The next implementation phase still needs the persisted parent/child category and classification tables described below, provider tasks in the main browser, a real Gmail-backed review source, the Hermes approval API, provider write approvals, durable reminder delivery, and authenticated real-account OAuth validation. Until those gates pass, the existing Hermes board and each connected provider remain authoritative.
