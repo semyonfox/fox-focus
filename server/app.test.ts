@@ -11,12 +11,12 @@ function testData(): PrototypeData {
   return {
     tasks: [{ id: 'test-task', title: 'Test task', area: 'Personal', state: 'scheduled',
       duration: '30 min', due: 'Today', priority: 'medium', completed: false,
-      scheduledTime: '10:00', linkedEventId: 'test-block', origin: 'manual' }],
+      scheduledDate: '2026-09-11', scheduledTime: '10:00', linkedEventId: 'test-block', origin: 'manual' }],
     events: [
       { id: 'test-context', title: 'Read-only test context', subtitle: '', area: 'Work',
-        start: '09:00', duration: 30, editable: false, origin: 'fixture' },
+        date: '2026-09-11', start: '09:00', duration: 30, editable: false, origin: 'fixture' },
       { id: 'test-block', title: 'Test task', subtitle: '', area: 'Personal',
-        start: '10:00', duration: 30, editable: true, origin: 'task', taskId: 'test-task' },
+        date: '2026-09-11', start: '10:00', duration: 30, editable: true, origin: 'task', taskId: 'test-task' },
     ],
     inboxItems: [], reminders: [],
   };
@@ -66,6 +66,9 @@ test('workspace API protects data, validates writes and rejects stale revisions'
     const badTime = store.read();
     badTime.data.events[0].start = '26:99';
     assert.equal((await put(badTime)).status, 400);
+    const badDate = store.read();
+    badDate.data.events[0].date = '2026-02-30';
+    assert.equal((await put(badDate)).status, 400);
     assert.equal(store.read().revision, 1);
   } finally { store.close(); }
 });
@@ -83,7 +86,9 @@ test('SQLite keeps edits across restart and preserves task/event transaction', (
     assert.equal(store.read().revision, 1);
     assert.equal(store.read().data.tasks[0].title, 'Survives restart');
     assert.equal(store.read().data.tasks[0].linkedEventId, 'test-block');
+    assert.equal(store.read().data.tasks[0].scheduledDate, '2026-09-11');
     assert.equal(store.read().data.events.find(event => event.id === 'test-block')?.taskId, 'test-task');
+    assert.equal(store.read().data.events.find(event => event.id === 'test-block')?.date, '2026-09-11');
     assert.equal(store.save(0, snapshot.data), null);
   } finally { store.close(); rmSync(dir, { recursive: true }); }
 });

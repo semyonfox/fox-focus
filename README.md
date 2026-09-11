@@ -1,13 +1,13 @@
 # Fox Focus
 
-Fox Focus is a private, self-hosted workspace for deciding what needs attention today. It brings local tasks, a simple timetable, reminders, reviewable incoming work, and a read-only view of Hermes activity into one page.
+Fox Focus is a private, self-hosted workspace for deciding what needs attention today. It brings local tasks, a week calendar, reminders, reviewable incoming work, and a read-only view of Hermes activity into one page.
 
 It is deliberately small. The point is not to build another project manager or to pretend that every service owns the same task. Fox Focus gives you a place to see the moving parts, capture something quickly, and decide what happens next.
 
 ## What works today
 
 - Add, edit, schedule, prioritise, and complete local tasks.
-- Add and edit local calendar blocks with colour-coded areas.
+- Add and edit local calendar blocks with colour-coded areas, then move through the week day by day.
 - Capture an Inbox item, review it, and ask for a draft or more work before turning it into action.
 - Keep local data in a SQLite file, with revision checks that stop one browser tab from silently overwriting another.
 - Show a read-only, human-readable feed from a Hermes Personal Tasks board when one is mounted. Hermes remains the source of truth.

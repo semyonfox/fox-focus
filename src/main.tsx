@@ -1,9 +1,11 @@
 import "@fontsource-variable/instrument-sans";
+import "@fontsource-variable/newsreader";
 import {
   Bell,
   Bot,
   CalendarDays,
   Check,
+  ChevronLeft,
   ChevronRight,
   Circle,
   Clock3,
@@ -23,7 +25,7 @@ import "./styles.css";
 import { hermesLabels, useHermesFeed } from './hermes-feed.tsx';
 import { type HermesTask } from "./hermes-model.ts";
 
-import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
+import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isCalendarDate, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, addCalendarDays, calendarDateForDueLabel, compareTasksByCreatedAt, compareTasksByDue, createInitialData, dublinCalendarDate, startOfCalendarWeek } from "./model.ts";
 
 function loadData(): PrototypeData {
   if (typeof window === "undefined") return createInitialData();
@@ -81,13 +83,34 @@ function formatCreatedAt(createdAt: string | undefined): string | null {
   }).format(new Date(createdAt));
 }
 
-function formatCalendarDay(): string {
-  return new Intl.DateTimeFormat("en-IE", {
-    weekday: "long",
+function calendarDateAtNoon(date: string): Date {
+  return new Date(`${date}T12:00:00Z`);
+}
+
+function formatCalendarDate(date: string, options: Intl.DateTimeFormatOptions): string {
+  return new Intl.DateTimeFormat("en-IE", { ...options, timeZone: "Europe/Dublin" }).format(calendarDateAtNoon(date));
+}
+
+function formatCalendarWeek(start: string): string {
+  const end = addCalendarDays(start, 6);
+  const startDate = calendarDateAtNoon(start);
+  const endDate = calendarDateAtNoon(end);
+  const formatter = new Intl.DateTimeFormat("en-IE", {
     day: "numeric",
     month: "short",
     timeZone: "Europe/Dublin",
-  }).format(new Date());
+  });
+  return start.slice(0, 4) === end.slice(0, 4)
+    ? `${formatter.format(startDate)} – ${formatter.format(endDate)}`
+    : `${formatter.format(startDate)} ${start.slice(0, 4)} – ${formatter.format(endDate)} ${end.slice(0, 4)}`;
+}
+
+function formatTaskPlan(task: Task): string {
+  if (!task.scheduledTime) return "";
+  const date = task.scheduledDate
+    ? `${formatCalendarDate(task.scheduledDate, { day: "numeric", month: "short" })} · `
+    : "";
+  return `${date}${task.scheduledTime} in calendar`;
 }
 
 function taskFilterLabel(filter: TaskFilter): string {
@@ -175,7 +198,7 @@ function TaskRow({
         <span>
           <i className={`area-dot area-dot--${areaClass(task.area)}`} />
           {task.area} · {task.duration}
-          {task.scheduledTime ? <em className="task-sync-chip">{task.completed ? "Calendar done" : `${task.scheduledTime} in calendar`}</em> : null}
+          {task.scheduledTime ? <em className="task-sync-chip">{task.completed ? "Calendar done" : formatTaskPlan(task)}</em> : null}
           {task.origin === "inbox" ? <em className="source-chip" title={task.source} aria-label={`From ${task.source ?? "Inbox"}`}>{task.source?.replace(/^Inbox · /, "") ?? "Inbox"}</em> : null}
           <em className={`task-created${createdAt ? "" : " task-created--unknown"}`}>{createdAt ? `Added ${createdAt}` : "Created date unknown"}</em>
         </span>
@@ -253,6 +276,152 @@ function hermesSourceId(source: string): string {
   return `hermes:${source}`;
 }
 
+type CalendarWeekProps = {
+  weekStart: string;
+  today: string;
+  events: TimelineEvent[];
+  tasks: Task[];
+  onOpenEvent: (event: TimelineEvent) => void;
+  onOpenTask: (task: Task) => void;
+};
+
+function CalendarWeek({ weekStart, today, events, tasks, onOpenEvent, onOpenTask }: CalendarWeekProps) {
+  const days = Array.from({ length: 7 }, (_, offset) => addCalendarDays(weekStart, offset));
+  const eventsByDate = new Map<string, TimelineEvent[]>();
+  const scheduledTaskIds = new Set<string>();
+  const undatedEvents: TimelineEvent[] = [];
+
+  for (const event of events) {
+    if (!event.date) {
+      undatedEvents.push(event);
+      if (event.taskId) scheduledTaskIds.add(event.taskId);
+      continue;
+    }
+    const date = event.date;
+    const dayEvents = eventsByDate.get(date) ?? [];
+    dayEvents.push(event);
+    eventsByDate.set(date, dayEvents);
+    if (event.taskId) scheduledTaskIds.add(event.taskId);
+  }
+
+  for (const dayEvents of eventsByDate.values()) {
+    dayEvents.sort((first, second) => first.start.localeCompare(second.start) || first.id.localeCompare(second.id));
+  }
+  undatedEvents.sort((first, second) => first.start.localeCompare(second.start) || first.id.localeCompare(second.id));
+
+  const undatedTasks = tasks
+    .filter((task) => !task.completed && Boolean(task.scheduledTime) && !task.scheduledDate && !scheduledTaskIds.has(task.id))
+    .sort((first, second) => (first.scheduledTime ?? "").localeCompare(second.scheduledTime ?? "") || first.id.localeCompare(second.id));
+  const undatedTaskIds = new Set(undatedTasks.map((task) => task.id));
+
+  const tasksByDate = new Map<string, Task[]>();
+  for (const task of tasks) {
+    if (task.completed || scheduledTaskIds.has(task.id) || undatedTaskIds.has(task.id)) continue;
+    const date = calendarDateForDueLabel(task.due, today);
+    if (!date) continue;
+    const dayTasks = tasksByDate.get(date) ?? [];
+    dayTasks.push(task);
+    tasksByDate.set(date, dayTasks);
+  }
+
+  for (const dayTasks of tasksByDate.values()) dayTasks.sort(compareTasksByDue);
+
+  return (
+    <>
+      {undatedEvents.length || undatedTasks.length ? (
+        <section className="calendar-undated" aria-labelledby="calendar-undated-heading">
+          <div>
+            <h3 className="eyebrow" id="calendar-undated-heading">Needs a day</h3>
+            <p>These local plans have a time but no date. They stay out of the calendar until you place them.</p>
+          </div>
+          <div className="calendar-undated-items">
+            {undatedEvents.map((event) => (
+              <button className="calendar-undated-entry" key={event.id} type="button" onClick={() => onOpenEvent(event)}>
+                <time>{event.start}</time>
+                <span className={`calendar-entry-dot calendar-entry-dot--${areaClass(event.area)}`} />
+                <strong>{event.title}</strong>
+                <small>Set a day</small>
+              </button>
+            ))}
+            {undatedTasks.map((task) => (
+              <button className="calendar-undated-entry" key={task.id} type="button" onClick={() => onOpenTask(task)}>
+                <time>{task.scheduledTime}</time>
+                <span className={`calendar-entry-dot calendar-entry-dot--${areaClass(task.area)}`} />
+                <strong>{task.title}</strong>
+                <small>Set a day</small>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      <div className="calendar-week-scroll">
+        <section className="calendar-week" aria-label={`Calendar week of ${formatCalendarWeek(weekStart)}`}>
+        {days.map((date) => {
+          const dayEvents = eventsByDate.get(date) ?? [];
+          const dayTasks = tasksByDate.get(date) ?? [];
+          const isToday = date === today;
+          const weekday = formatCalendarDate(date, { weekday: "short" });
+          const dayNumber = formatCalendarDate(date, { day: "numeric" });
+          const isWeekend = date === days[5] || date === days[6];
+
+          return (
+            <section
+              className={`calendar-day${isToday ? " calendar-day--today" : ""}${isWeekend ? " calendar-day--weekend" : ""}`}
+              key={date}
+              aria-labelledby={`calendar-day-${date}`}
+            >
+              <header className="calendar-day-heading">
+                <h3 id={`calendar-day-${date}`}><span>{weekday}</span><time dateTime={date}>{dayNumber}</time></h3>
+                {isToday ? <b>Today</b> : null}
+              </header>
+              <div className="calendar-day-items">
+                {dayTasks.length ? <div className="calendar-due-tasks" aria-label={`Tasks due ${formatCalendarDate(date, { weekday: "long", day: "numeric", month: "long" })}`}>
+                  {dayTasks.map((task) => (
+                    <button
+                      className={`calendar-task-marker calendar-task-marker--${areaClass(task.area)}`}
+                      key={task.id}
+                      type="button"
+                      onClick={() => onOpenTask(task)}
+                      title={`Edit ${task.title}`}
+                    >
+                      <span className="calendar-task-dot" />
+                      <strong>{task.title}</strong>
+                    </button>
+                  ))}
+                </div> : null}
+                {dayEvents.length ? <div className="calendar-timed-blocks">
+                  {dayEvents.map((event) => {
+                    const linkedTask = event.taskId ? tasks.find((task) => task.id === event.taskId) : undefined;
+                    const isTaskBlock = Boolean(event.taskId);
+                    return (
+                      <button
+                        className={`calendar-entry${event.editable ? " calendar-entry--local" : " calendar-entry--imported"}${isTaskBlock ? " calendar-entry--task-block" : ""}${linkedTask?.completed ? " calendar-entry--done" : ""}`}
+                        key={event.id}
+                        type="button"
+                        onClick={() => onOpenEvent(event)}
+                        title={event.editable ? `Edit ${event.title}` : `${event.title} is read-only calendar context`}
+                      >
+                        <time>{event.start}</time>
+                        <span className={`calendar-entry-dot calendar-entry-dot--${areaClass(event.area)}`} />
+                        <span className="calendar-entry-copy">
+                          <strong>{event.title}</strong>
+                          <small>{linkedTask?.completed ? "Completed task" : isTaskBlock ? "Planned task" : event.editable ? event.subtitle : "Calendar context"}</small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div> : null}
+                {!dayEvents.length && !dayTasks.length ? <p className="calendar-day-empty">Nothing planned</p> : null}
+              </div>
+            </section>
+          );
+        })}
+        </section>
+      </div>
+    </>
+  );
+}
+
 function App({ initial }: { initial?: ServerSnapshot }) {
   const hermes = useHermesFeed(Boolean(initial));
   const [data, setData] = useState<PrototypeData>(() => initial?.data ?? loadData());
@@ -269,7 +438,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [taskDraft, setTaskDraft] = useState<TaskDraft>(defaultTaskDraft);
   const [eventDraft, setEventDraft] = useState<EventDraft>(defaultEventDraft);
   const [draftText, setDraftText] = useState("");
-  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [calendarWeekStart, setCalendarWeekStart] = useState(() => startOfCalendarWeek(dublinCalendarDate()));
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("all");
   const [taskSource, setTaskSource] = useState(allTaskSources);
@@ -429,16 +598,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     else if (tabEnd > strip.scrollLeft + strip.clientWidth) strip.scrollTo({ left: tabEnd - strip.clientWidth, behavior: "smooth" });
   }, [taskFilter]);
 
-  const sortedEvents = useMemo(
-    () => [...data.events].sort((first, second) => first.start.localeCompare(second.start)),
-    [data.events],
-  );
-  const taskById = useMemo(() => new Map(data.tasks.map((task) => [task.id, task])), [data.tasks]);
-  const selectedEvent = data.events.find((event) => event.id === selectedEventId) ?? sortedEvents[0] ?? null;
-  const selectedEventTask = selectedEvent?.taskId ? taskById.get(selectedEvent.taskId) : undefined;
   const selectedInbox = data.inboxItems.find((item) => item.id === selectedInboxId) ?? data.inboxItems[0] ?? null;
   const activeTasks = data.tasks.filter((task) => !task.completed);
-  const activeBlock = sortedEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
   const activeReminder = data.reminders.find((reminder) => reminder.id === activeReminderId) ?? null;
   const hermesBoard = hermes.feed?.state === "connected" ? hermes.feed.board : null;
   const hermesTasks = hermesBoard?.tasks ?? [];
@@ -519,7 +680,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setTaskSource(allTaskSources);
   }, [taskFilter, taskSource]);
 
-  const calendarDay = formatCalendarDay();
+  const today = dublinCalendarDate();
 
   function scrollToSection(section: SectionAnchor) {
     setActiveSection(section);
@@ -558,6 +719,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       due: task?.due ?? "No deadline",
       duration: task?.duration ?? "30 min",
       state: task && task.state !== "done" ? task.state : "up-next",
+      scheduledDate: task?.scheduledDate ?? (task?.scheduledTime ? today : ""),
       scheduledTime: task?.scheduledTime ?? "",
       reminderMode: task ? reminderModeFor(data.reminders, task.id) : "none",
     });
@@ -574,6 +736,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       title: event?.title ?? inboxItem?.title ?? "",
       subtitle: event?.subtitle ?? "",
       area: event?.area ?? inboxItem?.accent ?? "Personal",
+      date: event?.date ?? today,
       time: event?.start ?? "09:00",
       duration: event ? String(event.duration) : "30",
       reminderMode: event ? reminderModeFor(data.reminders, event.id) : "none",
@@ -630,12 +793,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function openTaskSchedule(task: Task) {
-    if (!task.linkedEventId) {
+    const linkedEvent = task.linkedEventId ? data.events.find((event) => event.id === task.linkedEventId) : undefined;
+    if (!linkedEvent) {
       openTaskComposer(task);
       return;
     }
-    setSelectedEventId(task.linkedEventId);
-    scrollToSection("agenda");
+    setCalendarWeekStart(startOfCalendarWeek(linkedEvent.date ?? task.scheduledDate ?? today));
+    openEventComposer(linkedEvent);
   }
 
   function saveTask(event: FormEvent<HTMLFormElement>) {
@@ -651,19 +815,25 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setStatusMessage("Choose a valid planned time before saving the task.");
       return;
     }
+    if (taskDraft.scheduledTime && !isCalendarDate(taskDraft.scheduledDate)) {
+      setStatusMessage("Choose a calendar day for the planned task.");
+      return;
+    }
 
     const existingTask = modal.taskId ? data.tasks.find((task) => task.id === modal.taskId) : undefined;
     const inboxItem = modal.inboxId ? data.inboxItems.find((item) => item.id === modal.inboxId) : undefined;
     const taskId = existingTask?.id ?? makeId("task");
     const origin: TaskOrigin = existingTask?.origin ?? (inboxItem ? "inbox" : "manual");
     const source = existingTask?.source ?? (inboxItem ? `Inbox · ${inboxItem.source}` : undefined);
-    const linkedEventId = taskDraft.scheduledTime ? existingTask?.linkedEventId ?? makeId("event") : undefined;
-    const linkedEvent = linkedEventId
+    const plannedDate = taskDraft.scheduledTime ? taskDraft.scheduledDate : undefined;
+    const linkedEventId = plannedDate ? existingTask?.linkedEventId ?? makeId("event") : undefined;
+    const linkedEvent: TimelineEvent | null = linkedEventId && plannedDate
       ? {
           id: linkedEventId,
           title,
           subtitle: `${taskDraft.area} task · ${taskDraft.duration}`,
           area: taskDraft.area,
+          date: plannedDate,
           start: taskDraft.scheduledTime,
           duration: parseDuration(taskDraft.duration),
           editable: true,
@@ -683,6 +853,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       priority: taskDraft.priority,
       completed: existingTask?.completed ?? false,
       scheduledTime: taskDraft.scheduledTime || null,
+      ...(plannedDate ? { scheduledDate: plannedDate } : {}),
       linkedEventId,
       origin,
       ...(source ? { source } : {}),
@@ -711,7 +882,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     });
 
     if (completionUndo?.taskId === taskId) setCompletionUndo(null);
-    if (linkedEventId) setSelectedEventId(linkedEventId);
+    if (plannedDate) setCalendarWeekStart(startOfCalendarWeek(plannedDate));
     setStatusMessage(inboxItem ? `Accepted “${title}” as a local task.` : `Saved “${title}”.`);
     setModal(null);
   }
@@ -729,6 +900,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setStatusMessage("Choose a valid start time before saving the calendar block.");
       return;
     }
+    if (!isCalendarDate(eventDraft.date)) {
+      setStatusMessage("Choose a calendar day before saving the block.");
+      return;
+    }
 
     const existingEvent = modal.eventId ? data.events.find((candidate) => candidate.id === modal.eventId) : undefined;
     const inboxItem = modal.inboxId ? data.inboxItems.find((item) => item.id === modal.inboxId) : undefined;
@@ -739,6 +914,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       title,
       subtitle: eventDraft.subtitle.trim() || "Local calendar block",
       area: eventDraft.area,
+      date: eventDraft.date,
       start: eventDraft.time,
       duration: parseDuration(eventDraft.duration),
       editable: true,
@@ -756,6 +932,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                   title,
                   area: eventDraft.area,
                   duration: formatDuration(nextEvent.duration),
+                  scheduledDate: eventDraft.date,
                   scheduledTime: eventDraft.time,
                   state: task.completed ? "done" : "scheduled",
                 }
@@ -770,7 +947,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }));
 
     if (existingEvent?.taskId && completionUndo?.taskId === existingEvent.taskId) setCompletionUndo(null);
-    setSelectedEventId(eventId);
+    setCalendarWeekStart(startOfCalendarWeek(eventDraft.date));
     setStatusMessage(inboxItem ? `Accepted “${title}” as a local calendar block.` : `Saved “${title}”.`);
     setModal(null);
   }
@@ -783,7 +960,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setData((current) => ({
       tasks: current.tasks.map((task) =>
         task.linkedEventId === eventToRemove.id
-          ? { ...task, linkedEventId: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
+          ? { ...task, linkedEventId: undefined, scheduledDate: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
           : task,
       ),
       events: current.events.filter((event) => event.id !== eventToRemove.id),
@@ -791,7 +968,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       reminders: current.reminders.filter((reminder) => reminder.targetId !== eventToRemove.id),
     }));
     if (eventToRemove.taskId && completionUndo?.taskId === eventToRemove.taskId) setCompletionUndo(null);
-    setSelectedEventId(null);
     setStatusMessage(`Removed local block “${eventToRemove.title}”.`);
     setModal(null);
   }
@@ -884,80 +1060,43 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <div className="lifeboard-title">
             <p className="eyebrow">{initial ? "Personal workspace · private" : "Personal workspace · on this device"}</p>
             <h1>Today</h1>
-            <p>Tasks, calendar time, and decisions that need you—one surface, with no duplicate queues.</p>
+            <p>A quieter view of your time, tasks, and decisions. Nothing has to be duplicated.</p>
           </div>
         </section>
 
         <section className="lifeboard-grid" aria-label="Fox Focus lifeboard">
           <div className="lifeboard-column lifeboard-column--agenda">
-          <article className="pane lifeboard-agenda" id="agenda">
-            <PaneHeader
-              eyebrow="Calendar / local blocks"
-              title="Today in time order"
-              action={<button className="pane-link" type="button" onClick={() => openEventComposer()}><Plus size={12} /> Add to calendar</button>}
-            />
-            <div className="calendar-ribbon">
-              <span>Calendar</span>
-              <strong>{calendarDay}</strong>
-              <small>{sortedEvents.length} block{sortedEvents.length === 1 ? "" : "s"} · local changes stay linked to their task</small>
-            </div>
-            {initial ? <p className="source-boundary">Calendar source not connected. Add and edit your own blocks here.</p> : null}
-            {activeBlock ? (
-              <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}>
-                <div className="active-block-copy">
-                  <span className="live-label"><span /> Next editable block</span>
-                  <strong>{activeBlock.title}</strong>
-                  <small>{activeBlock.start} · {formatDuration(activeBlock.duration)} · {activeBlock.taskId ? "linked task" : "local block"}</small>
+            <article className="pane lifeboard-agenda lifeboard-calendar" id="agenda">
+              <header className="calendar-heading">
+                <div>
+                  <p className="eyebrow">Calendar / local planning</p>
+                  <h2>{formatCalendarWeek(calendarWeekStart)}</h2>
+                  <p>Timed blocks hold their place. Due tasks sit lightly on the day they need attention.</p>
                 </div>
-                <button className="open-note" type="button" onClick={() => setSelectedEventId(activeBlock.id)}>Inspect <ChevronRight size={12} /></button>
-              </div>
-            ) : null}
-            <div className="schedule-list agenda-list">
-              {sortedEvents.map((event) => {
-                const linkedTask = event.taskId ? taskById.get(event.taskId) : undefined;
-                const linkedTaskDone = linkedTask?.completed === true;
-                return (
-                  <button
-                    className={`schedule-row${event.id === selectedEvent?.id ? " schedule-row--selected" : ""}${linkedTaskDone ? " schedule-row--done" : ""}${event.editable ? "" : " schedule-row--imported"}`}
-                    key={event.id}
-                    type="button"
-                    aria-pressed={event.id === selectedEvent?.id}
-                    onClick={() => setSelectedEventId(event.id)}
-                  >
-                    <time>{event.start}</time>
-                    <i className={`area-dot area-dot--${areaClass(event.area)}`} />
-                    <span className="schedule-row-copy">
-                      <strong>{event.title}</strong>
-                      <small><em className={`agenda-origin${event.editable ? " agenda-origin--local" : " agenda-origin--imported"}${linkedTaskDone ? " agenda-origin--done" : ""}`}>{linkedTaskDone ? "Done" : event.editable ? "Local" : "Imported"}</em>{event.subtitle}</small>
-                    </span>
-                    <span className="schedule-duration">{formatDuration(event.duration)}</span>
-                    <ChevronRight className="schedule-arrow" size={14} />
-                  </button>
-                );
-              })}
-              {!sortedEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>No blocks yet. Add the first thing that has a time.</span></div> : null}
-            </div>
-            {selectedEvent ? (
-              <div className="agenda-detail">
-                <div className="agenda-detail-main">
-                  <i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} />
-                  <span>
-                    <em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em>
-                    <strong>{selectedEvent.title}</strong>
-                    <small>{selectedEvent.start} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}</small>
-                  </span>
+                <div className="calendar-heading-actions">
+                  <div className="calendar-week-controls" aria-label="Calendar week controls">
+                    <button type="button" onClick={() => setCalendarWeekStart((current) => addCalendarDays(current, -7))} aria-label="Previous week"><ChevronLeft size={15} /></button>
+                    <button type="button" onClick={() => setCalendarWeekStart(startOfCalendarWeek(today))}>Today</button>
+                    <button type="button" onClick={() => setCalendarWeekStart((current) => addCalendarDays(current, 7))} aria-label="Next week"><ChevronRight size={15} /></button>
+                  </div>
+                  <button className="calendar-add-button" type="button" onClick={() => openEventComposer()}><Plus size={14} /> Add block</button>
                 </div>
-                <div className="agenda-detail-actions">
-                  {selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}
-                  {selectedEvent.editable ? (
-                    <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button>
-                  ) : (
-                    <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>
-                  )}
-                </div>
-              </div>
-            ) : null}
-          </article>
+              </header>
+              <CalendarWeek
+                weekStart={calendarWeekStart}
+                today={today}
+                events={data.events}
+                tasks={data.tasks}
+                onOpenEvent={openEventComposer}
+                onOpenTask={openTaskComposer}
+              />
+              <footer className="calendar-footnote">
+                <span><i className="calendar-legend-mark calendar-legend-mark--block" /> Local block</span>
+                <span><i className="calendar-legend-mark calendar-legend-mark--task" /> Planned task</span>
+                <span><i className="calendar-legend-mark calendar-legend-mark--due" /> Due task</span>
+                {initial ? <small>Calendar sync is not connected. These local blocks stay editable here.</small> : null}
+              </footer>
+            </article>
           </div>
 
           <article className="pane lifeboard-tasks" id="tasks">
@@ -1143,10 +1282,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Deadline</span><select value={taskDraft.due} onChange={(event) => setTaskDraft((current) => ({ ...current, due: event.target.value }))}><option value="Today">Today</option><option value="Tomorrow">Tomorrow</option><option value="Friday">Friday</option><option value="Waiting">Waiting</option><option value="No deadline">No deadline</option></select></label>
               <label className="field"><span>Duration</span><select value={taskDraft.duration} onChange={(event) => setTaskDraft((current) => ({ ...current, duration: event.target.value }))}><option value="5 min">5 min</option><option value="10 min">10 min</option><option value="20 min">20 min</option><option value="30 min">30 min</option><option value="40 min">40 min</option><option value="45 min">45 min</option><option value="60 min">60 min</option></select></label>
               <label className="field"><span>Task state</span><select value={taskDraft.state} onChange={(event) => { const value = event.target.value; if (isOneOf(value, activeTaskStates)) setTaskDraft((current) => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="scheduled">Scheduled</option><option value="waiting">Waiting</option></select></label>
-              <label className="field"><span>Plan into timetable</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
+              <label className="field"><span>Plan day</span><input type="date" required={Boolean(taskDraft.scheduledTime)} value={taskDraft.scheduledDate} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledDate: event.target.value }))} /></label>
+              <label className="field"><span>Plan time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value, scheduledDate: event.target.value ? current.scheduledDate || today : current.scheduledDate }))} /></label>
               <label className="field"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
             </div>
-            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div><button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
+            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local calendar block." : "Leave the plan blank to keep this task unscheduled."}</span><div><button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -1164,6 +1304,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field field--full"><span>Block title</span><input autoFocus value={eventDraft.title} onChange={(event) => setEventDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What belongs in the timetable?" /></label>
               <label className="field field--full"><span>Location or context</span><input value={eventDraft.subtitle} onChange={(event) => setEventDraft((current) => ({ ...current, subtitle: event.target.value }))} placeholder="Optional note, location, or call link" /></label>
               <label className="field"><span>Area</span><select value={eventDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setEventDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
+              <label className="field"><span>Day</span><input type="date" required value={eventDraft.date} onChange={(event) => setEventDraft((current) => ({ ...current, date: event.target.value }))} /></label>
               <label className="field"><span>Start time</span><input type="time" required value={eventDraft.time} onChange={(event) => setEventDraft((current) => ({ ...current, time: event.target.value }))} /></label>
               <label className="field"><span>Duration</span><select value={eventDraft.duration} onChange={(event) => setEventDraft((current) => ({ ...current, duration: event.target.value }))}><option value="15">15 min</option><option value="30">30 min</option><option value="45">45 min</option><option value="60">60 min</option><option value="90">90 min</option></select></label>
               <label className="field"><span>Reminder</span><select value={eventDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setEventDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
