@@ -2354,6 +2354,25 @@ textarea:focus-visible {
   margin-block: 16px;
 }
 
+.hermes-list-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-block: 12px;
+}
+
+.hermes-list-tabs .filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
+}
+
+.hermes-list-count { opacity: 0.65; font-variant-numeric: tabular-nums; }
+
 .hermes-completed,
 .hermes-meta {
   color: var(--muted);
