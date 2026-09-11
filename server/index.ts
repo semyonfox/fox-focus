@@ -33,18 +33,22 @@ const integrationConfig = integrationConfigFromEnvironment();
 const integrations = integrationConfig ? createIntegrationService(store, integrationConfig) : undefined;
 const app = createApp(store, password, hermesPath ? () => readHermesFeed({ dbPath: hermesPath }) : undefined, integrations, vapid.publicKey);
 app.get('/assets/*', serveStatic({ root: './dist' }));
-app.get('/sw.js', async (c, next) => {
-  const response = await serveStatic({ path: './dist/sw.js' })(c, next);
-  if (!response) return c.notFound();
-  response.headers.set('Content-Type', 'application/javascript; charset=utf-8');
-  response.headers.set('Cache-Control', 'no-cache');
-  response.headers.set('Service-Worker-Allowed', '/');
-  return response;
-});
-app.get('/manifest.webmanifest', (c, next) => {
-  c.header('Content-Type', 'application/manifest+json');
-  return serveStatic({ path: './dist/manifest.webmanifest' })(c, next);
-});
+// both files come from public/ via the vite build; read once so a missing file is a clean 404
+function readDistFile(name: string): string | null {
+  try { return readFileSync(join('./dist', name), 'utf8'); } catch { return null; }
+}
+const serviceWorkerSource = readDistFile('sw.js');
+const manifestSource = readDistFile('manifest.webmanifest');
+app.get('/sw.js', (c) => serviceWorkerSource === null
+  ? c.notFound()
+  : c.body(serviceWorkerSource, 200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Service-Worker-Allowed': '/',
+    }));
+app.get('/manifest.webmanifest', (c) => manifestSource === null
+  ? c.notFound()
+  : c.body(manifestSource, 200, { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'no-cache' }));
 app.get('/', (c, next) => { c.header('Cache-Control', 'no-store'); return serveStatic({ path: './dist/index.html' })(c, next); });
 const port = Number(process.env.PORT ?? 8789);
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT');
