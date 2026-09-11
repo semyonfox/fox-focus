@@ -30,6 +30,15 @@ Docker environment variable. `compose.yaml` binds each named host file
 read-only at a fixed container path, so the application never receives a whole
 Hermes credential directory.
 
+The operator-owned production Compose file must preserve the same three-file
+contract at `/run/secrets/fox-focus/google-client.json`,
+`/run/secrets/fox-focus/microsoft-client.json`, and
+`/run/secrets/fox-focus/token-key`. Each mount must be a read-only file bind.
+If a provider is intentionally unconfigured, mount a non-secret `{}` placeholder
+for that provider rather than omitting the target. Jenkins validates this
+rendered mount map before replacing the running app and stops the deployment if
+the data volume, Hermes mount, or any OAuth mount changes its expected access.
+
 The exact Google/Entra registration and private environment shape are in
 [Google and Microsoft connections](integrations.md). The production callback
 host must be the canonical HTTPS URL; never derive it from a request Host
