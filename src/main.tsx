@@ -643,7 +643,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       due: task?.due ?? "No deadline",
       duration: task?.duration ?? "30 min",
       state: task && task.state !== "done" ? task.state : "up-next",
-      scheduledDate: linkedEvent ? eventDateKey(linkedEvent, todayDate) : selectedDate,
+      scheduledDate: linkedEvent ? eventDateKey(linkedEvent, todayDate) : task?.scheduledDate ?? selectedDate,
       scheduledTime: linkedEvent ? eventTimeValue(linkedEvent) : task?.scheduledTime ?? "",
       reminderMode: task ? reminderModeFor(data.reminders, task.id) : "none",
     });
@@ -725,12 +725,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       return;
     }
     const linkedEvent = data.events.find((event) => event.id === task.linkedEventId);
-    if (linkedEvent) {
-      const date = eventDateKey(linkedEvent, todayDate);
-      setSelectedDate(date);
-      setCalendarAnchor(date);
-      setCalendarMode("day");
+    if (!linkedEvent) {
+      openTaskComposer(task);
+      return;
     }
+    const date = eventDateKey(linkedEvent, todayDate);
+    setSelectedDate(date);
+    setCalendarAnchor(date);
+    setCalendarMode("day");
     setSelectedEventId(task.linkedEventId);
     scrollToSection("agenda");
   }
@@ -1045,7 +1047,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function plannedDateForTask(task: Task): string | undefined {
     const linkedEvent = task.linkedEventId ? eventById.get(task.linkedEventId) : undefined;
-    return linkedEvent ? eventDateKey(linkedEvent, todayDate) : undefined;
+    return linkedEvent ? eventDateKey(linkedEvent, todayDate) : task.scheduledDate;
   }
 
   function renderScheduleRow(event: TimelineEvent, showDate = false) {
