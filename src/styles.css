@@ -3484,7 +3484,26 @@ body {
 }
 
 .task-category-strip {
-  flex: 1 1 360px;
+  flex: 1 1 480px;
+}
+
+.task-toolbar-controls {
+  flex-wrap: wrap;
+}
+
+@media (max-width: 620px) {
+  .task-toolbar-controls {
+    width: 100%;
+  }
+
+  .task-select {
+    flex: 1 1 30%;
+    min-width: 0;
+  }
+
+  .task-select select {
+    width: 100%;
+  }
 }
 
 .imported-task-row--done {
