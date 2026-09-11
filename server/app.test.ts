@@ -26,7 +26,7 @@ function testData(): PrototypeData {
 test('a fresh workspace starts empty', () => {
   const store = openStore(':memory:');
   try {
-    assert.deepEqual(store.read(), { revision: 0, data: { tasks: [], events: [], inboxItems: [], reminders: [] } });
+    assert.deepEqual(store.read(), { revision: 0, data: { tasks: [], events: [], inboxItems: [], reminders: [], listAreas: {} } });
   } finally { store.close(); }
 });
 

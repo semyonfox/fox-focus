@@ -1,9 +1,10 @@
 import { CalendarDays, CheckCircle2, CircleAlert, Link2, ListTodo, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { dublinDateKey, isDateKey } from './calendar-time.ts';
-import { filterCalendarContextByDateRange } from './integration-model.ts';
+import { areaForList, filterCalendarContextByDateRange } from './integration-model.ts';
+import { areas, isOneOf, type Area } from './model.ts';
 
-type Provider = 'google' | 'microsoft';
+export type Provider = 'google' | 'microsoft';
 type SyncState = 'idle' | 'syncing' | 'failed';
 type ConnectionState = 'connected' | 'needs_reconnect';
 
@@ -24,7 +25,7 @@ type ProviderStatus = {
   taskCount: number;
 };
 
-type ImportedRecord = {
+export type ImportedRecord = {
   id: number;
   provider: Provider;
   kind: 'calendar_event' | 'task';
@@ -37,7 +38,13 @@ type ImportedRecord = {
   allDay: boolean;
 };
 
-type Overview = { providers: ProviderStatus[]; records: ImportedRecord[] };
+export type Overview = { providers: ProviderStatus[]; records: ImportedRecord[] };
+export type OverviewState = {
+  overview: Overview | null;
+  loading: boolean;
+  failed: boolean;
+  refresh: () => Promise<void>;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -80,7 +87,7 @@ function isOverview(value: unknown): value is Overview {
     Array.isArray(value.records) && value.records.every(isImportedRecord);
 }
 
-function providerLabel(provider: Provider): string {
+export function providerLabel(provider: Provider): string {
   return provider === 'google' ? 'Google' : 'Microsoft';
 }
 
@@ -114,7 +121,7 @@ function connectionCopy(provider: ProviderStatus): string {
   return 'Connected. First import is waiting to run.';
 }
 
-function useOverview(open: boolean) {
+export function useOverview(open: boolean): OverviewState {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -136,8 +143,20 @@ function useOverview(open: boolean) {
   return { overview, loading, failed, refresh };
 }
 
-export function IntegrationsDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { overview, loading, failed, refresh } = useOverview(open);
+export function IntegrationsDrawer({
+  open,
+  onClose,
+  overviewState,
+  listAreas,
+  onListAreaChange,
+}: {
+  open: boolean;
+  onClose: () => void;
+  overviewState: OverviewState;
+  listAreas: Record<string, Area> | undefined;
+  onListAreaChange: (key: string, area: Area) => void;
+}) {
+  const { overview, loading, failed, refresh } = overviewState;
   const [syncing, setSyncing] = useState<Provider | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   if (!open) return null;
@@ -163,6 +182,17 @@ export function IntegrationsDrawer({ open, onClose }: { open: boolean; onClose: 
   const records = overview?.records ?? [];
   const events = records.filter(record => record.kind === 'calendar_event');
   const tasks = records.filter(record => record.kind === 'task');
+  const taskLists = [...tasks.reduce((lists, task) => {
+    const key = `${task.provider}:${task.containerName}`;
+    const existing = lists.get(key);
+    lists.set(key, existing ? { ...existing, count: existing.count + 1 } : {
+      key,
+      provider: task.provider,
+      name: task.containerName,
+      count: 1,
+    });
+    return lists;
+  }, new Map<string, { key: string; provider: Provider; name: string; count: number }>()).values()];
 
   return (
     <div className="overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -195,6 +225,13 @@ export function IntegrationsDrawer({ open, onClose }: { open: boolean; onClose: 
           {!overview && !loading ? <p className="empty-line">No connection status is available yet.</p> : null}
         </div>
         {loading && !overview ? <p className="integration-loading">Checking connections…</p> : null}
+        {taskLists.length ? <div className="integration-record-section integration-task-lists">
+          <div><ListTodo size={15} /><strong>Task lists</strong></div>
+          {taskLists.map(list => <article className="integration-record" key={list.key}>
+            <span><strong>{list.name}</strong><small>{providerLabel(list.provider)} · {list.count} {list.count === 1 ? 'task' : 'tasks'}</small></span>
+            <label className="field"><span className="visually-hidden">Area for {providerLabel(list.provider)} {list.name}</span><select value={areaForList(listAreas, list.provider, list.name)} onChange={(event) => { const area = event.target.value; if (isOneOf(area, areas)) onListAreaChange(list.key, area); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
+          </article>)}
+        </div> : null}
         <div className="integration-records">
           <div className="integration-record-section">
             <div><CalendarDays size={15} /><strong>Imported calendar context</strong></div>
@@ -240,18 +277,17 @@ function emptyCalendarContextCopy(
 
 /** Compact context for the selected calendar range; the drawer remains the full source browser. */
 export function IntegrationCalendarContext({
-  enabled,
+  overviewState,
   startDate,
   endDate,
   onOpen,
 }: {
-  enabled: boolean;
+  overviewState: OverviewState;
   startDate: string;
   endDate: string;
   onOpen: () => void;
 }) {
-  const { overview, loading, failed } = useOverview(enabled);
-  if (!enabled) return null;
+  const { overview, loading, failed } = overviewState;
   const connected = overview?.providers.some(provider => provider.connection?.state === 'connected') ?? false;
   const importedEvents = (overview?.records ?? []).filter(record => record.kind === 'calendar_event');
   const matchingEvents = filterCalendarContextByDateRange(importedEvents, startDate, endDate);

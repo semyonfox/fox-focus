@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { filterCalendarContextByDateRange, sortTodayCalendarContext } from '../src/integration-model.ts';
+import { areaForList, defaultAreaForList, filterCalendarContextByDateRange, sortTodayCalendarContext } from '../src/integration-model.ts';
+
+test('maps provider task lists to areas with saved choices taking priority', () => {
+  assert.equal(defaultAreaForList('UNI exams'), 'University');
+  assert.equal(defaultAreaForList('Client work'), 'Work');
+  assert.equal(defaultAreaForList('Gym plan'), 'Health');
+  assert.equal(defaultAreaForList('Bills and tax'), 'Admin');
+  assert.equal(defaultAreaForList('Groceries'), 'Personal');
+  assert.equal(areaForList({ 'google:Groceries': 'Admin' }, 'google', 'Groceries'), 'Admin');
+  assert.equal(areaForList({}, 'microsoft', 'Office'), 'Work');
+});
 
 test('selected calendar day includes Dublin-local timed starts and puts all-day records first', () => {
   const records = [

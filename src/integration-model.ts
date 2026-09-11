@@ -1,4 +1,21 @@
 import { dublinDateKey, isDateKey } from './calendar-time.ts';
+import { type Area } from './model.ts';
+
+const areaKeywords: Array<[Area, readonly string[]]> = [
+  ['University', ['university', 'uni', 'college', 'study', 'exam', 'lecture']],
+  ['Work', ['work', 'job', 'office', 'client']],
+  ['Health', ['health', 'gym', 'fitness', 'doctor']],
+  ['Admin', ['admin', 'bills', 'errand', 'finance', 'tax']],
+];
+
+export function defaultAreaForList(name: string): Area {
+  const normalized = name.toLocaleLowerCase();
+  return areaKeywords.find(([, keywords]) => keywords.some(keyword => normalized.includes(keyword)))?.[0] ?? 'Personal';
+}
+
+export function areaForList(listAreas: Record<string, Area> | undefined, provider: string, name: string): Area {
+  return listAreas?.[`${provider}:${name}`] ?? defaultAreaForList(name);
+}
 
 export type CalendarContextItem = {
   title: string;

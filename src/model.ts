@@ -83,6 +83,7 @@ export type PrototypeData = {
   events: TimelineEvent[];
   inboxItems: InboxItem[];
   reminders: Reminder[];
+  listAreas?: Record<string, Area>;
 };
 
 export type TaskDraft = {
@@ -272,7 +273,14 @@ export function isReminder(value: unknown): value is Reminder {
 export function isPrototypeData(value: unknown): value is PrototypeData {
   if (!isRecord(value)) return false;
 
+  const listAreaEntries = value.listAreas === undefined
+    ? []
+    : isRecord(value.listAreas) ? Object.entries(value.listAreas) : null;
+
   return (
+    listAreaEntries !== null &&
+    listAreaEntries.length <= 100 &&
+    listAreaEntries.every(([key, area]) => key.length >= 1 && key.length <= 300 && isOneOf(area, areas)) &&
     Array.isArray(value.tasks) &&
     value.tasks.every(isTask) &&
     Array.isArray(value.events) &&
@@ -288,5 +296,5 @@ export function isPrototypeData(value: unknown): value is PrototypeData {
 }
 
 export function createInitialData(): PrototypeData {
-  return { tasks: [], events: [], inboxItems: [], reminders: [] };
+  return { tasks: [], events: [], inboxItems: [], reminders: [], listAreas: {} };
 }

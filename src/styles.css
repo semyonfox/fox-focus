@@ -3456,3 +3456,32 @@ body {
   }
 
 }
+
+/* imported task lists */
+
+.imported-task-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.imported-task-row--done {
+  opacity: 0.68;
+}
+
+.integration-task-lists {
+  margin-top: 20px;
+}
+
+.integration-task-lists .integration-record {
+  display: flex;
+}
+
+.integration-task-lists .field {
+  flex: 0 0 auto;
+}
+
+.integration-task-lists .field select {
+  min-width: 112px;
+  height: 30px;
+  padding: 0 7px;
+  font-size: 10px;
+}

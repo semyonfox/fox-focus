@@ -4,6 +4,7 @@ import {
   compareTasksByCreatedAt,
   compareTasksByDue,
   isInboxItem,
+  isPrototypeData,
   isTask,
   isTimelineEvent,
   type Task,
@@ -99,4 +100,14 @@ test("accepts handled inbox records", () => {
     status: "handled",
     accent: "Personal",
   }), true);
+});
+
+test("validates optional task-list area mappings", () => {
+  const base = { tasks: [], events: [], inboxItems: [], reminders: [] };
+  assert.equal(isPrototypeData(base), true);
+  assert.equal(isPrototypeData({ ...base, listAreas: { "google:University": "University" } }), true);
+  assert.equal(isPrototypeData({ ...base, listAreas: [] }), false);
+  assert.equal(isPrototypeData({ ...base, listAreas: { "": "Personal" } }), false);
+  assert.equal(isPrototypeData({ ...base, listAreas: { "google:Tasks": "Other" } }), false);
+  assert.equal(isPrototypeData({ ...base, listAreas: Object.fromEntries(Array.from({ length: 101 }, (_, index) => [`google:${index}`, "Personal"])) }), false);
 });
