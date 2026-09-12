@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from hermes_cli import kanban_db
+from hermes_cli import kanban_db, kanban_db_connect
 from hermes_cli.dashboard_auth.token_auth import register_token_route
 
 
@@ -73,8 +73,8 @@ def complete_task(payload: CompletionRequest, request: Request):
             status_code=400,
         )
 
-    kanban_db.init_db(board=BOARD)
-    conn = kanban_db.connect(board=BOARD)
+    kanban_db_connect.init_db(board=BOARD)
+    conn = kanban_db_connect.connect(board=BOARD)
     try:
         result = kanban_db.complete_task_from_external_approval(
             conn,
