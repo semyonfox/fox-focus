@@ -71,6 +71,19 @@ test("uses newest-created as the secondary due-ordering rule", () => {
   assert.deepEqual(tasks.sort(compareTasksByDue).map(({ id }) => id), ["newer", "older", "legacy"]);
 });
 
+test("orders dated due labels chronologically instead of by creation time", () => {
+  const tasks = [
+    task("ospf", { due: "Wed 18 Nov", createdAt: "2026-09-12T16:08:00Z" }),
+    task("practical", { due: "Mon 21 Sep", createdAt: "2026-09-12T16:08:00Z" }),
+    task("vlan", { due: "Sun 18 Oct", createdAt: "2026-09-12T16:08:00Z" }),
+    task("group", { due: "Tue 15 Sep", createdAt: "2026-09-09T12:05:00Z" }),
+  ];
+  assert.deepEqual(
+    tasks.sort((first, second) => compareTasksByDue(first, second, "2026-09-12")).map(({ id }) => id),
+    ["group", "practical", "vlan", "ospf"],
+  );
+});
+
 test("accepts exact calendar instants while preserving dated and time-only legacy rows", () => {
   const base = {
     id: "event-1",
