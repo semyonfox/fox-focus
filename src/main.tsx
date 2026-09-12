@@ -733,9 +733,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
     return [...filtered].sort((first, second) => {
       if (taskFilter !== "done" && first.completed !== second.completed) return Number(first.completed) - Number(second.completed);
-      return taskSort === "created" ? compareTasksByCreatedAt(first, second) : compareTasksByDue(first, second);
+      return taskSort === "created" ? compareTasksByCreatedAt(first, second) : compareTasksByDue(first, second, todayDate);
     });
-  }, [categoryLocalTasks, taskFilter, taskSort]);
+  }, [categoryLocalTasks, taskFilter, taskSort, todayDate]);
 
   const visibleHermesTasks = useMemo(() => {
     const filtered = categoryHermesTasks.filter(task => {
@@ -751,7 +751,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const firstTask = hermesTaskProjection(first, todayDate, hermesTaskArea(first, data.listAreas) ?? "Personal");
       const secondTask = hermesTaskProjection(second, todayDate, hermesTaskArea(second, data.listAreas) ?? "Personal");
       if (taskFilter !== "done" && firstTask.completed !== secondTask.completed) return Number(firstTask.completed) - Number(secondTask.completed);
-      return taskSort === "created" ? compareTasksByCreatedAt(firstTask, secondTask) : compareTasksByDue(firstTask, secondTask);
+      return taskSort === "created" ? compareTasksByCreatedAt(firstTask, secondTask) : compareTasksByDue(firstTask, secondTask, todayDate);
     });
   }, [categoryHermesTasks, data.listAreas, taskFilter, taskSort, todayDate]);
 

@@ -201,13 +201,49 @@ const dueOrdering: Record<string, number> = {
   "No deadline": 5,
 };
 
+const monthIndex: Record<string, number> = {
+  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+};
+
 /** Keeps the existing human-readable deadline ordering used by the task UI. */
 export function taskDueWeight(due: string): number {
   return dueOrdering[due] ?? 3;
 }
 
+/**
+ * Hermes annotations currently store a concise display label rather than a
+ * structured deadline. Recognise the date labels produced by Fox Focus so
+ * `Due first` remains chronological instead of falling back to creation time.
+ */
+function taskDueTimestamp(due: string, referenceDate: string | undefined): number | null {
+  if (!referenceDate || !/^\d{4}-\d{2}-\d{2}$/.test(referenceDate)) return null;
+  const reference = new Date(`${referenceDate}T00:00:00Z`);
+  if (!Number.isFinite(reference.getTime())) return null;
+  if (due === "Today") return reference.getTime();
+  if (due === "Tomorrow") return reference.getTime() + 86_400_000;
+  if (due === "Friday") {
+    const daysUntilFriday = (5 - reference.getUTCDay() + 7) % 7 || 7;
+    return reference.getTime() + daysUntilFriday * 86_400_000;
+  }
+  const match = due.match(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/);
+  if (!match) return null;
+  const [, dayText, monthText] = match;
+  const day = Number(dayText);
+  const month = monthIndex[monthText];
+  const candidate = new Date(Date.UTC(reference.getUTCFullYear(), month, day));
+  return candidate.getUTCMonth() === month && candidate.getUTCDate() === day ? candidate.getTime() : null;
+}
+
 /** Sorts earlier/current deadlines first, then newest-created, then task ID. */
-export function compareTasksByDue(first: Task, second: Task): number {
+export function compareTasksByDue(first: Task, second: Task, referenceDate?: string): number {
+  const firstTimestamp = taskDueTimestamp(first.due, referenceDate);
+  const secondTimestamp = taskDueTimestamp(second.due, referenceDate);
+  if (firstTimestamp !== null || secondTimestamp !== null) {
+    if (firstTimestamp === null) return 1;
+    if (secondTimestamp === null) return -1;
+    if (firstTimestamp !== secondTimestamp) return firstTimestamp - secondTimestamp;
+  }
   return taskDueWeight(first.due) - taskDueWeight(second.due) ||
     compareTasksByCreatedAt(first, second) || first.id.localeCompare(second.id);
 }
