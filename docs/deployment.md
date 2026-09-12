@@ -15,11 +15,55 @@ The first startup creates a random password at `/data/workspace-password` with m
 - `/api/v1/workspace` and `/api/v1/hermes` require the same password.
 - `/healthz` is public and returns no workspace data.
 
-## Hermes is optional and read-only
+## Hermes task mirror
 
-To show a Hermes Personal Tasks board, mount that board directory read-only and set `HERMES_KANBAN_DB` to its SQLite database path. Mount the database's WAL and shared-memory sidecar files with it. The adapter opens SQLite in read-only mode and returns task titles, status, numeric priority, derived update time, ownership, source list names, and parent task titles. It reads explicit source metadata from task bodies internally to recover list names; it never returns the bodies. Structure-only list headings appear as list buttons, not actionable tasks.
+Mount the Hermes Personal Tasks board directory read-only and set
+`HERMES_KANBAN_DB` to its SQLite database path. Mount the WAL and shared-memory
+sidecars with it. Fox Focus polls that source on startup and every 60 seconds,
+then upserts a normalized mirror by Hermes task ID. A failed or bounded read
+keeps the last good mirror instead of deleting rows. Task bodies never leave the
+adapter.
 
-Visible list buttons switch directly between individual lists, including empty lists. My Tasks opens by default when present. Switching lists clears the search so items are not accidentally hidden. It does not copy Hermes records into local editable tasks. The Personal Tasks board remains canonical. Running without the mount simply leaves the Hermes panel unavailable.
+Hermes owns title and completion status. Fox Focus stores area, due label,
+duration, planning, and reminder annotations against that stable ID. Google
+backed cards use their `google-task:<external ID>` provenance to join the
+read-only provider record when the match is unambiguous. They never deduplicate
+by title.
+
+The codebase contains one optional remote write: Hermes completion. It uses a dedicated action route,
+a separately scoped bearer token, optimistic version checking, an idempotency
+key, a persisted approval record, and readback. If an HTTP result is lost while
+Hermes is waiting on its database, Fox leaves the checkbox unchanged and
+reconciles the exact durable action receipt on later polls. Configure the
+private deployment by installing [`integrations/hermes/fox-focus-sync`](../integrations/hermes/fox-focus-sync/README.md)
+as the Hermes user plugin, then set:
+
+```dotenv
+HERMES_ACTION_API_URL=http://host.docker.internal:9119/api/plugins/fox-focus-sync/task-completion
+HERMES_ACTION_TOKEN_FILE=/run/secrets/fox-focus/hermes-action-token
+HERMES_ACTION_TOKEN_FILE_HOST=/absolute/private/hermes-action-token
+```
+
+The token must carry only `kanban:personal-tasks:complete`. Do not reuse a
+dashboard session token. The Compose service maps `host.docker.internal` to the
+Docker host and mounts the token file read-only. Hermes's default loopback bind
+is not reachable from a bridge-network container: run the dashboard on a host
+interface Docker can reach (the current service uses `--host 0.0.0.0`) and
+firewall port 9119 so only the Docker bridge and intended local clients can
+reach it. Without both action settings, mirror reads and local annotations
+still work, but completion stays disabled. After rotating the service token,
+restart both the Hermes dashboard and Fox Focus because each reads it once at
+startup.
+
+Deploying the Fox Focus image alone does not enable completion. Jenkins uses an
+operator-owned production Compose file, and the plugin runs in Hermes rather
+than in the Fox Focus image. Install and validate the plugin, token, reachable
+private endpoint, firewall rule, environment values, and read-only token mount
+as one separate runtime change. Until all of them are present, the deployed app
+continues to mirror tasks and save local annotations but refuses completion. The
+approval preview must be checked against the exact completion lifecycle of the
+Hermes revision being deployed; do not enable the route when the preview omits
+run, dependency, workspace-cleanup, or lifecycle-hook effects.
 
 ## Google and Microsoft are optional and read-only
 
@@ -51,6 +95,12 @@ reads: a rolling calendar-context window and task-list snapshots. It does not
 use public webhooks or perform calendar/task mutations. A refresh-token failure
 marks that provider as requiring reconnection without touching local workspace
 data or another provider connection.
+
+Microsoft sign-in uses the `consumers` authority. The person who connects can
+use an ordinary personal Outlook, Hotmail, or Microsoft account. Microsoft
+still requires the operator to create an Entra app registration configured for
+personal Microsoft accounts; deploying this repository cannot create or infer
+that client registration.
 
 ## SQLite and backups
 

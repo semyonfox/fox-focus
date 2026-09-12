@@ -6,7 +6,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import { createApp } from './app.ts';
 import { createIntegrationService, integrationConfigFromEnvironment } from './integrations.ts';
 import { openStore } from './store.ts';
-import { readHermesFeed } from './hermes.ts';
+import { createHermesActionClient, createHermesMirrorService, type HermesActionClient } from './hermes.ts';
 import webPush from 'web-push';
 import { deliverDuePushNotifications, deliveryKey, subscriptionDeliveryKey } from './push.ts';
 
@@ -31,9 +31,24 @@ if (typeof vapid !== 'object' || vapid === null || !('publicKey' in vapid) || !(
 webPush.setVapidDetails('mailto:semyon.fox@gmail.com', vapid.publicKey, vapid.privateKey);
 const store = openStore(join(dataDir, 'focus.sqlite'));
 const hermesPath = process.env.HERMES_KANBAN_DB;
+const hermesActionUrl = process.env.HERMES_ACTION_API_URL;
+const hermesActionTokenFile = process.env.HERMES_ACTION_TOKEN_FILE;
+let hermesActionClient: HermesActionClient | undefined;
+if (hermesActionUrl && hermesActionTokenFile) {
+  const token = readFileSync(hermesActionTokenFile, 'utf8').trim();
+  hermesActionClient = createHermesActionClient(hermesActionUrl, token);
+} else if (hermesActionUrl || hermesActionTokenFile) {
+  console.error('Hermes completion needs both HERMES_ACTION_API_URL and HERMES_ACTION_TOKEN_FILE. Completion is disabled.');
+}
+const hermes = hermesPath
+  ? createHermesMirrorService(store, { dbPath: hermesPath }, hermesActionClient)
+  : undefined;
 const integrationConfig = integrationConfigFromEnvironment();
 const integrations = integrationConfig ? createIntegrationService(store, integrationConfig) : undefined;
-const app = createApp(store, password, hermesPath ? () => readHermesFeed({ dbPath: hermesPath }) : undefined, integrations, vapid.publicKey);
+const app = createApp(store, password, hermes, integrations, vapid.publicKey);
+// Establish a current or explicitly stale mirror before the first reminder
+// tick, so persisted rows from a previous run can never fire unchecked.
+if (hermes) await hermes.poll();
 app.get('/assets/*', serveStatic({ root: './dist' }));
 // both files come from public/ via the vite build; read once so a missing file is a clean 404
 function readDistFile(name: string): string | null {
@@ -61,9 +76,14 @@ async function sendDuePushNotifications(): Promise<void> {
   pushTickRunning = true;
   try {
     const snapshot = store.read();
-    store.prunePushDeliveries(snapshot.data.reminders.map(deliveryKey));
+    const hermesReminders = hermes ? store.listHermesReminders() : [];
+    const retainedHermesReminders = store.listHermesReminders(true);
+    const notificationData = { ...snapshot.data, reminders: [...snapshot.data.reminders, ...hermesReminders] };
+    // Keep delivery keys for the last good Hermes mirror while polling is
+    // stale or disabled, but never send reminders from that unverified view.
+    store.prunePushDeliveries([...snapshot.data.reminders, ...retainedHermesReminders].map(deliveryKey));
     const summary = await deliverDuePushNotifications({
-      data: snapshot.data,
+      data: notificationData,
       now: new Date(),
       subscriptions: store.listPushSubscriptions().map(record => record.subscription),
       delivered: new Set(store.listPushDeliveries().map(subscriptionDeliveryKey)),
@@ -83,6 +103,11 @@ async function sendDuePushNotifications(): Promise<void> {
 const pushTimer = setInterval(() => { void sendDuePushNotifications(); }, 60_000);
 pushTimer.unref();
 void sendDuePushNotifications();
+let hermesTimer: NodeJS.Timeout | undefined;
+if (hermes) {
+  hermesTimer = setInterval(() => { void hermes.poll(); }, 60_000);
+  hermesTimer.unref();
+}
 if (integrations) {
   // Polling keeps this private deployment read-only and avoids public webhooks.
   const initialSync = setTimeout(() => { void integrations.syncConnected(); }, 5_000);
@@ -95,5 +120,6 @@ if (integrations) {
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   clearInterval(pushTimer);
+  if (hermesTimer) clearInterval(hermesTimer);
   server.close(() => { store.close(); process.exit(0); });
 });

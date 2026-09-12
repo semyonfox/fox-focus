@@ -52,16 +52,24 @@ function importedGoogleTask(title = 'Imported task') {
 test('runtime configuration accepts mounted files and rejects credential environment variables', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fox-focus-oauth-config-'));
   const googleFile = join(dir, 'google.json');
+  const microsoftFile = join(dir, 'microsoft.json');
   const keyFile = join(dir, 'token-key');
   try {
     writeFileSync(googleFile, JSON.stringify({ web: { client_id: 'test-client-id', client_secret: 'test-client-secret' } }), { mode: 0o600 });
+    writeFileSync(microsoftFile, JSON.stringify({ clientId: 'microsoft-client-id', clientSecret: 'microsoft-client-secret' }), { mode: 0o600 });
     writeFileSync(keyFile, masterKey, { mode: 0o600 });
     const configured = integrationConfigFromEnvironment({
       APP_BASE_URL: 'https://focus.example.test',
       GOOGLE_OAUTH_CLIENT_FILE: googleFile,
+      MICROSOFT_OAUTH_CLIENT_FILE: microsoftFile,
       OAUTH_TOKEN_KEY_FILE: keyFile,
     });
     assert.equal(configured?.providers.google?.clientId, 'test-client-id');
+    assert.equal(configured?.providers.microsoft?.clientId, 'microsoft-client-id');
+    assert.equal(configured?.providers.microsoft?.authorizationEndpoint,
+      'https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize');
+    assert.equal(configured?.providers.microsoft?.tokenEndpoint,
+      'https://login.microsoftonline.com/consumers/oauth2/v2.0/token');
     assert.equal(configured?.tokenMasterKey, masterKey);
     assert.equal(integrationConfigFromEnvironment({
       APP_BASE_URL: 'https://focus.example.test',

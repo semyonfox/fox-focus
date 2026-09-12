@@ -35,7 +35,7 @@ import {
   isDateKey,
 } from "./calendar-time.ts";
 import { hermesLabels, useHermesFeed } from "./hermes-feed.tsx";
-import { type HermesTask } from "./hermes-model.ts";
+import { deduplicatedProviderIdentity, type HermesTask, type HermesTaskAnnotationInput } from "./hermes-model.ts";
 import { IntegrationCalendarContext, IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord } from './integrations.tsx';
 import { areaForList } from './integration-model.ts';
 
@@ -199,6 +199,9 @@ function TaskRow({
   onSchedule,
   plannedDate,
   compact = false,
+  sourceBadge,
+  toggleDisabled = false,
+  toggleBusy = false,
 }: {
   task: Task;
   onToggle: (task: Task) => void;
@@ -206,6 +209,9 @@ function TaskRow({
   onSchedule: (task: Task) => void;
   plannedDate?: string;
   compact?: boolean;
+  sourceBadge?: ReactNode;
+  toggleDisabled?: boolean;
+  toggleBusy?: boolean;
 }) {
   const planned = task.scheduledTime && !task.completed
     ? `${plannedDate ? `${formatDublinDateKey(plannedDate, { weekday: "short", day: "numeric" })} ` : ""}${task.scheduledTime}`
@@ -217,6 +223,8 @@ function TaskRow({
         className={`task-check task-check--${areaClass(task.area)}${task.completed ? " task-check--done" : ""}`}
         type="button"
         onClick={() => onToggle(task)}
+        disabled={toggleDisabled || toggleBusy}
+        aria-busy={toggleBusy || undefined}
         aria-label={`${task.completed ? "Reopen" : "Complete"} ${task.title}`}
       >
         {task.completed ? <Check size={14} strokeWidth={3} /> : <Circle size={16} strokeWidth={2} />}
@@ -228,6 +236,7 @@ function TaskRow({
           {task.area} · {task.duration}
           {planned ? <em className="task-planned"><CalendarDays size={11} /> {planned}</em> : null}
           {task.origin === "inbox" ? <em className="source-chip" title={task.source} aria-label={`From ${task.source ?? "Inbox"}`}>{task.source?.replace(/^Inbox · /, "") ?? "Inbox"}</em> : null}
+          {sourceBadge}
         </span>
       </div>
       <time>{task.due}</time>
@@ -239,26 +248,6 @@ function TaskRow({
           {task.scheduledTime ? "Calendar" : "Schedule"}
         </button>
       </div>
-    </article>
-  );
-}
-
-function HermesTaskRow({ task }: { task: HermesTask }) {
-  const updatedAt = formatCreatedAt(task.updatedAt);
-
-  return (
-    <article className={`task-row hermes-task-row${task.status === "done" ? " hermes-task-row--done" : ""}`}>
-      <span className="hermes-task-mark" title="Managed in Hermes" aria-label="Managed in Hermes"><Bot size={16} /></span>
-      <div className="task-copy">
-        <strong className={task.status === "done" ? "task-title--done" : undefined}>{task.title}</strong>
-        <span>
-          <em className="source-chip source-chip--hermes" title={`Hermes · ${task.source}`}>Hermes · {task.source}</em>
-          <em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>
-          {task.priority > 0 ? <em className="task-created">Priority {task.priority}</em> : null}
-          {task.parentTitle ? <em className="task-created" title={`Part of ${task.parentTitle}`}>Part of {task.parentTitle}</em> : null}
-        </span>
-      </div>
-      <time dateTime={task.updatedAt}>{updatedAt ? `Updated ${updatedAt}` : "Updated"}</time>
     </article>
   );
 }
@@ -344,8 +333,47 @@ function providerTaskSource(provider: ImportedRecord["provider"]): TaskSource {
   return provider === "google" ? googleTaskSource : microsoftTaskSource;
 }
 
-function taskSourceIdentity(title: string, source: string): string {
-  return `${title.trim().toLocaleLowerCase()}\u0000${source.trim().toLocaleLowerCase()}`;
+function hermesTaskArea(task: HermesTask, listAreas: Record<string, Area> | undefined): Area {
+  if (task.annotationUpdatedAt) return task.area;
+  if (task.sourceMatchUnique && task.sourceProvider && task.sourceContainerId && task.sourceContainerName) {
+    return areaForList(listAreas, task.sourceProvider, task.sourceContainerId, task.sourceContainerName);
+  }
+  return task.area;
+}
+
+function hermesTaskDue(task: HermesTask, today: string): string {
+  if (task.due !== "No deadline") return task.due;
+  if (!task.sourceDueOn) return "No deadline";
+  if (task.sourceDueOn === today) return "Today";
+  if (task.sourceDueOn === addCalendarDays(today, 1)) return "Tomorrow";
+  return formatDublinDateKey(task.sourceDueOn, { day: "numeric", month: "short" });
+}
+
+function hermesTaskProjection(task: HermesTask, today: string, effectiveArea = task.area): Task {
+  const completed = task.status === "done";
+  const scheduledTime = task.scheduledAt ? dublinTimeValue(task.scheduledAt) : null;
+  const state: TaskState = completed
+    ? "done"
+    : task.scheduledAt
+      ? "scheduled"
+      : task.status === "blocked" || task.localState === "waiting"
+        ? "waiting"
+        : "up-next";
+  return {
+    id: `hermes:${task.id}`,
+    title: task.title,
+    area: effectiveArea,
+    state,
+    duration: task.duration,
+    due: hermesTaskDue(task, today),
+    priority: task.priority >= 4 ? "high" : task.priority >= 2 ? "medium" : "low",
+    completed,
+    scheduledTime,
+    ...(task.scheduledAt ? { scheduledDate: dublinDateKey(new Date(task.scheduledAt)) } : {}),
+    origin: "manual",
+    source: `Hermes · ${task.source}`,
+    createdAt: task.createdAt,
+  };
 }
 
 function App({ initial }: { initial?: ServerSnapshot }) {
@@ -384,6 +412,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [pushSubscribed, setPushSubscribed] = useState(false);
   const serviceWorkerRegistration = useRef<ServiceWorkerRegistration | null>(null);
   const [completionUndo, setCompletionUndo] = useState<CompletionUndo | null>(null);
+  const [editingHermesTaskId, setEditingHermesTaskId] = useState<string | null>(null);
+  const [hermesCompletionApproval, setHermesCompletionApproval] = useState<HermesTask | null>(null);
+  const [hermesTaskDraft, setHermesTaskDraft] = useState<TaskDraft>(defaultTaskDraft);
+  const [hermesCompletionPending, setHermesCompletionPending] = useState<string | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
   const [showIntegrations, setShowIntegrations] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("integration"));
   const [agentRequest, setAgentRequest] = useState("");
@@ -392,6 +424,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [modalError, setModalError] = useState("");
   const focusBeforeOverlay = useRef<HTMLElement | null>(null);
   const calendarTabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const firedHermesReminderIds = useRef(new Set<string>());
+  const hermesBoard = hermes.feed && hermes.feed.state !== "unavailable" ? hermes.feed.board : null;
+  const hermesTasks = hermesBoard?.tasks ?? [];
+  const hermesReminders = useMemo<Reminder[]>(() =>
+    (hermes.feed?.state === "connected" ? hermesTasks : []).flatMap(task =>
+    task.status !== "done" && task.reminderMode !== "none"
+      ? [{
+          id: `reminder-hermes-${task.id}`,
+          targetId: `hermes:${task.id}`,
+          targetType: "task" as const,
+          title: task.title,
+          mode: task.reminderMode,
+          when: task.reminderMode === "one-hour" ? "1 hour before" : "09:00 on the day",
+          state: "scheduled" as const,
+          ...(task.reminderFireAt ? { fireAt: task.reminderFireAt } : {}),
+        }]
+      : []), [hermes.feed?.state, hermesTasks]);
+  const allReminders = useMemo(() => [...data.reminders, ...hermesReminders], [data.reminders, hermesReminders]);
 
   useEffect(() => {
     if (initial) {
@@ -430,7 +480,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || showReminderTray || activeReminderId || showIntegrations);
+  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations);
 
   useEffect(() => {
     if (!isOverlayOpen) {
@@ -511,8 +561,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const scheduleNext = () => {
       if (timeout !== undefined) window.clearTimeout(timeout);
       const now = Date.now();
-      const nextReminder = [...data.reminders]
-        .filter((reminder) => reminder.state === "scheduled" && reminder.fireAt && !reminder.firedAt && Date.parse(reminder.fireAt) > now)
+      const nextReminder = [...allReminders]
+        .filter((reminder) => reminder.state === "scheduled" && reminder.fireAt && !reminder.firedAt &&
+          !firedHermesReminderIds.current.has(`${reminder.id}\u0000${reminder.fireAt}`) && Date.parse(reminder.fireAt) > now)
         .sort((first, second) => Date.parse(first.fireAt ?? "") - Date.parse(second.fireAt ?? ""))[0];
       if (!nextReminder?.fireAt) return;
 
@@ -523,6 +574,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           return;
         }
         setActiveReminderId(nextReminder.id);
+        if (nextReminder.targetId.startsWith("hermes:")) {
+          firedHermesReminderIds.current.add(`${nextReminder.id}\u0000${nextReminder.fireAt}`);
+        }
         let showedNotification = false;
         if (!pushSubscribed && "Notification" in window && Notification.permission === "granted") {
           try {
@@ -534,7 +588,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         }
         if (showedNotification) {
           const firedAt = new Date().toISOString();
-          setData((current) => ({
+          if (!nextReminder.targetId.startsWith("hermes:")) setData((current) => ({
             ...current,
             reminders: current.reminders.map((reminder) => reminder.id === nextReminder.id && !reminder.firedAt
               ? { ...reminder, firedAt }
@@ -550,7 +604,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (timeout !== undefined) window.clearTimeout(timeout);
       window.clearInterval(interval);
     };
-  }, [data.reminders, pushSubscribed]);
+  }, [allReminders, pushSubscribed]);
 
   const resolvedTheme: ResolvedTheme = themeMode === "system" ? systemTheme : themeMode;
 
@@ -572,6 +626,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setModal(null);
+      setEditingHermesTaskId(null);
+      setHermesCompletionApproval(null);
       setShowReminderTray(false);
       setActiveReminderId(null);
     };
@@ -593,9 +649,26 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [reviewUndo]);
 
   const todayDate = dublinDateKey(new Date());
+  const hermesPlannedEvents = useMemo<TimelineEvent[]>(() => hermesTasks.flatMap(task => {
+    const area = hermesTaskArea(task, data.listAreas) ?? "Personal";
+    return task.scheduledAt && task.status !== "done"
+      ? [{
+          id: `hermes-event:${task.id}`,
+          title: task.title,
+          subtitle: `Hermes · ${area} · ${task.duration}`,
+          area,
+          startsAt: task.scheduledAt,
+          duration: parseDuration(task.duration),
+          editable: true,
+          origin: "task" as const,
+          taskId: `hermes:${task.id}`,
+          source: `Hermes · ${task.source}`,
+        }]
+      : [];
+  }), [data.listAreas, hermesTasks]);
   const sortedEvents = useMemo(
-    () => [...data.events].sort((first, second) => compareCalendarEvents(first, second, todayDate)),
-    [data.events, todayDate],
+    () => [...data.events, ...hermesPlannedEvents].sort((first, second) => compareCalendarEvents(first, second, todayDate)),
+    [data.events, hermesPlannedEvents, todayDate],
   );
   const calendarDays = useMemo(() => calendarDateWindow(calendarAnchor, 3, 3), [calendarAnchor]);
   const calendarRangeStart = selectedDate;
@@ -611,6 +684,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const eventById = useMemo(() => new Map(data.events.map((event) => [event.id, event])), [data.events]);
   const selectedEvent = visibleCalendarEvents.find((event) => event.id === selectedEventId) ?? visibleCalendarEvents[0] ?? null;
   const selectedEventTask = selectedEvent?.taskId ? taskById.get(selectedEvent.taskId) : undefined;
+  const selectedEventHermesTask = selectedEvent?.taskId?.startsWith("hermes:")
+    ? hermesTasks.find(task => `hermes:${task.id}` === selectedEvent.taskId)
+    : undefined;
   const reviewItems = useMemo(
     () => [...data.inboxItems].sort((first, second) => Number(first.status === "handled") - Number(second.status === "handled")),
     [data.inboxItems],
@@ -618,9 +694,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const selectedInbox = reviewItems.find((item) => item.id === selectedInboxId) ?? reviewItems[0] ?? null;
   const selectedInboxIndex = selectedInbox ? reviewItems.findIndex((item) => item.id === selectedInbox.id) : -1;
   const activeTasks = data.tasks.filter((task) => !task.completed);
-  const activeReminder = data.reminders.find((reminder) => reminder.id === activeReminderId) ?? null;
-  const hermesBoard = hermes.feed?.state === "connected" ? hermes.feed.board : null;
-  const hermesTasks = hermesBoard?.tasks ?? [];
+  const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
   const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
   const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
     importedTasks.some((task) => task.provider === provider) ||
@@ -632,9 +706,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     : taskCategory === unclassifiedTaskCategory
       ? []
       : data.tasks.filter((task) => task.area === taskCategory);
-  const categoryHermesTasks = taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory
+  const categoryHermesTasks = taskCategory === allTaskCategories
     ? hermesTasks
-    : [];
+    : taskCategory === unclassifiedTaskCategory
+      ? hermesTasks.filter(task => hermesTaskArea(task, data.listAreas) === null)
+      : hermesTasks.filter(task => hermesTaskArea(task, data.listAreas) === taskCategory);
   const categoryImportedTasks = taskCategory === allTaskCategories
     ? importedTasks
     : taskCategory === unclassifiedTaskCategory
@@ -644,7 +720,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     { id: allTaskCategories, label: "All" },
     ...areas.map((area) => ({ id: area, label: area })),
   ];
-  if (hermesBoard) taskCategoryOptions.push({ id: unclassifiedTaskCategory, label: "Uncategorised" });
 
   const visibleTasks = useMemo(() => {
     const filtered = categoryLocalTasks.filter((task) => {
@@ -663,12 +738,22 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [categoryLocalTasks, taskFilter, taskSort]);
 
   const visibleHermesTasks = useMemo(() => {
-    if (taskFilter === "done") return categoryHermesTasks.filter((task) => task.status === "done");
-    if (taskFilter === "open") return categoryHermesTasks.filter((task) => task.status !== "done");
-    return taskFilter === "all"
-      ? [...categoryHermesTasks].sort((first, second) => Number(first.status === "done") - Number(second.status === "done"))
-      : [];
-  }, [categoryHermesTasks, taskFilter]);
+    const filtered = categoryHermesTasks.filter(task => {
+      const projected = hermesTaskProjection(task, todayDate, hermesTaskArea(task, data.listAreas) ?? "Personal");
+      if (taskFilter === "all") return true;
+      if (taskFilter === "due-today") return projected.due === "Today" && !projected.completed;
+      if (taskFilter === "planned") return Boolean(task.scheduledAt) && !projected.completed;
+      if (taskFilter === "waiting") return projected.state === "waiting" && !projected.completed;
+      if (taskFilter === "done") return projected.completed;
+      return !projected.completed;
+    });
+    return [...filtered].sort((first, second) => {
+      const firstTask = hermesTaskProjection(first, todayDate, hermesTaskArea(first, data.listAreas) ?? "Personal");
+      const secondTask = hermesTaskProjection(second, todayDate, hermesTaskArea(second, data.listAreas) ?? "Personal");
+      if (taskFilter !== "done" && firstTask.completed !== secondTask.completed) return Number(firstTask.completed) - Number(secondTask.completed);
+      return taskSort === "created" ? compareTasksByCreatedAt(firstTask, secondTask) : compareTasksByDue(firstTask, secondTask);
+    });
+  }, [categoryHermesTasks, data.listAreas, taskFilter, taskSort, todayDate]);
 
   const visibleImportedTasks = useMemo(() => {
     if (taskFilter === "done") return categoryImportedTasks.filter((task) => task.status === "completed");
@@ -679,12 +764,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : [];
   }, [categoryImportedTasks, taskFilter, todayDate]);
 
-  // Hermes is the canonical personal-task board. Hide its Google-backed
-  // duplicates in the combined view, while keeping the complete Google view
-  // available from the source selector.
-  const visibleHermesIdentities = new Set(visibleHermesTasks.map((task) => taskSourceIdentity(task.title, task.source)));
+  // Stable provider IDs survive title and list changes. A completed Hermes
+  // mirror must not hide a still-open authoritative provider task.
+  const hermesProviderIdentities = new Set(hermesTasks.flatMap(task => {
+    const identity = deduplicatedProviderIdentity(task);
+    return identity ? [identity] : [];
+  }));
   const combinedImportedTasks = visibleImportedTasks.filter((task) =>
-    task.provider !== "google" || !visibleHermesIdentities.has(taskSourceIdentity(task.title, task.containerName)));
+    !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
   const taskSourceOptions: Array<{ id: TaskSource; label: string; count: number }> = [
     { id: allTaskSources, label: "All sources", count: visibleTasks.length + visibleHermesTasks.length + combinedImportedTasks.length },
     { id: localTaskSource, label: "Fox Focus", count: visibleTasks.length },
@@ -692,7 +779,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   if (hermesBoard) taskSourceOptions.push({ id: hermesTaskSource, label: "Hermes", count: visibleHermesTasks.length });
   if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleImportedTasks.filter((task) => task.provider === "google").length });
   if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
-  const isExternalOnlyScope = taskSource !== allTaskSources && taskSource !== localTaskSource;
+  const isExternalOnlyScope = taskSource === googleTaskSource || taskSource === microsoftTaskSource;
 
   const shownLocalTasks = taskSource === allTaskSources || taskSource === localTaskSource ? visibleTasks : [];
   const shownHermesTasks = taskSource === allTaskSources || taskSource === hermesTaskSource ? visibleHermesTasks : [];
@@ -702,15 +789,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ? visibleImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
       : [];
 
-  const reminderCount = data.reminders.length;
+  const reminderCount = allReminders.length;
   const reviewCount = data.inboxItems.filter((item) => item.status !== "handled").length;
-  const plannedTaskCount = activeTasks.filter((task) => Boolean(task.linkedEventId && eventById.has(task.linkedEventId))).length;
+  const plannedTaskCount = activeTasks.filter((task) => Boolean(task.linkedEventId && eventById.has(task.linkedEventId))).length +
+    hermesTasks.filter(task => task.status !== "done" && Boolean(task.scheduledAt)).length;
   const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
-  const activeHermesIdentities = new Set(hermesTasks
-    .filter((task) => task.status !== "done")
-    .map((task) => taskSourceIdentity(task.title, task.source)));
   const activeImportedTaskCount = importedTasks.filter((task) => task.status !== "completed" &&
-    (task.provider !== "google" || !activeHermesIdentities.has(taskSourceIdentity(task.title, task.containerName)))).length;
+    !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`)).length;
   const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
   const openTaskCount = activeTasks.length + activeHermesTaskCount + activeImportedTaskCount;
   const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
@@ -723,8 +808,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [googleTasksAvailable, hermesBoard, microsoftTasksAvailable, taskSource]);
 
   useEffect(() => {
-    if ((taskFilter === "planned" || taskFilter === "waiting") && isExternalOnlyScope) setTaskSource(localTaskSource);
-    if (taskFilter === "due-today" && taskSource === hermesTaskSource) setTaskSource(allTaskSources);
+    if ((taskFilter === "planned" || taskFilter === "waiting") && isExternalOnlyScope) setTaskSource(allTaskSources);
   }, [taskFilter, taskSource]);
 
   useEffect(() => {
@@ -738,8 +822,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function selectTaskFilter(filter: TaskFilter) {
     setTaskFilter(filter);
-    if ((filter === "planned" || filter === "waiting") && isExternalOnlyScope) setTaskSource(localTaskSource);
-    if (filter === "due-today" && taskSource === hermesTaskSource) setTaskSource(allTaskSources);
+    if ((filter === "planned" || filter === "waiting") && isExternalOnlyScope) setTaskSource(allTaskSources);
   }
 
   function selectTaskCategory(category: TaskCategory) {
@@ -747,9 +830,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (category === unclassifiedTaskCategory && taskSource !== allTaskSources && taskSource !== hermesTaskSource) {
       setTaskSource(hermesBoard ? hermesTaskSource : allTaskSources);
       return;
-    }
-    if (category !== allTaskCategories && category !== unclassifiedTaskCategory && taskSource === hermesTaskSource) {
-      setTaskSource(allTaskSources);
     }
   }
 
@@ -792,6 +872,87 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     event.preventDefault();
     selectCalendarDate(nextDate);
     window.requestAnimationFrame(() => calendarTabRefs.current[3]?.focus({ preventScroll: true }));
+  }
+
+  function openHermesTaskEditor(task: HermesTask) {
+    setHermesTaskDraft({
+      title: task.title,
+      area: hermesTaskArea(task, data.listAreas) ?? task.area,
+      priority: task.priority >= 4 ? "high" : task.priority >= 2 ? "medium" : "low",
+      due: task.due,
+      duration: task.duration,
+      state: task.localState === "scheduled" ? "up-next" : task.localState,
+      scheduledDate: task.scheduledAt ? dublinDateKey(new Date(task.scheduledAt)) : "",
+      scheduledTime: task.scheduledAt ? dublinTimeValue(task.scheduledAt) : "",
+      reminderMode: task.reminderMode,
+    });
+    setModalError("");
+    setEditingHermesTaskId(task.id);
+  }
+
+  async function saveHermesTask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const task = hermesTasks.find(candidate => candidate.id === editingHermesTaskId);
+    if (!task) return;
+    const hasPlan = Boolean(hermesTaskDraft.scheduledDate || hermesTaskDraft.scheduledTime);
+    if (hasPlan && (!isDateKey(hermesTaskDraft.scheduledDate) || !isValidTime(hermesTaskDraft.scheduledTime))) {
+      setModalError("Choose both a valid planned day and time, or clear both.");
+      return;
+    }
+    const scheduledAt = hasPlan
+      ? dublinDateTimeToInstant(hermesTaskDraft.scheduledDate, hermesTaskDraft.scheduledTime)
+      : null;
+    if (hasPlan && !scheduledAt) {
+      setModalError("That Dublin time does not exist or repeats at a clock change. Choose another time.");
+      return;
+    }
+    if (hermesTaskDraft.reminderMode !== "none" && !scheduledAt) {
+      setModalError("Plan the task before adding a reminder.");
+      return;
+    }
+    const reminderFireAt = scheduledAt && hermesTaskDraft.reminderMode !== "none"
+      ? hermesTaskDraft.reminderMode === "one-hour"
+        ? new Date(Date.parse(scheduledAt) - 60 * 60_000).toISOString()
+        : dublinDateTimeToInstant(dublinDateKey(new Date(scheduledAt)), "09:00")
+      : null;
+    const annotation: HermesTaskAnnotationInput = {
+      area: hermesTaskDraft.area,
+      localState: scheduledAt ? "scheduled" : hermesTaskDraft.state,
+      duration: hermesTaskDraft.duration,
+      due: hermesTaskDraft.due,
+      scheduledAt,
+      reminderMode: hermesTaskDraft.reminderMode,
+      reminderFireAt,
+    };
+    try {
+      await hermes.updateAnnotation(task.id, annotation);
+      setEditingHermesTaskId(null);
+      setModalError("");
+      setSaveError(null);
+      setStatusMessage(`Saved Fox Focus details for “${task.title}”. Hermes still owns its title and completion state.`);
+    } catch (error) {
+      setModalError(error instanceof Error ? error.message : "Could not save this task's details.");
+    }
+  }
+
+  async function completeHermesTask(task: HermesTask) {
+    if (task.status === "done" || hermesCompletionPending) return;
+    setHermesCompletionApproval(null);
+    setHermesCompletionPending(task.id);
+    setSaveError(null);
+    try {
+      const completed = await hermes.completeTask(task.id, {
+        expectedVersion: task.version,
+        confirmation: { beforeStatus: task.status, afterStatus: "done", confirmedAt: new Date().toISOString() },
+      });
+      setStatusMessage(completed.sourceProvider === "google" && completed.sourceStatus !== "completed"
+        ? `Completed “${task.title}” in Hermes and verified it. Google Tasks is unchanged.`
+        : `Completed “${task.title}” in Hermes and verified the result.`);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Hermes could not complete this task. It remains open.");
+    } finally {
+      setHermesCompletionPending(null);
+    }
   }
 
   function openTaskComposer(task?: Task, inboxItem?: InboxItem) {
@@ -1184,7 +1345,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function testReminder() {
-    const reminder = data.reminders.find((candidate) => candidate.state === "scheduled") ?? data.reminders[0];
+    const reminder = allReminders.find((candidate) => candidate.state === "scheduled") ?? allReminders[0];
     if (!reminder) {
       setStatusMessage("Add a reminder to a task or local calendar block first.");
       return;
@@ -1195,6 +1356,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function snoozeReminder() {
     if (!activeReminder) return;
+    if (activeReminder.targetId.startsWith("hermes:")) {
+      setActiveReminderId(null);
+      setStatusMessage("Edit the Hermes task plan to change this reminder.");
+      return;
+    }
     setData((current) => ({
       ...current,
       reminders: current.reminders.map((reminder) =>
@@ -1387,12 +1553,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                   <i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} />
                   <span>
                     <strong>{selectedEvent.title}</strong>
-                    <small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}{selectedEventTask?.completed ? " · done" : !selectedEvent.editable ? " · imported" : ""}</small>
+                    <small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}{selectedEventTask?.completed ? " · done" : selectedEventHermesTask ? " · Hermes" : !selectedEvent.editable ? " · imported" : ""}</small>
                   </span>
                 </div>
                 <div className="agenda-detail-actions">
-                  {selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}
-                  {selectedEvent.editable ? (
+                  {selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : selectedEventHermesTask ? <button className="mini-action" type="button" onClick={() => openHermesTaskEditor(selectedEventHermesTask)}><Pencil size={12} /> Edit task plan</button> : null}
+                  {selectedEventHermesTask ? null : selectedEvent.editable ? (
                     <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button>
                   ) : (
                     <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>
@@ -1417,14 +1583,30 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                 <label className="task-select"><span className="visually-hidden">Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)}</option>)}</select></label>
                 {hermesBoard || googleTasksAvailable || microsoftTasksAvailable ? <label className="task-select"><span className="visually-hidden">Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id}>{source.label} ({source.count})</option>)}</select></label> : null}
                 <label className="task-select"><span className="visually-hidden">Sort</span><select value={taskSort} disabled={isExternalOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>
-                {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh} aria-label="Refresh Hermes"><RotateCcw size={13} /></button> : null}
+                {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={() => void hermes.poll().catch(error => setSaveError(error instanceof Error ? error.message : "Hermes could not be refreshed."))} aria-label="Refresh Hermes"><RotateCcw size={13} /></button> : null}
               </div>
             </div>
             {initial && hermes.failed ? <p className="task-filter-boundary"><Bot size={13} /> Hermes could not be refreshed. Local tasks are unaffected.</p> : null}
-            {(hermesTasks.length || importedTasks.length) && (taskFilter === "planned" || taskFilter === "waiting") ? <p className="task-filter-boundary"><Bot size={13} /> Hermes and imported tasks only appear under All, Open, Done and Due today.</p> : null}
+            {hermes.feed?.state === "stale" ? <p className="task-filter-boundary"><Bot size={13} /> Showing the last Hermes sync. Completion is paused until the board can be read again.</p> : null}
+            {hermesBoard && hermes.feed?.completionAvailable === false ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks are mirrored, but completion is not configured on this server.</p> : null}
+            {importedTasks.length && (taskFilter === "planned" || taskFilter === "waiting") ? <p className="task-filter-boundary"><Bot size={13} /> Provider tasks do not have local planning details yet.</p> : null}
             <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks, ${selectedTaskCategoryLabel}, ${selectedTaskSourceLabel}`} tabIndex={0}>
               {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)}
-              {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} />)}
+              {shownHermesTasks.map((task) => {
+                const projected = hermesTaskProjection(task, todayDate, hermesTaskArea(task, data.listAreas) ?? "Personal");
+                return <TaskRow
+                  key={`hermes:${task.id}`}
+                  task={projected}
+                  plannedDate={projected.scheduledDate}
+                  onToggle={() => setHermesCompletionApproval(task)}
+                  onEdit={() => openHermesTaskEditor(task)}
+                  onSchedule={() => openHermesTaskEditor(task)}
+                  toggleDisabled={task.status === "done" || task.status === "running" ||
+                    hermes.feed?.state === "stale" || hermes.feed?.completionAvailable === false}
+                  toggleBusy={hermesCompletionPending === task.id}
+                  sourceBadge={<><em className="source-chip source-chip--hermes" title={task.sourceProvider === "google" ? `Managed in Hermes · From Google Tasks · ${task.source}` : `Managed in Hermes · ${task.source}`}>{task.sourceProvider === "google" ? "Hermes · Google Tasks" : `Hermes · ${task.source}`}</em><em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>{task.status === "done" && task.sourceProvider === "google" && task.sourceStatus && task.sourceStatus !== "completed" ? <em className="task-created">Google still open</em> : null}</>}
+                />;
+              })}
               {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
               {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "Nothing completed yet" : "Nothing here"}</strong><p>{taskFilter === "done" ? "Completed tasks will show up here." : "Try another area or source, or add a task."}</p></div> : null}
             </div>
@@ -1485,7 +1667,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             </div>
           </article>
           <aside className="pane lifeboard-signals" id="signals">
-            <PaneHeader eyebrow="Read-only sources" title="Connections" />
+            <PaneHeader eyebrow="Sources and sync" title="Connections" />
             <div className="control-list">
               <button className="control-row control-row--button" type="button" onClick={() => setShowIntegrations(true)}>
                 <span className="control-icon control-icon--blue"><Link2 size={14} /></span>
@@ -1494,7 +1676,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               </button>
               <button className="control-row control-row--button" type="button" onClick={() => scrollToSection("tasks")}>
                 <span className="control-icon control-icon--stone"><Bot size={14} /></span>
-                <span><strong>Hermes</strong><small>{initial ? hermes.feed?.state === "connected" ? `${activeHermesTaskCount} active tasks` : hermes.loading ? "Checking board…" : hermes.failed ? "Could not refresh" : "Not connected" : "Preview only"}</small></span>
+                <span><strong>Hermes</strong><small>{initial ? hermes.feed?.state === "connected" ? `${activeHermesTaskCount} active tasks` : hermes.feed?.state === "stale" ? `${activeHermesTaskCount} active · sync delayed` : hermes.loading ? "Checking board…" : hermes.failed ? "Could not refresh" : "Not connected" : "Preview only"}</small></span>
                 <ChevronRight className="control-arrow" size={14} />
               </button>
               <button className="control-row control-row--button" type="button" onClick={() => setShowReminderTray(true)}>
@@ -1513,6 +1695,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const taskModal = modal?.kind === "task" ? modal : null;
   const eventModal = modal?.kind === "event" ? modal : null;
   const draftModal = modal?.kind === "draft" ? modal : null;
+  const editingHermesTask = hermesTasks.find(task => task.id === editingHermesTaskId) ?? null;
   const modalInbox = taskModal?.inboxId
     ? data.inboxItems.find((item) => item.id === taskModal.inboxId)
     : eventModal?.inboxId
@@ -1545,6 +1728,48 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         {completionUndo ? <button className="status-undo" type="button" onClick={undoTaskCompletion}>Undo</button> : reviewUndo ? <button className="status-undo" type="button" onClick={undoInboxChange}>Undo</button> : null}
       </div> : null}
       <main aria-hidden={isOverlayOpen}>{renderLifeboard()}</main>
+
+      {hermesCompletionApproval ? (
+        <DialogFrame title="Confirm Hermes completion" onClose={() => setHermesCompletionApproval(null)} className="editor-dialog--confirmation">
+          <div className="editor-heading">
+            <div className="composer-icon"><CheckCircle2 size={17} /></div>
+            <div><p className="eyebrow">External change</p><h2>Complete this task?</h2></div>
+            <button className="close-composer" type="button" onClick={() => setHermesCompletionApproval(null)} aria-label="Cancel completion"><X size={17} /></button>
+          </div>
+          <p className="completion-task-title">{hermesCompletionApproval.title}</p>
+          <div className="completion-preview" aria-label="Exact completion changes">
+            <span>Hermes</span><strong>{hermesCompletionApproval.status} → Completed</strong>
+            {hermesCompletionApproval.sourceProvider === "google" ? <><span>Google Tasks</span><strong>No change</strong></> : null}
+          </div>
+          <div className="editor-footer"><span>{hermesCompletionApproval.sourceProvider === "google" ? "Managed in Hermes · From Google Tasks" : "Fox Focus will verify Hermes before checking the row."}</span><div><button className="secondary-action" type="button" onClick={() => setHermesCompletionApproval(null)}>Cancel</button><button className="submit-button" type="button" disabled={hermesCompletionPending !== null} onClick={() => { void completeHermesTask(hermesCompletionApproval); }}><Check size={14} /> Complete in Hermes</button></div></div>
+        </DialogFrame>
+      ) : null}
+
+      {editingHermesTask ? (
+        <DialogFrame title="Organise Hermes task" onClose={() => setEditingHermesTaskId(null)}>
+          <form onSubmit={(event) => { void saveHermesTask(event); }}>
+            <div className="editor-heading">
+              <div className="composer-icon"><Bot size={17} /></div>
+              <div><p className="eyebrow">Hermes task</p><h2>Organise in Fox Focus</h2></div>
+              <button className="close-composer" type="button" onClick={() => setEditingHermesTaskId(null)} aria-label="Close task editor"><X size={17} /></button>
+            </div>
+            {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
+            <div className="source-notice"><Bot size={14} /> Hermes owns the title and completion state. These planning details stay in Fox Focus.</div>
+            <div className="editor-grid">
+              <label className="field field--full"><span>Task · managed in Hermes</span><input value={editingHermesTask.title} readOnly /></label>
+              <label className="field field--full"><span>Status · managed in Hermes</span><input value={hermesLabels[editingHermesTask.status]} readOnly /></label>
+              <label className="field"><span>Area</span><select autoFocus value={hermesTaskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setHermesTaskDraft(current => ({ ...current, area: value })); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
+              <label className="field"><span>Deadline</span><select value={hermesTaskDraft.due} onChange={(event) => setHermesTaskDraft(current => ({ ...current, due: event.target.value }))}><option value="Today">Today</option><option value="Tomorrow">Tomorrow</option><option value="Friday">Friday</option><option value="Waiting">Waiting</option><option value="No deadline">No deadline</option></select></label>
+              <label className="field"><span>Duration</span><select value={hermesTaskDraft.duration} onChange={(event) => setHermesTaskDraft(current => ({ ...current, duration: event.target.value }))}><option value="5 min">5 min</option><option value="10 min">10 min</option><option value="20 min">20 min</option><option value="30 min">30 min</option><option value="40 min">40 min</option><option value="45 min">45 min</option><option value="60 min">60 min</option></select></label>
+              <label className="field"><span>Task state</span><select value={hermesTaskDraft.state} onChange={(event) => { const value = event.target.value; if (value === "up-next" || value === "waiting") setHermesTaskDraft(current => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="waiting">Waiting</option></select></label>
+              <label className="field"><span>Planned day</span><input type="date" value={hermesTaskDraft.scheduledDate} onChange={(event) => setHermesTaskDraft(current => ({ ...current, scheduledDate: event.target.value }))} /></label>
+              <label className="field"><span>Planned time</span><input type="time" value={hermesTaskDraft.scheduledTime} onChange={(event) => setHermesTaskDraft(current => ({ ...current, scheduledTime: event.target.value }))} /></label>
+              <label className="field field--full"><span>Reminder</span><select value={hermesTaskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setHermesTaskDraft(current => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
+            </div>
+            <div className="editor-footer"><span>{editingHermesTask.sourceDueOn ? `Google due date: ${formatDublinDateKey(editingHermesTask.sourceDueOn, { day: "numeric", month: "short" })}.` : "Planning and reminders are local to Fox Focus."}</span><div><button className="secondary-action" type="button" onClick={() => setEditingHermesTaskId(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save details</button></div></div>
+          </form>
+        </DialogFrame>
+      ) : null}
 
       {taskModal ? (
         <DialogFrame title={taskModal.taskId ? "Edit task" : "Add task"} onClose={() => setModal(null)}>
@@ -1617,8 +1842,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <DialogFrame title="Reminders" onClose={() => setShowReminderTray(false)} className="editor-dialog--tray">
           <div className="editor-heading"><div className="composer-icon"><Bell size={17} /></div><div><p className="eyebrow">On this device</p><h2>Reminders</h2></div><button className="close-composer" type="button" onClick={() => setShowReminderTray(false)} aria-label="Close reminders"><X size={17} /></button></div>
           <div className="reminder-list">
-            {data.reminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.firedAt ? "fired" : reminder.fireAt ? "scheduled" : "needs a planned time"}</small></span></div>)}
-            {!data.reminders.length ? <p className="empty-line">No local reminders yet.</p> : null}
+            {allReminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.targetId.startsWith("hermes:") ? "Hermes task · " : ""}{reminder.firedAt ? "fired" : reminder.fireAt ? "scheduled" : "needs a planned time"}</small></span></div>)}
+            {!allReminders.length ? <p className="empty-line">No local reminders yet.</p> : null}
           </div>
           <div className="editor-footer"><span>{pushSubscribed ? "Notifications can arrive when Fox Focus is closed." : "In-tab reminders still work while Fox Focus is open."}</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}{pushSubscribed ? <button className="mini-action" type="button" onClick={() => void turnOffDeviceNotifications()}>Turn off</button> : <button className="secondary-action" type="button" disabled={notificationPermission === "denied" || notificationPermission === "unsupported"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button>}<button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
         </DialogFrame>
@@ -1630,7 +1855,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <p className="eyebrow">Reminder</p>
           <h2>{activeReminder.title}</h2>
           <p>{activeReminder.when}.</p>
-          <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setActiveReminderId(null)}>Dismiss</button><button className="submit-button" type="button" onClick={snoozeReminder}>Snooze 30 min</button></div>
+          <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setActiveReminderId(null)}>Dismiss</button>{activeReminder.targetId.startsWith("hermes:") ? null : <button className="submit-button" type="button" onClick={snoozeReminder}>Snooze 30 min</button>}</div>
         </DialogFrame>
       ) : null}
 

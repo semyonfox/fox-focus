@@ -1,6 +1,6 @@
 # Fox Focus
 
-Fox Focus is a private, self-hosted workspace for deciding what needs attention today. It brings local tasks, a simple timetable, reminders, reviewable incoming work, and a read-only view of Hermes activity into one page.
+Fox Focus is a private, self-hosted workspace for deciding what needs attention today. It brings local tasks, a simple timetable, reminders, reviewable incoming work, and a persistent mirror of Hermes-owned tasks into one page.
 
 It is deliberately small. The point is not to build another project manager or to pretend that every service owns the same task. Fox Focus gives you a place to see the moving parts, capture something quickly, and decide what happens next.
 
@@ -10,15 +10,19 @@ It is deliberately small. The point is not to build another project manager or t
 - Add and edit local calendar blocks with colour-coded areas.
 - Capture an Inbox item, review it, and ask for a draft or more work before turning it into action.
 - Keep local data in a SQLite file, with revision checks that stop one browser tab from silently overwriting another.
-- Show a read-only, human-readable feed from a Hermes Personal Tasks board when one is mounted. Hermes remains the source of truth.
+- Mirror a mounted Hermes Personal Tasks board every 60 seconds. Fox Focus can add local area, planning, and reminder details without changing the Hermes-owned title or status.
+- Prepare a Hermes-owned completion after a confirmation when the separately scoped action bridge is installed. Completion stays disabled until the matching Hermes changes, exact-effect preview, plugin, endpoint, and token have all been reviewed and configured.
 - Connect Google Calendar/Tasks and Microsoft Calendar/To Do through server-side OAuth. Imported records are read-only context and refresh tokens are encrypted locally.
+- Deliver opted-in Web Push reminders to each subscribed device. In-tab reminders remain available when push is unsupported.
 - Run the app in one Docker container. It generates a password on first start and keeps data in a mounted volume.
 
 The deployed personal instance is intentionally protected. It is not a public demo and it contains no sample workspace for visitors to browse.
 
+Optional code is not the same as runtime configuration. The normal local Docker command below leaves provider OAuth and Hermes completion off. Deploying a new Fox Focus image also does not create a Microsoft app registration, install the Hermes plugin, or add private mounts to the operator-owned production Compose file.
+
 ## What is not built yet
 
-Email capture, MCP, real notification delivery, accounts, provider disconnect/revocation, and provider write-back are planned work. They are not hidden behind a half-finished button.
+Email capture, MCP, accounts, provider disconnect/revocation, and Google or Microsoft write-back are planned work. They are not hidden behind a half-finished button.
 
 The proposed rules for those integrations are in [the architecture plan](docs/architecture-plan.md). The approved category, ownership, and sync direction is in the [task organisation and sync handover](docs/task-organisation-and-sync-handover.md). Imported systems keep ownership of their records, and an external change will require a readable preview and human approval.
 
@@ -79,8 +83,13 @@ Browser
   -> SQLite workspace file
 
 Optional Hermes board
-  -> read-only adapter
+  -> read-only 60-second poll
+  -> persistent mirror + local planning annotations
   -> same Hono API
+
+Optional Hermes action plugin
+  <- one explicitly approved completion request
+  <- separate, narrowly scoped service token
 
 Optional Google / Microsoft OAuth clients
   -> server-held OAuth + encrypted token envelope
@@ -95,7 +104,10 @@ The server exposes a small workspace API:
 - `GET /healthz` is an unauthenticated health check with no workspace data.
 - `GET /api/v1/workspace` reads the local workspace.
 - `PUT /api/v1/workspace` saves it when the supplied revision still matches.
-- `GET /api/v1/hermes` reads the optional Hermes feed.
+- `GET /api/v1/hermes` reads the persisted Hermes mirror.
+- `POST /api/v1/hermes/sync` requests a read-only mirror refresh.
+- `PUT /api/v1/hermes/tasks/:taskId/annotation` saves Fox-owned planning details.
+- `POST /api/v1/hermes/tasks/:taskId/complete` submits one confirmed completion when the action bridge is configured.
 - `GET /api/v1/integrations` returns safe connection status and imported read-only records.
 - `GET /api/v1/integrations/:provider/connect` starts OAuth; its callback consumes a one-time server state.
 - `POST /api/v1/integrations/:provider/sync` performs an authenticated, read-only provider refresh.
@@ -104,7 +116,7 @@ The workspace and API use HTTP Basic authentication in this first self-hosted re
 
 ## Running a fuller self-hosted setup
 
-`compose.yaml` adds a persistent SQLite volume and an optional read-only Hermes board mount. Set `HERMES_BOARD_DIR` and `HERMES_KANBAN_DB=/hermes/personal-tasks/kanban.db` when you have a board to show. You do not need Hermes, a tunnel, or a reverse proxy to run the Docker command above.
+`compose.yaml` adds a persistent SQLite volume and an optional read-only Hermes board mount. Set `HERMES_BOARD_DIR` and `HERMES_KANBAN_DB=/hermes/personal-tasks/kanban.db` when you have a board to show. Read-only mirroring and local annotations work without the action bridge. Checkboxes remain disabled until the action URL and its separate token file are both configured. You do not need Hermes, a tunnel, or a reverse proxy to run the Docker command above.
 
 For a production-shaped setup, bind the app to loopback and put a TLS-terminating reverse proxy or private network access layer in front of it. See [self-hosting notes](docs/deployment.md) for the safety boundaries and backup guidance.
 
@@ -129,4 +141,4 @@ GitHub Actions independently validates pull requests and `main`. The homelab Jen
 - Imported services stay authoritative for their own records.
 - The existing `personal-tasks` board remains canonical until an explicit migration is approved.
 - Never commit credentials, private records, or database files.
-- Any future external write needs a human-readable before-and-after approval record.
+- Every external write needs a human-readable before-and-after approval record. Fox contains an optional Hermes completion client, but it must remain disabled until its preview describes the full behavior of the matching Hermes release.

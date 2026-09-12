@@ -1,6 +1,6 @@
 # Hermes task sync request
 
-Status: draft handoff only. Nothing in this repository sends it to Hermes or changes a Hermes board.
+Status: partially implemented on the Fox Focus side. Fox now has a persistent read-only mirror, local annotations, and a fail-closed completion client. The bundled plugin contract still depends on matching Hermes changes that must be forward-ported and reviewed against current Hermes before installation. No production completion route is configured.
 
 The `personal-tasks` board remains canonical until an explicit migration is approved. Fox Focus needs a safe way to show a proposed completion and, only after a human approves it, ask Hermes to apply that one change.
 

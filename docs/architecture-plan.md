@@ -2,7 +2,7 @@
 
 Status: living plan, updated 11 September 2026.
 
-This document describes the next product phases, not a list of features already shipped. The current app is a local React, Hono, and SQLite workspace with a read-only Hermes view and implemented read-only Google and Microsoft OAuth/import paths. Real-account deployment validation, Gmail, MCP, durable jobs, provider writes, and notification delivery remain planned work.
+This document describes the next product phases, not a list of features already shipped. The current release is a React, Hono, and SQLite workspace with Web Push, read-only Google and Microsoft imports, and a persistent Hermes task mirror. Fox Focus can store local planning annotations for mirrored tasks. It contains a fail-closed client for one confirmed Hermes completion, but that action must remain disabled until the matching current-Hermes implementation and a preview of its full effects have been reviewed and deployed. Real-account Microsoft use still needs a personal-account Entra app registration. Gmail, MCP, durable jobs, and Google or Microsoft writes remain planned work.
 
 The approved [task organisation and sync handover](task-organisation-and-sync-handover.md) is authoritative for category navigation, task ownership, Hermes completion, and the later Microsoft-versus-Google task-home decision where older phase language below differs.
 

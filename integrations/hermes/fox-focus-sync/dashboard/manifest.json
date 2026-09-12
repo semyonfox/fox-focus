@@ -1,0 +1,11 @@
+{
+  "name": "fox-focus-sync",
+  "label": "Fox Focus sync",
+  "description": "Narrow service endpoint for approved personal-task completion",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "entry": "noop.js",
+  "api": "plugin_api.py"
+}

@@ -1,6 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { createInitialData, isPrototypeData, type PrototypeData } from '../src/model.ts';
+import { areas, createInitialData, isPrototypeData, type PrototypeData } from '../src/model.ts';
+import { hermesStatuses } from '../src/hermes-model.ts';
+import type {
+  HermesFeed,
+  HermesMirrorSnapshot,
+  HermesStatus,
+  HermesTask,
+  HermesTaskAnnotationInput,
+} from '../src/hermes-model.ts';
 import { isPushSubscription, type StoredPushDelivery, type StoredPushSubscription } from './push.ts';
 
 export type Snapshot = { revision: number; data: PrototypeData };
@@ -70,6 +78,24 @@ export type PushSubscriptionRecord = {
   userAgent: string | null;
   createdAt: string;
 };
+
+export type HermesActionRecord = {
+  id: string;
+  taskId: string;
+  idempotencyKey: string;
+  expectedVersion: number;
+  approvalSummary: string;
+  beforeStatus: HermesStatus;
+  afterStatus: 'done';
+  approvedAt: string;
+  state: 'pending' | 'succeeded' | 'failed' | 'readback_failed';
+};
+
+export type BeginHermesCompletionResult =
+  | { outcome: 'ready'; value: { task: HermesTask; action: HermesActionRecord } }
+  | { outcome: 'not_found' }
+  | { outcome: 'already_done'; task: HermesTask }
+  | { outcome: 'conflict'; task: HermesTask };
 
 const providers = new Set<Provider>(['google', 'microsoft']);
 const recordKinds = new Set<ProviderRecordKind>(['calendar_event', 'task']);
@@ -170,6 +196,51 @@ function rowToSync(row: Record<string, unknown> | undefined, provider: Provider)
   };
 }
 
+function rowToHermesTask(row: Record<string, unknown>): HermesTask | null {
+  if (
+    typeof row.task_id !== 'string' || typeof row.title !== 'string' ||
+    typeof row.remote_status !== 'string' || !hermesStatuses.includes(row.remote_status as HermesStatus) ||
+    typeof row.priority !== 'number' || typeof row.owner !== 'string' ||
+    !['human', 'agent', 'unassigned'].includes(row.owner) ||
+    typeof row.source_label !== 'string' || typeof row.remote_created_at !== 'string' ||
+    typeof row.remote_updated_at !== 'string' ||
+    typeof row.remote_version !== 'number' || typeof row.area !== 'string' ||
+    !areas.includes(row.area as (typeof areas)[number]) || typeof row.local_state !== 'string' ||
+    !['up-next', 'scheduled', 'waiting'].includes(row.local_state) ||
+    typeof row.duration !== 'string' || typeof row.due !== 'string' ||
+    typeof row.reminder_mode !== 'string' || !['none', 'one-hour', 'morning'].includes(row.reminder_mode)
+  ) return null;
+
+  const sourceProvider = row.source_provider === 'google' ? 'google' : null;
+  return {
+    id: row.task_id,
+    title: row.title,
+    status: row.remote_status as HermesStatus,
+    priority: row.priority,
+    createdAt: row.remote_created_at,
+    updatedAt: row.remote_updated_at,
+    version: row.remote_version,
+    owner: row.owner as HermesTask['owner'],
+    source: row.source_label,
+    parentTitle: stringOrNull(row.parent_title),
+    sourceProvider,
+    sourceExternalId: sourceProvider ? stringOrNull(row.source_external_id) : null,
+    sourceDueOn: stringOrNull(row.source_due_on),
+    sourceStatus: stringOrNull(row.source_status),
+    sourceContainerId: stringOrNull(row.source_container_id),
+    sourceContainerName: stringOrNull(row.source_container_name),
+    sourceMatchUnique: row.source_match_unique === 1,
+    area: row.area as HermesTask['area'],
+    localState: row.local_state as HermesTask['localState'],
+    duration: row.duration,
+    due: row.due,
+    scheduledAt: stringOrNull(row.scheduled_at),
+    reminderMode: row.reminder_mode as HermesTask['reminderMode'],
+    reminderFireAt: stringOrNull(row.reminder_fire_at),
+    annotationUpdatedAt: stringOrNull(row.annotation_updated_at),
+  };
+}
+
 // The prototype document remains the local-task store. Provider records live in
 // normal tables, so an import cannot be edited through the workspace PUT route.
 export function openStore(path: string, initialData: PrototypeData = createInitialData()) {
@@ -232,6 +303,61 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       record_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT
     );
+    CREATE TABLE IF NOT EXISTS hermes_sync_state (
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      state TEXT NOT NULL CHECK(state IN ('connected', 'stale', 'unavailable')),
+      checked_at TEXT NOT NULL,
+      last_successful_at TEXT,
+      board_slug TEXT,
+      board_name TEXT,
+      total INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS hermes_task_mirrors (
+      task_id TEXT PRIMARY KEY,
+      board_slug TEXT NOT NULL,
+      title TEXT NOT NULL,
+      remote_status TEXT NOT NULL,
+      priority INTEGER NOT NULL,
+      owner TEXT NOT NULL,
+      source_label TEXT NOT NULL,
+      parent_title TEXT,
+      remote_created_at TEXT NOT NULL,
+      remote_updated_at TEXT NOT NULL,
+      remote_version INTEGER NOT NULL,
+      source_provider TEXT,
+      source_external_id TEXT,
+      sync_marker TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS hermes_task_source_identity
+      ON hermes_task_mirrors(source_provider, source_external_id)
+      WHERE source_provider IS NOT NULL AND source_external_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS hermes_task_annotations (
+      task_id TEXT PRIMARY KEY,
+      area TEXT NOT NULL CHECK(area IN ('University', 'Work', 'Personal', 'Health', 'Admin')),
+      local_state TEXT NOT NULL CHECK(local_state IN ('up-next', 'scheduled', 'waiting')),
+      duration TEXT NOT NULL,
+      due TEXT NOT NULL,
+      scheduled_at TEXT,
+      reminder_mode TEXT NOT NULL CHECK(reminder_mode IN ('none', 'one-hour', 'morning')),
+      reminder_fire_at TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS hermes_actions (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      expected_version INTEGER NOT NULL,
+      approval_summary TEXT NOT NULL,
+      before_json TEXT NOT NULL CHECK(json_valid(before_json)),
+      after_json TEXT NOT NULL CHECK(json_valid(after_json)),
+      approved_at TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending', 'succeeded', 'failed', 'readback_failed')),
+      response_json TEXT CHECK(response_json IS NULL OR json_valid(response_json)),
+      error_code TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS hermes_actions_task ON hermes_actions(task_id, approved_at DESC);
     CREATE TABLE IF NOT EXISTS push_deliveries (
       delivery_key TEXT PRIMARY KEY,
       fired_at TEXT NOT NULL
@@ -472,6 +598,264 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     });
   }
 
+  const hermesTaskSelect = `SELECT
+      mirror.task_id, mirror.title, mirror.remote_status, mirror.priority, mirror.owner,
+      mirror.source_label, mirror.parent_title, mirror.remote_created_at,
+      mirror.remote_updated_at, mirror.remote_version,
+      mirror.source_provider, mirror.source_external_id,
+      COALESCE(annotation.area, 'Personal') AS area,
+      COALESCE(annotation.local_state,
+        CASE mirror.remote_status WHEN 'blocked' THEN 'waiting' ELSE 'up-next' END) AS local_state,
+      COALESCE(annotation.duration, '30 min') AS duration,
+      COALESCE(annotation.due, 'No deadline') AS due,
+      annotation.scheduled_at, COALESCE(annotation.reminder_mode, 'none') AS reminder_mode,
+      annotation.reminder_fire_at, annotation.updated_at AS annotation_updated_at,
+      provider.due_on AS source_due_on, provider.status AS source_status,
+      provider.container_id AS source_container_id,
+      provider.container_name AS source_container_name,
+      CASE WHEN provider.id IS NULL THEN 0 ELSE 1 END AS source_match_unique
+    FROM hermes_task_mirrors mirror
+    LEFT JOIN hermes_task_annotations annotation ON annotation.task_id=mirror.task_id
+    LEFT JOIN provider_records provider ON provider.id=(
+      SELECT CASE
+        WHEN COUNT(*)=1 THEN MIN(candidate.id)
+        WHEN SUM(CASE WHEN candidate.container_name=mirror.source_label COLLATE NOCASE THEN 1 ELSE 0 END)=1
+          THEN MIN(CASE WHEN candidate.container_name=mirror.source_label COLLATE NOCASE THEN candidate.id END)
+        ELSE NULL
+      END
+      FROM provider_records candidate
+      WHERE candidate.deleted_at IS NULL AND candidate.kind='task'
+        AND candidate.provider=mirror.source_provider
+        AND candidate.external_id=mirror.source_external_id
+    )`;
+
+  function replaceHermesTasks(snapshot: HermesMirrorSnapshot): number {
+    const marker = randomUUID();
+    const nextState = snapshot.complete ? 'connected' : 'stale';
+    const upsert = db.prepare(`INSERT INTO hermes_task_mirrors (
+      task_id, board_slug, title, remote_status, priority, owner, source_label,
+      parent_title, remote_created_at, remote_updated_at, remote_version, source_provider,
+      source_external_id, sync_marker, last_seen_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      board_slug=excluded.board_slug, title=excluded.title,
+      remote_status=excluded.remote_status, priority=excluded.priority,
+      owner=excluded.owner, source_label=excluded.source_label,
+      parent_title=excluded.parent_title, remote_created_at=excluded.remote_created_at,
+      remote_updated_at=excluded.remote_updated_at,
+      remote_version=excluded.remote_version, source_provider=excluded.source_provider,
+      source_external_id=excluded.source_external_id,
+      sync_marker=excluded.sync_marker, last_seen_at=excluded.last_seen_at`);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const task of snapshot.board.tasks) {
+        upsert.run(
+          task.id, snapshot.board.slug, task.title, task.status, task.priority, task.owner,
+          task.source, task.parentTitle, task.createdAt, task.updatedAt, task.version, task.sourceProvider,
+          task.sourceExternalId, marker, snapshot.checkedAt,
+        );
+      }
+      // A failed or bounded read must never erase mirrors that the snapshot did
+      // not have a chance to observe.
+      if (snapshot.complete) {
+        db.prepare('DELETE FROM hermes_task_mirrors WHERE board_slug=? AND sync_marker != ?')
+          .run(snapshot.board.slug, marker);
+      }
+      db.prepare(`INSERT INTO hermes_sync_state
+        (id, state, checked_at, last_successful_at, board_slug, board_name, total)
+        VALUES (1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET state=excluded.state, checked_at=excluded.checked_at,
+          last_successful_at=CASE WHEN excluded.state='connected'
+            THEN excluded.last_successful_at ELSE hermes_sync_state.last_successful_at END,
+          board_slug=excluded.board_slug,
+          board_name=excluded.board_name, total=excluded.total`)
+        .run(
+          nextState,
+          snapshot.checkedAt,
+          snapshot.complete ? snapshot.checkedAt : null,
+          snapshot.board.slug,
+          snapshot.board.name,
+          snapshot.board.total,
+        );
+      db.exec('COMMIT');
+      return snapshot.board.tasks.length;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function markHermesUnavailable(checkedAt: string): void {
+    db.prepare(`INSERT INTO hermes_sync_state
+      (id, state, checked_at, last_successful_at, board_slug, board_name, total)
+      VALUES (1, 'unavailable', ?, NULL, NULL, NULL, 0)
+      ON CONFLICT(id) DO UPDATE SET
+        state=CASE WHEN hermes_sync_state.board_slug IS NULL THEN 'unavailable' ELSE 'stale' END,
+        checked_at=excluded.checked_at`)
+      .run(checkedAt);
+  }
+
+  function getHermesTask(taskId: string): HermesTask | null {
+    const row = db.prepare(`${hermesTaskSelect} WHERE mirror.task_id=?`).get(taskId) as Record<string, unknown> | undefined;
+    return row ? rowToHermesTask(row) : null;
+  }
+
+  function readHermesFeed(): HermesFeed {
+    const state = db.prepare('SELECT * FROM hermes_sync_state WHERE id=1').get() as Record<string, unknown> | undefined;
+    const checkedAt = typeof state?.checked_at === 'string' ? state.checked_at : new Date(0).toISOString();
+    if (!state || (state.state !== 'connected' && state.state !== 'stale') || typeof state.board_slug !== 'string' ||
+      typeof state.board_name !== 'string' || typeof state.total !== 'number') {
+      return { state: 'unavailable', checkedAt, board: null };
+    }
+    const rows = db.prepare(`${hermesTaskSelect}
+      WHERE mirror.board_slug=?
+      ORDER BY CASE mirror.remote_status
+        WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 WHEN 'review' THEN 2
+        WHEN 'ready' THEN 3 WHEN 'todo' THEN 4 WHEN 'triage' THEN 5
+        WHEN 'scheduled' THEN 6 ELSE 7 END,
+        mirror.priority DESC, mirror.remote_updated_at DESC, mirror.task_id`)
+      .all(state.board_slug) as Record<string, unknown>[];
+    const tasks = rows.flatMap(row => {
+      const task = rowToHermesTask(row);
+      return task ? [task] : [];
+    });
+    const board = {
+      slug: state.board_slug,
+      name: state.board_name,
+      total: state.total,
+      tasks,
+      sources: [...new Set(tasks.map(task => task.source))].sort((first, second) => first.localeCompare(second)),
+    };
+    if (state.state === 'stale') return {
+      state: 'stale',
+      checkedAt,
+      lastSuccessfulAt: typeof state.last_successful_at === 'string' ? state.last_successful_at : checkedAt,
+      board,
+    };
+    return { state: 'connected', checkedAt, board };
+  }
+
+  function updateHermesTaskAnnotation(taskId: string, annotation: HermesTaskAnnotationInput): HermesTask | null {
+    if (!getHermesTask(taskId)) return null;
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO hermes_task_annotations (
+      task_id, area, local_state, duration, due, scheduled_at,
+      reminder_mode, reminder_fire_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id) DO UPDATE SET area=excluded.area, local_state=excluded.local_state,
+      duration=excluded.duration, due=excluded.due, scheduled_at=excluded.scheduled_at,
+      reminder_mode=excluded.reminder_mode, reminder_fire_at=excluded.reminder_fire_at,
+      updated_at=excluded.updated_at`).run(
+      taskId, annotation.area, annotation.scheduledAt ? 'scheduled' : annotation.localState,
+      annotation.duration, annotation.due, annotation.scheduledAt,
+      annotation.reminderMode, annotation.reminderFireAt, now,
+    );
+    return getHermesTask(taskId);
+  }
+
+  function listHermesReminders(includeStale = false) {
+    const feed = readHermesFeed();
+    if (feed.state === 'unavailable' || (feed.state === 'stale' && !includeStale)) return [];
+    return feed.board.tasks.flatMap(task => task.status !== 'done' && task.reminderMode !== 'none'
+      ? [{
+          id: `reminder-hermes-${task.id}`,
+          targetId: `hermes:${task.id}`,
+          targetType: 'task' as const,
+          title: task.title,
+          mode: task.reminderMode as Exclude<typeof task.reminderMode, 'none'>,
+          when: task.reminderMode === 'one-hour' ? '1 hour before' : '09:00 on the day',
+          state: 'scheduled' as const,
+          ...(task.reminderFireAt ? { fireAt: task.reminderFireAt } : {}),
+        }]
+      : []);
+  }
+
+  function beginHermesCompletion(
+    taskId: string,
+    expectedVersion: number,
+    beforeStatus: HermesStatus,
+    confirmedAt: string,
+  ): BeginHermesCompletionResult {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = getHermesTask(taskId);
+      if (!task) { db.exec('ROLLBACK'); return { outcome: 'not_found' }; }
+      if (task.status === 'done') { db.exec('ROLLBACK'); return { outcome: 'already_done', task }; }
+      if (task.version !== expectedVersion || task.status !== beforeStatus) {
+        db.exec('ROLLBACK');
+        return { outcome: 'conflict', task };
+      }
+      const idempotencyKey = `fox-focus:personal-tasks:${taskId}:complete:${expectedVersion}`;
+      const existing = db.prepare('SELECT * FROM hermes_actions WHERE idempotency_key=?')
+        .get(idempotencyKey) as Record<string, unknown> | undefined;
+      const id = typeof existing?.id === 'string' ? existing.id : randomUUID();
+      const approvedAt = typeof existing?.approved_at === 'string' ? existing.approved_at : confirmedAt;
+      const summary = `Complete "${task.title}" in Hermes personal-tasks: status ${task.status} -> done.`;
+      const before = JSON.stringify({ taskId, title: task.title, status: task.status, version: task.version });
+      const after = JSON.stringify({ taskId, title: task.title, status: 'done' });
+      db.prepare(`INSERT INTO hermes_actions (
+        id, task_id, idempotency_key, expected_version, approval_summary,
+        before_json, after_json, approved_at, state, response_json, error_code, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?)
+      ON CONFLICT(idempotency_key) DO UPDATE SET
+        state=CASE WHEN hermes_actions.state='succeeded' THEN 'succeeded' ELSE 'pending' END,
+        error_code=NULL, updated_at=excluded.updated_at`)
+        .run(id, taskId, idempotencyKey, expectedVersion, summary, before, after, approvedAt, new Date().toISOString());
+      db.exec('COMMIT');
+      return {
+        outcome: 'ready',
+        value: {
+          task,
+          action: {
+            id, taskId, idempotencyKey, expectedVersion, approvalSummary: summary,
+            beforeStatus: task.status, afterStatus: 'done', approvedAt,
+            state: existing?.state === 'succeeded' ? 'succeeded' : 'pending',
+          },
+        },
+      };
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  function finishHermesAction(
+    id: string,
+    state: HermesActionRecord['state'],
+    response: unknown = null,
+    errorCode: string | null = null,
+  ): void {
+    db.prepare(`UPDATE hermes_actions
+      SET state=?, response_json=?, error_code=?, updated_at=?
+      WHERE id=? AND (hermes_actions.state != 'succeeded' OR ?='succeeded')`)
+      .run(state, response === null ? null : JSON.stringify(response), errorCode, new Date().toISOString(), id, state);
+  }
+
+  function listHermesActions(): HermesActionRecord[] {
+    const rows = db.prepare('SELECT * FROM hermes_actions ORDER BY approved_at, id').all() as Record<string, unknown>[];
+    return rows.flatMap(row => {
+      if (typeof row.id !== 'string' || typeof row.task_id !== 'string' ||
+        typeof row.idempotency_key !== 'string' || typeof row.expected_version !== 'number' ||
+        typeof row.approval_summary !== 'string' || typeof row.before_json !== 'string' ||
+        typeof row.after_json !== 'string' || typeof row.approved_at !== 'string' ||
+        !['pending', 'succeeded', 'failed', 'readback_failed'].includes(String(row.state))) return [];
+      const before: unknown = JSON.parse(row.before_json);
+      if (typeof before !== 'object' || before === null || !('status' in before) ||
+        typeof before.status !== 'string' || !hermesStatuses.includes(before.status as HermesStatus)) return [];
+      return [{
+        id: row.id,
+        taskId: row.task_id,
+        idempotencyKey: row.idempotency_key,
+        expectedVersion: row.expected_version,
+        approvalSummary: row.approval_summary,
+        beforeStatus: before.status as HermesStatus,
+        afterStatus: 'done',
+        approvedAt: row.approved_at,
+        state: row.state as HermesActionRecord['state'],
+      }];
+    });
+  }
+
   function savePushSubscription(subscription: StoredPushSubscription, userAgent: string | null): void {
     db.prepare(`INSERT INTO push_subscriptions (endpoint, subscription_json, user_agent, created_at)
       VALUES (?, ?, ?, ?)
@@ -545,6 +929,15 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     replaceProviderRecords,
     clearProviderRecords,
     listProviderRecords,
+    replaceHermesTasks,
+    markHermesUnavailable,
+    readHermesFeed,
+    getHermesTask,
+    updateHermesTaskAnnotation,
+    listHermesReminders,
+    beginHermesCompletion,
+    finishHermesAction,
+    listHermesActions,
     savePushSubscription,
     listPushSubscriptions,
     deletePushSubscription,

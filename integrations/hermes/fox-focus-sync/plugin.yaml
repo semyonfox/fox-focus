@@ -1,0 +1,5 @@
+name: fox-focus-sync
+version: 1.0.0
+description: "Narrow, approved Fox Focus completion bridge for the personal-tasks Kanban board."
+author: Semyon
+kind: backend

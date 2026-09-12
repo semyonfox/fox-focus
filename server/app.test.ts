@@ -95,6 +95,40 @@ test('SQLite keeps edits across restart and preserves task/event transaction', (
   } finally { store.close(); rmSync(dir, { recursive: true }); }
 });
 
+test('SQLite adds the Hermes mirror schema to an existing workspace without changing its data', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fox-focus-hermes-migration-'));
+  const path = join(dir, 'test.sqlite');
+  let store = openStore(path, testData());
+  try {
+    const snapshot = store.read();
+    snapshot.data.tasks[0].title = 'Keep this existing task';
+    assert.ok(store.save(snapshot.revision, snapshot.data));
+    store.close();
+
+    const previous = new DatabaseSync(path);
+    previous.exec(`
+      DROP TABLE hermes_actions;
+      DROP TABLE hermes_task_annotations;
+      DROP TABLE hermes_task_mirrors;
+      DROP TABLE hermes_sync_state;
+    `);
+    assert.equal((previous.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 4);
+    previous.close();
+
+    store = openStore(path);
+    assert.equal(store.read().revision, 1);
+    assert.equal(store.read().data.tasks[0].title, 'Keep this existing task');
+    const migrated = new DatabaseSync(path, { readOnly: true });
+    try {
+      const tables = new Set((migrated.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
+        .map(row => row.name));
+      for (const table of ['hermes_sync_state', 'hermes_task_mirrors', 'hermes_task_annotations', 'hermes_actions']) {
+        assert.ok(tables.has(table), `${table} was not created`);
+      }
+    } finally { migrated.close(); }
+  } finally { store.close(); rmSync(dir, { recursive: true }); }
+});
+
 test('integration routes keep browser OAuth callbacks authenticated and expose no token material', async () => {
   const store = openStore(':memory:');
   let callbackQuery = '';

@@ -31,6 +31,7 @@ export type ImportedRecord = {
   kind: 'calendar_event' | 'task';
   containerId: string;
   containerName: string;
+  externalId: string;
   title: string;
   status: string | null;
   startsAt: string | null;
@@ -76,7 +77,8 @@ function isProviderStatus(value: unknown): value is ProviderStatus {
 function isImportedRecord(value: unknown): value is ImportedRecord {
   return isRecord(value) && typeof value.id === 'number' && Number.isSafeInteger(value.id) &&
     isProvider(value.provider) && (value.kind === 'calendar_event' || value.kind === 'task') &&
-    typeof value.containerId === 'string' && typeof value.containerName === 'string' && typeof value.title === 'string' &&
+    typeof value.containerId === 'string' && typeof value.containerName === 'string' &&
+    typeof value.externalId === 'string' && typeof value.title === 'string' &&
     (value.status === null || typeof value.status === 'string') &&
     (value.startsAt === null || typeof value.startsAt === 'string') &&
     (value.startsOn === null || typeof value.startsOn === 'string') &&

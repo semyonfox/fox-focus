@@ -2,7 +2,9 @@
 
 Fox Focus can import a read-only rolling calendar view plus tasks from Google
 and Microsoft. The provider remains authoritative: this release has no
-calendar edit, task completion, delete, email, or webhook write path.
+provider calendar edit, provider task completion, delete, email, or webhook
+write path. Completing a Hermes-owned mirror uses the separately scoped Hermes
+action API and never writes Google Tasks or Microsoft To Do.
 
 The server runs the authorization-code flow. It uses PKCE, one-time expiring
 state, and a server-held client secret. Browser storage never receives an
@@ -81,8 +83,13 @@ private; a generally distributed product needs Google's verification process.
 
 ## Microsoft Entra
 
-Register a Web app that accepts both personal Microsoft accounts and
-organizational accounts if both are useful. Add exactly:
+The account connected to Fox Focus is an ordinary personal Microsoft account.
+Fox Focus uses Microsoft's `consumers` OAuth authority, so choose **Personal
+Microsoft accounts only** under Supported account types. Microsoft still
+requires the OAuth client itself to be an Entra app registration; Fox Focus
+cannot use a generic shared client in place of that registration. The tenant
+owns the app registration but is not the account whose calendar and tasks Fox
+imports. Add exactly:
 
 ```text
 https://focus.semyon.ie/api/v1/integrations/microsoft/callback

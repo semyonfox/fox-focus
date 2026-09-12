@@ -3506,6 +3506,57 @@ body {
   opacity: 0.68;
 }
 
+.task-check:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.task-check[aria-busy="true"] svg {
+  animation: task-check-pulse 800ms ease-in-out infinite alternate;
+}
+
+@keyframes task-check-pulse {
+  to { opacity: 0.25; }
+}
+
+.editor-dialog--confirmation {
+  width: min(100%, 430px);
+}
+
+.completion-task-title {
+  margin: 16px 0 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.completion-preview {
+  display: grid;
+  grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
+  gap: 1px 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.completion-preview span,
+.completion-preview strong {
+  padding: 5px 0;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.completion-preview span {
+  color: var(--muted);
+}
+
+.completion-preview strong {
+  color: var(--text);
+  font-weight: 690;
+}
+
 .integration-task-lists {
   margin-top: 20px;
 }

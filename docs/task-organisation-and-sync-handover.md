@@ -1,6 +1,6 @@
 # Task organisation and sync handover
 
-Status: approved product direction. This is a handover for the next implementation phase, not permission to enable provider writes or migrate the Hermes board.
+Status: approved product direction and historical implementation handover. Since this checkpoint, Fox Focus has added provider tasks to the main browser, durable Web Push, local annotations for mirrored Hermes tasks, and a fail-closed Fox-side Hermes completion client. The completion backend is not configured and must not be enabled until its full effects match the approval preview. Google and Microsoft remain read-only, and the Hermes board remains canonical. Use the README and deployment guide for current runtime behavior.
 
 ## Implementation checkpoint — 11 September 2026
 
@@ -8,14 +8,14 @@ This release establishes the focused daily workflow without changing task owners
 
 - The calendar opens one day at a time with a seven-day selector centred on the chosen day. `Upcoming` keeps the useful seven-day scan as a separate mode.
 - The task browser opens on `All`, uses the existing top-level areas as category tabs, keeps counts inside a compact filter-and-sort control, orders local tasks by due date then newest creation time, and places completed work after active work.
-- Local tasks remain click-to-complete. Hermes tasks share the browser but remain visibly read-only and managed by Hermes.
+- Local tasks remain click-to-complete. Hermes tasks share the browser and remain managed by Hermes. Current Fox code can show a second confirmation, but the checkbox remains disabled without the separately reviewed and configured action bridge.
 - Inbox review presents one selected item at a time with previous and next controls, local task/calendar/draft/no-action outcomes, reversible handled state, and a local feedback note. No email or Hermes action is sent.
 - Task capture starts with a title and deadline; area, priority, duration, planning, and reminder preview live under `More options`.
 - The fixed header no longer changes position while scrolling, uses a slightly translucent surface, and reduces appearance selection to one icon with `System` as the default.
 - New local calendar blocks store UTC instants and render against `Europe/Dublin`; dated and time-only legacy rows remain readable. Spring-forward gaps and fall-back ambiguities are rejected rather than silently shifted.
 - Connections and reminder prototypes sit at the end of the working flow. Reminder controls are explicitly manual in-app previews because no scheduler or system-notification delivery exists yet.
 
-The next implementation phase still needs the persisted parent/child category and classification tables described below, provider tasks in the main browser, a real Gmail-backed review source, the Hermes approval API, provider write approvals, durable reminder delivery, and authenticated real-account OAuth validation. Until those gates pass, the existing Hermes board and each connected provider remain authoritative.
+The release now has provider tasks in the main browser, list-to-area mapping, durable reminder delivery, and the Fox side of a narrow Hermes approval API. It still needs a current-Hermes backend whose full effects match the preview, the persisted parent/child category model described below, a real Gmail-backed review source, provider write approvals, and authenticated real-account Microsoft validation. The existing Hermes board and each connected provider remain authoritative.
 
 ## The decision
 

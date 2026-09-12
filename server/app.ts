@@ -4,9 +4,10 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
 import { isPrototypeData, isRecord } from '../src/model.ts';
+import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
 import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
-import type { HermesFeed } from '../src/hermes-model.ts';
+import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
 
 const emptyIntegrations: IntegrationOverview = {
@@ -29,7 +30,7 @@ function providerFrom(value: string): 'google' | 'microsoft' | null {
 export function createApp(
   store: Store,
   password: string,
-  hermes?: () => HermesFeed,
+  hermes?: HermesMirrorService,
   integrations?: IntegrationService,
   pushPublicKey?: string,
 ) {
@@ -83,7 +84,53 @@ export function createApp(
     store.deletePushSubscription(body.endpoint);
     return c.json({ ok: true });
   });
-  app.get('/api/v1/hermes', (c) => c.json(hermes?.() ?? { state: 'unavailable', checkedAt: new Date().toISOString(), board: null }));
+  app.get('/api/v1/hermes', (c) => c.json(hermes?.feed() ?? {
+    state: 'unavailable', checkedAt: new Date().toISOString(), board: null, completionAvailable: false,
+  }));
+  app.post('/api/v1/hermes/sync', async (c) => c.json(
+    hermes ? await hermes.poll() : {
+      state: 'unavailable', checkedAt: new Date().toISOString(), board: null, completionAvailable: false,
+    },
+  ));
+  app.put('/api/v1/hermes/tasks/:taskId/annotation', async (c) => {
+    if (!hermes) return c.json({ error: 'Hermes is unavailable' }, 503);
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isHermesTaskAnnotationInput(body)) return c.json({ error: 'Invalid task organisation' }, 400);
+    if (body.reminderMode !== 'none' && (!body.scheduledAt || !body.reminderFireAt)) {
+      return c.json({ error: 'A reminder needs a planned time' }, 400);
+    }
+    if (body.reminderMode === 'none' && body.reminderFireAt !== null) {
+      return c.json({ error: 'A disabled reminder cannot have a fire time' }, 400);
+    }
+    if (!body.scheduledAt && body.localState === 'scheduled') {
+      return c.json({ error: 'Scheduled state needs a planned time' }, 400);
+    }
+    const taskId = c.req.param('taskId');
+    if (!taskId || taskId.length > 200) return c.json({ error: 'Invalid task ID' }, 400);
+    const task = hermes.updateAnnotation(taskId, body);
+    return task ? c.json({ task }) : c.json({ error: 'Task not found' }, 404);
+  });
+  app.post('/api/v1/hermes/tasks/:taskId/complete', async (c) => {
+    if (!hermes) return c.json({ error: 'Hermes is unavailable' }, 503);
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isHermesCompletionInput(body)) return c.json({ error: 'Invalid completion approval' }, 400);
+    const taskId = c.req.param('taskId');
+    if (!taskId || taskId.length > 200) return c.json({ error: 'Invalid task ID' }, 400);
+    const confirmedAt = Date.parse(body.confirmation.confirmedAt);
+    if (confirmedAt > Date.now() + 60_000 || confirmedAt < Date.now() - 10 * 60_000) {
+      return c.json({ error: 'Completion approval expired. Confirm it again.' }, 400);
+    }
+    try {
+      return c.json(await hermes.completeTask(taskId, body));
+    } catch (error) {
+      if (error instanceof HermesServiceError) return c.json({ error: error.message }, error.status);
+      throw error;
+    }
+  });
   app.get('/api/v1/integrations', (c) => c.json(integrations?.overview() ?? emptyIntegrations));
   app.get('/api/v1/integrations/:provider/connect', (c) => {
     const provider = providerFrom(c.req.param('provider'));
