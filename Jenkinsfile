@@ -44,8 +44,8 @@ pipeline {
       steps {
         sh '''
           set -eu
-          source_dir="$WORKSPACE/source"
-          oauth_env=/home/semyon/server-stacks/jenkins/fox-focus/oauth.env
+          operator_dir=/home/semyon/server-stacks/jenkins/fox-focus
+          oauth_env="$operator_dir/oauth.env"
           [ -f "$oauth_env" ]
           set -a
           . "$oauth_env"
@@ -53,9 +53,14 @@ pipeline {
           : "${APP_BASE_URL:?APP_BASE_URL is required}"
           image="$(cat "$WORKSPACE/.fox-focus-image")"
           google_client="${GOOGLE_OAUTH_CLIENT_FILE_HOST:?GOOGLE_OAUTH_CLIENT_FILE_HOST is required}"
-          microsoft_client="${MICROSOFT_OAUTH_CLIENT_FILE_HOST:-$source_dir/empty-oauth/microsoft-client.placeholder}"
+          microsoft_client="${MICROSOFT_OAUTH_CLIENT_FILE_HOST:-$operator_dir/microsoft-client.placeholder}"
           token_key="${OAUTH_TOKEN_KEY_FILE_HOST:?OAUTH_TOKEN_KEY_FILE_HOST is required}"
-          hermes_status_token="$(mktemp)"
+          [ -f "$google_client" ]
+          [ -f "$microsoft_client" ]
+          [ -f "$token_key" ]
+          # The agent uses the host Docker daemon. Create bind-mounted temporary
+          # files under a path shared at the same absolute location on both.
+          hermes_status_token="$(mktemp "$operator_dir/.candidate-hermes-status-token.XXXXXX")"
           chmod 600 "$hermes_status_token"
           openssl rand -base64 32 > "$hermes_status_token"
           candidate="fox-focus-candidate-$BUILD_NUMBER"
