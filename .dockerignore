@@ -26,4 +26,5 @@ coverage
 **/google-client.json
 **/microsoft-client.json
 **/token-key
+**/hermes-status-token
 **/.env*

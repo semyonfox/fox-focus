@@ -9,7 +9,9 @@ export type InboxStatus = "new" | "draft-ready" | "waiting-on-agent" | "handled"
 export type ThemeMode = "system" | "light" | "black";
 export type ResolvedTheme = Exclude<ThemeMode, "system">;
 export type SectionAnchor = "today" | "agenda" | "tasks" | "review" | "signals";
-export type TaskOrigin = "manual" | "inbox";
+export type TaskOrigin = "manual" | "inbox" | "migration";
+export type TaskLinkProvider = "google_tasks" | "microsoft_todo" | "hermes";
+export type TaskLinkPolicy = "read_only" | "completion_only";
 export type EventOrigin = "fixture" | "local" | "task" | "inbox";
 export type ReminderMode = "none" | "one-hour" | "morning";
 export type ActiveReminderMode = Exclude<ReminderMode, "none">;
@@ -35,6 +37,26 @@ export type Task = {
   source?: string;
   /** Creation instant for ordering; omitted on legacy workspace records. */
   createdAt?: string;
+  /** Exact local deadline. The legacy `due` label stays readable during migration. */
+  deadlineDate?: string;
+  /** Completion instant retained as part of Fox Focus task history. */
+  completedAt?: string;
+  /** Optional provenance. Native task behaviour never depends on this being present. */
+  externalLinks?: TaskExternalLink[];
+};
+
+export type TaskExternalLink = {
+  provider: TaskLinkProvider;
+  externalId: string;
+  containerId: string;
+  containerName?: string;
+  /** Opaque OAuth connection generation used to block writes after account changes. */
+  connectionId?: string;
+  policy: TaskLinkPolicy;
+  sourceStatus?: string;
+  sourceVersion?: string;
+  sourceUpdatedAt?: string;
+  linkedAt: string;
 };
 
 type TimelineEventBase = {
@@ -93,6 +115,7 @@ export type TaskDraft = {
   area: Area;
   priority: Priority;
   due: string;
+  deadlineDate: string;
   duration: string;
   state: ActiveTaskState;
   scheduledDate: string;
@@ -122,7 +145,9 @@ export const taskStates = ["up-next", "scheduled", "waiting", "done"] as const;
 export const activeTaskStates = ["up-next", "scheduled", "waiting"] as const;
 export const inboxStatuses = ["new", "draft-ready", "waiting-on-agent", "handled"] as const;
 export const eventOrigins = ["fixture", "local", "task", "inbox"] as const;
-export const taskOrigins = ["manual", "inbox"] as const;
+export const taskOrigins = ["manual", "inbox", "migration"] as const;
+export const taskLinkProviders = ["google_tasks", "microsoft_todo", "hermes"] as const;
+export const taskLinkPolicies = ["read_only", "completion_only"] as const;
 export const reminderModes = ["none", "one-hour", "morning"] as const;
 export const activeReminderModes = ["one-hour", "morning"] as const;
 export const reminderStates = ["scheduled", "snoozed"] as const;
@@ -135,6 +160,7 @@ export const defaultTaskDraft: TaskDraft = {
   area: "Personal",
   priority: "medium",
   due: "No deadline",
+  deadlineDate: "",
   duration: "30 min",
   state: "up-next",
   scheduledDate: "",
@@ -189,8 +215,30 @@ export function isTask(value: unknown): value is Task {
     (value.linkedEventId === undefined || typeof value.linkedEventId === "string") &&
     isOneOf(value.origin, taskOrigins) &&
     (value.source === undefined || typeof value.source === "string") &&
-    (value.createdAt === undefined || isIsoInstant(value.createdAt))
+    (value.createdAt === undefined || isIsoInstant(value.createdAt)) &&
+    (value.deadlineDate === undefined || isDateKey(value.deadlineDate)) &&
+    (value.completedAt === undefined || isIsoInstant(value.completedAt)) &&
+    (value.externalLinks === undefined || (
+      Array.isArray(value.externalLinks) &&
+      value.externalLinks.length <= 8 &&
+      value.externalLinks.every(isTaskExternalLink) &&
+      new Set(value.externalLinks.map(link => `${link.provider}:${link.connectionId ?? "legacy"}:${link.containerId}:${link.externalId}`)).size === value.externalLinks.length
+    ))
   );
+}
+
+export function isTaskExternalLink(value: unknown): value is TaskExternalLink {
+  if (!isRecord(value)) return false;
+  return isOneOf(value.provider, taskLinkProviders) &&
+    typeof value.externalId === "string" && value.externalId.length > 0 && value.externalId.length <= 512 &&
+    typeof value.containerId === "string" && value.containerId.length > 0 && value.containerId.length <= 512 &&
+    (value.containerName === undefined || (typeof value.containerName === "string" && value.containerName.length <= 500)) &&
+    (value.connectionId === undefined || (typeof value.connectionId === "string" && value.connectionId.length > 0 && value.connectionId.length <= 200)) &&
+    isOneOf(value.policy, taskLinkPolicies) &&
+    (value.sourceStatus === undefined || (typeof value.sourceStatus === "string" && value.sourceStatus.length <= 100)) &&
+    (value.sourceVersion === undefined || (typeof value.sourceVersion === "string" && value.sourceVersion.length <= 512)) &&
+    (value.sourceUpdatedAt === undefined || isIsoInstant(value.sourceUpdatedAt)) &&
+    isIsoInstant(value.linkedAt);
 }
 
 const dueOrdering: Record<string, number> = {
@@ -237,6 +285,12 @@ function taskDueTimestamp(due: string, referenceDate: string | undefined): numbe
 
 /** Sorts earlier/current deadlines first, then newest-created, then task ID. */
 export function compareTasksByDue(first: Task, second: Task, referenceDate?: string): number {
+  if (first.deadlineDate !== undefined || second.deadlineDate !== undefined) {
+    if (first.deadlineDate === undefined) return 1;
+    if (second.deadlineDate === undefined) return -1;
+    const exactOrder = first.deadlineDate.localeCompare(second.deadlineDate);
+    if (exactOrder !== 0) return exactOrder;
+  }
   const firstTimestamp = taskDueTimestamp(first.due, referenceDate);
   const secondTimestamp = taskDueTimestamp(second.due, referenceDate);
   if (firstTimestamp !== null || secondTimestamp !== null) {
@@ -317,7 +371,7 @@ export function isPrototypeData(value: unknown): value is PrototypeData {
     ? []
     : isRecord(value.listAreas) ? Object.entries(value.listAreas) : null;
 
-  return (
+  const collectionsAreValid = (
     listAreaEntries !== null &&
     listAreaEntries.length <= 100 &&
     listAreaEntries.every(([key, area]) => key.length >= 1 && key.length <= 300 && isOneOf(area, areas)) &&
@@ -333,6 +387,11 @@ export function isPrototypeData(value: unknown): value is PrototypeData {
       items.length <= 500 && new Set(items.map(item => item.id)).size === items.length &&
       items.every(item => item.id.length > 0 && item.id.length <= 200 && item.title.trim().length > 0 && item.title.length <= 500))
   );
+  if (!collectionsAreValid) return false;
+  const tasks = value.tasks as Task[];
+  const linkedSources = tasks.flatMap(task => task.externalLinks ?? [])
+    .map(link => `${link.provider}:${link.connectionId ?? "legacy"}:${link.containerId}:${link.externalId}`);
+  return new Set(linkedSources).size === linkedSources.length;
 }
 
 export function createInitialData(): PrototypeData {

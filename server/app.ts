@@ -1,14 +1,25 @@
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { basicAuth } from 'hono/basic-auth';
 import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
-import { isPrototypeData, isRecord } from '../src/model.ts';
+import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
 import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
 import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
+import {
+  TaskManagementError,
+  adoptionSourceStillMatches,
+  adoptedTaskIdForHermes,
+  adoptedTaskIdForRecord,
+  previewHermesTaskAdoption,
+  previewProviderTaskAdoption,
+  previewTaskAction,
+  taskStatusProjection,
+} from './task-management.ts';
 
 const emptyIntegrations: IntegrationOverview = {
   providers: (['google', 'microsoft'] as const).map(provider => ({
@@ -27,14 +38,40 @@ function providerFrom(value: string): 'google' | 'microsoft' | null {
   return value === 'google' || value === 'microsoft' ? value : null;
 }
 
+export type AppOptions = {
+  pushPublicKey?: string;
+  taskStatusToken?: string;
+  now?: () => Date;
+};
+
+function tokenMatches(value: string, expected: string): boolean {
+  const supplied = Buffer.from(value);
+  const wanted = Buffer.from(expected);
+  return supplied.length === wanted.length && timingSafeEqual(supplied, wanted);
+}
+
+function isHermesApiPath(path: string): boolean {
+  return path === '/api/v1/task-status' || path === '/api/v1/task-proposals';
+}
+
+function taskManagementStatus(error: TaskManagementError): 404 | 409 | 422 {
+  if (error.code === 'not_found') return 404;
+  if (error.code === 'already_adopted' || error.code === 'action_in_progress' || error.code === 'idempotency_conflict') return 409;
+  return 422;
+}
+
 export function createApp(
   store: Store,
   password: string,
   hermes?: HermesMirrorService,
   integrations?: IntegrationService,
-  pushPublicKey?: string,
+  options: AppOptions = {},
 ) {
-  if (password.length < 8) throw new Error('Workspace password must have at least 8 characters');
+  if (password.length < 24) throw new Error('Workspace password must have at least 24 characters');
+  if (options.taskStatusToken !== undefined && options.taskStatusToken.length < 24) {
+    throw new Error('Hermes task-status token must have at least 24 characters');
+  }
+  const now = options.now ?? (() => new Date());
   const app = new Hono();
   app.use('*', secureHeaders());
   const auth = basicAuth({ username: 'fox', password, realm: 'Fox Focus workspace' });
@@ -43,7 +80,15 @@ export function createApp(
   app.use('/app/*', auth);
   app.use('/sw.js', auth);
   app.use('/manifest.webmanifest', auth);
-  app.use('/api/*', auth);
+  app.use('/api/*', async (c, next) => {
+    const authorization = c.req.header('Authorization') ?? '';
+    const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
+    if (isHermesApiPath(c.req.path) && options.taskStatusToken && tokenMatches(bearer, options.taskStatusToken)) {
+      await next();
+      return;
+    }
+    return auth(c, next);
+  });
   app.use('/api/*', async (c, next) => {
     c.header('Cache-Control', 'no-store');
     // Browser mutations must originate on this origin. Agents use Basic auth
@@ -61,8 +106,8 @@ export function createApp(
   app.get('/healthz', (c) => c.json({ ok: true, mode: 'workspace' }));
   app.get('/app', (c) => c.redirect('/', 302));
   app.get('/api/v1/workspace', (c) => c.json(store.read()));
-  app.get('/api/v1/push/public-key', (c) => pushPublicKey
-    ? c.json({ publicKey: pushPublicKey })
+  app.get('/api/v1/push/public-key', (c) => options.pushPublicKey
+    ? c.json({ publicKey: options.pushPublicKey })
     : c.json({ error: 'Push notifications are unavailable' }, 503));
   app.post('/api/v1/push/subscriptions', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
@@ -120,6 +165,10 @@ export function createApp(
     if (!isHermesCompletionInput(body)) return c.json({ error: 'Invalid completion approval' }, 400);
     const taskId = c.req.param('taskId');
     if (!taskId || taskId.length > 200) return c.json({ error: 'Invalid task ID' }, 400);
+    const currentFeed = hermes.feed();
+    if (currentFeed.board && adoptedTaskIdForHermes(store.read(), currentFeed.board.slug, taskId)) {
+      return c.json({ error: 'This task is owned by Fox Focus and cannot be completed through the legacy Hermes bridge.' }, 409);
+    }
     const confirmedAt = Date.parse(body.confirmation.confirmedAt);
     if (confirmedAt > Date.now() + 60_000 || confirmedAt < Date.now() - 10 * 60_000) {
       return c.json({ error: 'Completion approval expired. Confirm it again.' }, 400);
@@ -131,7 +180,53 @@ export function createApp(
       throw error;
     }
   });
-  app.get('/api/v1/integrations', (c) => c.json(integrations?.overview() ?? emptyIntegrations));
+  app.get('/api/v1/task-status', (c) => {
+    const snapshot = store.read();
+    const etag = `"workspace-${snapshot.revision}"`;
+    c.header('ETag', etag);
+    if (c.req.header('If-None-Match') === etag) return c.body(null, 304);
+    return c.json(taskStatusProjection(snapshot, now().toISOString()));
+  });
+  app.post('/api/v1/task-proposals', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (
+      !isRecord(body) || typeof body.idempotencyKey !== 'string' || body.idempotencyKey.length < 8 || body.idempotencyKey.length > 200 ||
+      typeof body.title !== 'string' || body.title.trim().length === 0 || body.title.length > 500 ||
+      typeof body.summary !== 'string' || body.summary.trim().length === 0 || body.summary.length > 2_000 ||
+      (body.area !== undefined && !isOneOf(body.area, areas))
+    ) return c.json({ error: 'Invalid task proposal' }, 400);
+    const timestamp = now().toISOString();
+    const normalizedProposal = {
+      title: body.title.trim(),
+      summary: body.summary.trim(),
+      area: body.area ?? 'Personal',
+    };
+    const requestHash = createHash('sha256').update(JSON.stringify(normalizedProposal)).digest('base64url');
+    const result = store.addAgentProposal(body.idempotencyKey, requestHash, {
+      id: `inbox-${randomUUID()}`,
+      title: normalizedProposal.title,
+      summary: normalizedProposal.summary,
+      source: 'Hermes proposal',
+      actor: 'Hermes',
+      status: 'new',
+      accent: normalizedProposal.area,
+    }, timestamp);
+    if (result.conflict) return c.json({ error: 'That idempotency key was used for a different proposal' }, 409);
+    return c.json({ outcome: result.created ? 'created' : 'already_received', inboxItemId: result.inboxItemId }, result.created ? 201 : 200);
+  });
+  app.get('/api/v1/integrations', (c) => {
+    const overview = integrations?.overview() ?? {
+      ...emptyIntegrations,
+      records: [...store.listProviderRecords(2_000, 'calendar_event'), ...store.listProviderRecords(2_000, 'task')],
+    };
+    const snapshot = store.read();
+    return c.json({
+      ...overview,
+      records: overview.records.map(record => ({ ...record, adoptedTaskId: adoptedTaskIdForRecord(store, snapshot, record) })),
+    });
+  });
   app.get('/api/v1/integrations/:provider/connect', (c) => {
     const provider = providerFrom(c.req.param('provider'));
     const authorizationUrl = provider ? integrations?.startAuthorization(provider) : null;
@@ -151,6 +246,132 @@ export function createApp(
     const result = await integrations.sync(provider);
     return result.outcome === 'synced' ? c.json(result) : c.json(result, 503);
   });
+  app.post('/api/v1/task-adoptions/preview', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isRecord(body) || (body.source !== 'google' && body.source !== 'microsoft' && body.source !== 'hermes')) {
+      return c.json({ error: 'Invalid adoption source' }, 400);
+    }
+    try {
+      const request = body.source === 'hermes'
+        ? typeof body.externalId === 'string' && body.externalId.length > 0 && body.externalId.length <= 512
+          ? previewHermesTaskAdoption(store, hermes?.feed() ?? { state: 'unavailable', checkedAt: now().toISOString(), board: null }, body.externalId, now())
+          : null
+        : typeof body.recordId === 'number' && Number.isSafeInteger(body.recordId) && body.recordId > 0
+          ? body.targetTaskId === undefined || (
+              typeof body.targetTaskId === 'string' && body.targetTaskId.length > 0 && body.targetTaskId.length <= 200
+            )
+            ? previewProviderTaskAdoption(store, body.recordId, now(), body.targetTaskId)
+            : null
+          : null;
+      if (!request) return c.json({ error: 'Invalid adoption target' }, 400);
+      if (request.source !== body.source) return c.json({ error: 'Adoption source does not match the imported record' }, 409);
+      return c.json({
+        id: request.id,
+        status: request.status,
+        before: request.before,
+        after: request.task,
+        expiresAt: request.expiresAt,
+      }, 201);
+    } catch (error) {
+      if (error instanceof TaskManagementError) return c.json({ error: error.message }, taskManagementStatus(error));
+      throw error;
+    }
+  });
+  app.post('/api/v1/task-adoptions/:id/approve', (c) => {
+    const id = c.req.param('id');
+    const request = store.getTaskAdoption(id);
+    if (!request) return c.json({ error: 'Adoption preview was not found' }, 404);
+    if (request.status === 'awaiting_approval' && store.read().revision !== request.workspaceRevision) {
+      return c.json({ error: 'The workspace changed after this preview. Preview the adoption again.' }, 409);
+    }
+    if (!adoptionSourceStillMatches(store, request, request.source === 'hermes' ? hermes?.feed() : undefined)) {
+      return c.json({ error: 'The source task changed after this preview. Refresh and review it again.' }, 409);
+    }
+    const result = store.approveTaskAdoption(id, now().toISOString());
+    return result
+      ? c.json({ outcome: 'adopted', taskId: result.adoptedTaskId, snapshot: result.snapshot })
+      : c.json({ error: 'Adoption preview was not found or has expired' }, 410);
+  });
+  app.get('/api/v1/task-actions', (c) => {
+    const taskId = c.req.query('taskId');
+    return c.json({ actions: store.listTaskActions(taskId || undefined) });
+  });
+  app.post('/api/v1/task-actions/preview', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (
+      !isRecord(body) || typeof body.taskId !== 'string' || body.taskId.length === 0 || body.taskId.length > 200 ||
+      (body.desiredState !== 'open' && body.desiredState !== 'completed') ||
+      typeof body.idempotencyKey !== 'string' || body.idempotencyKey.length < 8 || body.idempotencyKey.length > 200
+    ) return c.json({ error: 'Invalid task action' }, 400);
+    try {
+      return c.json(previewTaskAction(store, body.taskId, body.desiredState, body.idempotencyKey, now()), 201);
+    } catch (error) {
+      if (error instanceof TaskManagementError) return c.json({ error: error.message }, taskManagementStatus(error));
+      throw error;
+    }
+  });
+
+  async function executeTaskAction(id: string, retry: boolean) {
+    const existing = store.getTaskAction(id);
+    if (existing?.status === 'succeeded') return { status: 200 as const, body: { action: existing, snapshot: store.read() } };
+    if (retry && existing?.status === 'failed' && existing.result?.retryable !== true) {
+      return { status: 409 as const, body: { error: 'This failure needs a new preview or reconnection before retrying.' } };
+    }
+    const started = store.beginTaskAction(id, now().toISOString(), retry);
+    if (!started) return { status: 410 as const, body: { error: 'Action preview was not found, cannot be retried, or has expired.' } };
+    if (started.outcome === 'conflict') {
+      return { status: 409 as const, body: { action: started.action, snapshot: started.snapshot } };
+    }
+    if (!integrations) {
+      const action = store.finishTaskAction(id, 'failed', { retryable: false }, 'Google Tasks is not configured.', now().toISOString());
+      return { status: 503 as const, body: { action, snapshot: store.read() } };
+    }
+    const result = await integrations.updateGoogleTaskCompletion({
+      connectionId: started.action.connectionId,
+      containerId: started.action.containerId,
+      externalId: started.action.externalId,
+      desiredState: started.action.desiredState,
+      ...(started.action.expectedVersion ? { expectedVersion: started.action.expectedVersion } : {}),
+    });
+    if (result.outcome === 'succeeded') {
+      store.updateTaskExternalState({
+        taskId: started.action.taskId,
+        connectionId: started.action.connectionId,
+        containerId: started.action.containerId,
+        externalId: started.action.externalId,
+        sourceStatus: result.sourceStatus,
+        sourceVersion: result.sourceVersion,
+        sourceUpdatedAt: result.sourceUpdatedAt,
+        completedAt: result.completedAt,
+        now: now().toISOString(),
+      });
+      const action = store.finishTaskAction(id, 'succeeded', {
+        verified: true,
+        sourceStatus: result.sourceStatus,
+        sourceVersion: result.sourceVersion,
+      }, null, now().toISOString());
+      return { status: 200 as const, body: { action, snapshot: store.read() } };
+    }
+    if (result.outcome === 'conflict') {
+      const action = store.finishTaskAction(id, 'conflict', { retryable: false }, result.notice, now().toISOString());
+      return { status: 409 as const, body: { action, snapshot: store.read() } };
+    }
+    const action = store.finishTaskAction(id, 'failed', { retryable: result.retryable }, result.notice, now().toISOString());
+    return { status: 503 as const, body: { action, snapshot: store.read() } };
+  }
+
+  app.post('/api/v1/task-actions/:id/approve', async (c) => {
+    const result = await executeTaskAction(c.req.param('id'), false);
+    return c.json(result.body, result.status);
+  });
+  app.post('/api/v1/task-actions/:id/retry', async (c) => {
+    const result = await executeTaskAction(c.req.param('id'), true);
+    return c.json(result.body, result.status);
+  });
   app.put('/api/v1/workspace', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
     let body: unknown;
@@ -165,6 +386,22 @@ export function createApp(
     if (imported.some(e => JSON.stringify(data.events.find(next => next.id === e.id)) !== JSON.stringify(e)) ||
       data.events.some(e => !e.editable && !imported.some(previous => previous.id === e.id))) {
       return c.json({ error: 'Read-only calendar context cannot be changed' }, 403);
+    }
+    const currentTasks = new Map(current.data.tasks.map(task => [task.id, task]));
+    for (const nextTask of data.tasks) {
+      const previous = currentTasks.get(nextTask.id);
+      const previousLinks = previous?.externalLinks ?? [];
+      const nextLinks = nextTask.externalLinks ?? [];
+      if (JSON.stringify(previousLinks) !== JSON.stringify(nextLinks)) {
+        return c.json({ error: 'External task links are managed by Fox Focus' }, 403);
+      }
+      if (previousLinks.some(link => link.policy === 'completion_only') &&
+        (previous?.completed !== nextTask.completed || previous.completedAt !== nextTask.completedAt)) {
+        return c.json({ error: 'Linked task completion requires an approval preview' }, 403);
+      }
+    }
+    if (current.data.tasks.some(task => task.externalLinks?.length && !data.tasks.some(next => next.id === task.id))) {
+      return c.json({ error: 'Adopted tasks cannot be removed through the workspace editor' }, 403);
     }
     const saved = store.save(body.revision, body.data);
     return saved ? c.json(saved) : c.json({ error: 'Workspace changed in another tab. Reload before saving.' }, 409);

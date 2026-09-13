@@ -34,6 +34,7 @@ oauth.env
 google-client.json
 microsoft-client.json
 token-key
+hermes-status-token
 
 # Editor and OS files
 .DS_Store

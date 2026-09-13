@@ -41,6 +41,7 @@ jobs:
               "providers.ts",
               "push.ts",
               "store.ts",
+              "task-management.ts",
             ]);
             assert.deepEqual(createInitialData(), {
               tasks: [],
@@ -56,7 +57,7 @@ jobs:
             if docker exec fox-focus-check node --input-type=module -e '
               import assert from "node:assert/strict";
               assert.equal((await fetch("http://127.0.0.1:8789/healthz")).status, 200);
-              for (const path of ["/", "/app", "/api/v1/workspace", "/api/v1/hermes", "/api/v1/integrations"]) {
+              for (const path of ["/", "/app", "/api/v1/workspace", "/api/v1/hermes", "/api/v1/integrations", "/api/v1/task-status"]) {
                 assert.equal((await fetch(`http://127.0.0.1:8789${path}`, { redirect: "manual" })).status, 401);
               }
             ' 2>/dev/null; then

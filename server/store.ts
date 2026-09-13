@@ -1,6 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { areas, createInitialData, isPrototypeData, type PrototypeData } from '../src/model.ts';
+import {
+  areas,
+  createInitialData,
+  isInboxItem,
+  isPrototypeData,
+  isTask,
+  type InboxItem,
+  type PrototypeData,
+  type Task,
+} from '../src/model.ts';
 import { hermesStatuses } from '../src/hermes-model.ts';
 import type {
   HermesFeed,
@@ -19,6 +28,7 @@ export type ProviderSyncState = 'idle' | 'syncing' | 'failed';
 
 export type ConnectionSummary = {
   provider: Provider;
+  connectionId: string;
   state: ProviderConnectionState;
   scopes: string[];
   connectedAt: string;
@@ -55,6 +65,9 @@ export type ImportedRecord = {
   dueOn: string | null;
   completedAt: string | null;
   sourceUpdatedAt: string | null;
+  sourceVersion?: string | null;
+  connectionId?: string | null;
+  completionWritable?: boolean;
   sourceUrl: string | null;
   sourceTimeZone: string | null;
 };
@@ -62,6 +75,55 @@ export type ImportedRecord = {
 export type StoredRecord = ImportedRecord & {
   id: number;
   importedAt: string;
+  sourceVersion: string | null;
+  connectionId: string | null;
+  completionWritable: boolean;
+};
+
+export type TaskActionState = 'open' | 'completed';
+export type TaskActionStatus = 'awaiting_approval' | 'running' | 'succeeded' | 'failed' | 'conflict';
+export const TASK_ACTION_LEASE_MS = 2 * 60_000;
+
+export type TaskActionRequest = {
+  id: string;
+  idempotencyKey: string;
+  taskId: string;
+  provider: 'google';
+  connectionId: string;
+  containerId: string;
+  externalId: string;
+  desiredState: TaskActionState;
+  expectedVersion: string | null;
+  workspaceRevision: number;
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  status: TaskActionStatus;
+  createdAt: string;
+  expiresAt: string;
+  approvedAt: string | null;
+  finishedAt: string | null;
+  attemptCount: number;
+  leaseExpiresAt: string | null;
+  result: Record<string, unknown> | null;
+  lastError: string | null;
+};
+
+export type TaskAdoptionSource = 'google' | 'microsoft' | 'hermes';
+export type TaskAdoptionStatus = 'awaiting_approval' | 'approved' | 'expired';
+
+export type TaskAdoptionRequest = {
+  id: string;
+  source: TaskAdoptionSource;
+  externalId: string;
+  containerId: string;
+  workspaceRevision: number;
+  before: Record<string, unknown>;
+  task: Task;
+  status: TaskAdoptionStatus;
+  createdAt: string;
+  expiresAt: string;
+  approvedAt: string | null;
+  adoptedTaskId: string | null;
 };
 
 export type SyncSummary = {
@@ -132,12 +194,14 @@ function stringList(value: unknown): string[] {
 
 function rowToConnection(row: Record<string, unknown> | undefined): StoredConnection | null {
   if (
-    !row || !isProvider(row.provider) || !connectionStates.has(row.state as ProviderConnectionState) ||
+    !row || !isProvider(row.provider) || typeof row.connection_id !== 'string' ||
+    !connectionStates.has(row.state as ProviderConnectionState) ||
     typeof row.connected_at !== 'string' || typeof row.updated_at !== 'string'
   ) return null;
 
   return {
     provider: row.provider,
+    connectionId: row.connection_id,
     state: row.state as ProviderConnectionState,
     scopes: stringList(row.scopes),
     connectedAt: row.connected_at,
@@ -173,9 +237,90 @@ function rowToRecord(row: Record<string, unknown>): StoredRecord | null {
     dueOn: stringOrNull(row.due_on),
     completedAt: stringOrNull(row.completed_at),
     sourceUpdatedAt: stringOrNull(row.source_updated_at),
+    sourceVersion: stringOrNull(row.source_version),
+    connectionId: stringOrNull(row.connection_id),
+    completionWritable: booleanFromInteger(row.completion_writable),
     sourceUrl: stringOrNull(row.source_url),
     sourceTimeZone: stringOrNull(row.source_time_zone),
     importedAt: row.imported_at,
+  };
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function rowToTaskAction(row: Record<string, unknown> | undefined): TaskActionRequest | null {
+  const before = jsonRecord(row?.before_json);
+  const after = jsonRecord(row?.after_json);
+  const result = row?.result_json === null ? null : jsonRecord(row?.result_json);
+  if (
+    !row || typeof row.id !== 'string' || typeof row.idempotency_key !== 'string' ||
+    typeof row.task_id !== 'string' || row.provider !== 'google' || typeof row.connection_id !== 'string' ||
+    typeof row.container_id !== 'string' || typeof row.external_id !== 'string' ||
+    (row.desired_state !== 'open' && row.desired_state !== 'completed') ||
+    !['awaiting_approval', 'running', 'succeeded', 'failed', 'conflict'].includes(String(row.status)) ||
+    typeof row.created_at !== 'string' || typeof row.expires_at !== 'string' ||
+    typeof row.workspace_revision !== 'number' || typeof row.attempt_count !== 'number' || !before || !after
+  ) return null;
+  return {
+    id: row.id,
+    idempotencyKey: row.idempotency_key,
+    taskId: row.task_id,
+    provider: 'google',
+    connectionId: row.connection_id,
+    containerId: row.container_id,
+    externalId: row.external_id,
+    desiredState: row.desired_state,
+    expectedVersion: stringOrNull(row.expected_version),
+    workspaceRevision: row.workspace_revision,
+    before,
+    after,
+    status: row.status as TaskActionStatus,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    approvedAt: stringOrNull(row.approved_at),
+    finishedAt: stringOrNull(row.finished_at),
+    attemptCount: row.attempt_count,
+    leaseExpiresAt: stringOrNull(row.lease_expires_at),
+    result,
+    lastError: stringOrNull(row.last_error),
+  };
+}
+
+function rowToTaskAdoption(row: Record<string, unknown> | undefined): TaskAdoptionRequest | null {
+  const before = jsonRecord(row?.before_json);
+  let task: unknown;
+  try { task = typeof row?.task_json === 'string' ? JSON.parse(row.task_json) : null; } catch { task = null; }
+  if (
+    !row || typeof row.id !== 'string' ||
+    !['google', 'microsoft', 'hermes'].includes(String(row.source)) ||
+    typeof row.external_id !== 'string' || typeof row.container_id !== 'string' ||
+    !['awaiting_approval', 'approved', 'expired'].includes(String(row.status)) ||
+    typeof row.created_at !== 'string' || typeof row.expires_at !== 'string' || typeof row.workspace_revision !== 'number' ||
+    !before || !isTask(task)
+  ) return null;
+  return {
+    id: row.id,
+    source: row.source as TaskAdoptionSource,
+    externalId: row.external_id,
+    containerId: row.container_id,
+    workspaceRevision: row.workspace_revision,
+    before,
+    task,
+    status: row.status as TaskAdoptionStatus,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    approvedAt: stringOrNull(row.approved_at),
+    adoptedTaskId: stringOrNull(row.adopted_task_id),
   };
 }
 
@@ -241,7 +386,7 @@ function rowToHermesTask(row: Record<string, unknown>): HermesTask | null {
   };
 }
 
-// The prototype document remains the local-task store. Provider records live in
+// The workspace document is the native task store. Provider records live in
 // normal tables, so an import cannot be edited through the workspace PUT route.
 export function openStore(path: string, initialData: PrototypeData = createInitialData()) {
   const db = new DatabaseSync(path);
@@ -254,6 +399,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     );
     CREATE TABLE IF NOT EXISTS provider_connections (
       provider TEXT PRIMARY KEY CHECK(provider IN ('google', 'microsoft')),
+      connection_id TEXT NOT NULL,
       state TEXT NOT NULL CHECK(state IN ('connected', 'needs_reconnect')),
       scopes TEXT NOT NULL CHECK(json_valid(scopes)),
       token_envelope TEXT,
@@ -273,6 +419,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     CREATE TABLE IF NOT EXISTS provider_records (
       id INTEGER PRIMARY KEY,
       provider TEXT NOT NULL CHECK(provider IN ('google', 'microsoft')),
+      connection_id TEXT,
       kind TEXT NOT NULL CHECK(kind IN ('calendar_event', 'task')),
       container_id TEXT NOT NULL,
       container_name TEXT NOT NULL,
@@ -287,6 +434,8 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       due_on TEXT,
       completed_at TEXT,
       source_updated_at TEXT,
+      source_version TEXT,
+      completion_writable INTEGER NOT NULL DEFAULT 0 CHECK(completion_writable IN (0, 1)),
       source_url TEXT,
       source_time_zone TEXT,
       imported_at TEXT NOT NULL,
@@ -375,7 +524,52 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       PRIMARY KEY(delivery_key, endpoint)
     );
     CREATE INDEX IF NOT EXISTS push_subscription_deliveries_endpoint
-      ON push_subscription_deliveries(endpoint);`);
+      ON push_subscription_deliveries(endpoint);
+    CREATE TABLE IF NOT EXISTS task_action_requests (
+      id TEXT PRIMARY KEY,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      task_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK(provider = 'google'),
+      connection_id TEXT NOT NULL,
+      container_id TEXT NOT NULL,
+      external_id TEXT NOT NULL,
+      desired_state TEXT NOT NULL CHECK(desired_state IN ('open', 'completed')),
+      expected_version TEXT,
+      workspace_revision INTEGER NOT NULL,
+      before_json TEXT NOT NULL CHECK(json_valid(before_json)),
+      after_json TEXT NOT NULL CHECK(json_valid(after_json)),
+      status TEXT NOT NULL CHECK(status IN ('awaiting_approval', 'running', 'succeeded', 'failed', 'conflict')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      approved_at TEXT,
+      finished_at TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      result_json TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS task_action_requests_task ON task_action_requests(task_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS task_adoption_requests (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL CHECK(source IN ('google', 'microsoft', 'hermes')),
+      external_id TEXT NOT NULL,
+      container_id TEXT NOT NULL,
+      workspace_revision INTEGER NOT NULL,
+      before_json TEXT NOT NULL CHECK(json_valid(before_json)),
+      task_json TEXT NOT NULL CHECK(json_valid(task_json)),
+      status TEXT NOT NULL CHECK(status IN ('awaiting_approval', 'approved', 'expired')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      approved_at TEXT,
+      adopted_task_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS task_adoption_requests_source ON task_adoption_requests(source, container_id, external_id);
+    CREATE TABLE IF NOT EXISTS agent_proposals (
+      idempotency_key TEXT PRIMARY KEY,
+      request_hash TEXT NOT NULL,
+      inbox_item_id TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );`);
   // A short-lived development build used the initial provider table without
   // date-only all-day columns. Keep that private SQLite shape upgrade-safe.
   const recordColumns = new Set((db.prepare('PRAGMA table_info(provider_records)').all() as Record<string, unknown>[])
@@ -395,6 +589,30 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       throw error;
     }
   }
+  if (!recordColumns.has('source_version')) db.exec('ALTER TABLE provider_records ADD COLUMN source_version TEXT');
+  if (!recordColumns.has('connection_id')) db.exec('ALTER TABLE provider_records ADD COLUMN connection_id TEXT');
+  if (!recordColumns.has('completion_writable')) db.exec('ALTER TABLE provider_records ADD COLUMN completion_writable INTEGER NOT NULL DEFAULT 0');
+  const connectionColumns = new Set((db.prepare('PRAGMA table_info(provider_connections)').all() as Record<string, unknown>[])
+    .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
+  if (!connectionColumns.has('connection_id')) db.exec('ALTER TABLE provider_connections ADD COLUMN connection_id TEXT');
+  const connectionsWithoutGeneration = db.prepare('SELECT provider FROM provider_connections WHERE connection_id IS NULL OR connection_id = ?')
+    .all('') as Record<string, unknown>[];
+  for (const row of connectionsWithoutGeneration) {
+    if (isProvider(row.provider)) db.prepare('UPDATE provider_connections SET connection_id=? WHERE provider=?').run(randomUUID(), row.provider);
+  }
+  const actionColumns = new Set((db.prepare('PRAGMA table_info(task_action_requests)').all() as Record<string, unknown>[])
+    .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
+  if (!actionColumns.has('connection_id')) db.exec("ALTER TABLE task_action_requests ADD COLUMN connection_id TEXT NOT NULL DEFAULT 'legacy'");
+  if (!actionColumns.has('workspace_revision')) db.exec('ALTER TABLE task_action_requests ADD COLUMN workspace_revision INTEGER NOT NULL DEFAULT 0');
+  if (!actionColumns.has('lease_expires_at')) db.exec('ALTER TABLE task_action_requests ADD COLUMN lease_expires_at TEXT');
+  const adoptionColumns = new Set((db.prepare('PRAGMA table_info(task_adoption_requests)').all() as Record<string, unknown>[])
+    .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
+  if (!adoptionColumns.has('workspace_revision')) db.exec('ALTER TABLE task_adoption_requests ADD COLUMN workspace_revision INTEGER NOT NULL DEFAULT 0');
+  if (!adoptionColumns.has('adopted_task_id')) db.exec('ALTER TABLE task_adoption_requests ADD COLUMN adopted_task_id TEXT');
+  const proposalColumns = new Set((db.prepare('PRAGMA table_info(agent_proposals)').all() as Record<string, unknown>[])
+    .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
+  if (!proposalColumns.has('request_hash')) db.exec("ALTER TABLE agent_proposals ADD COLUMN request_hash TEXT NOT NULL DEFAULT 'legacy'");
+  db.exec('PRAGMA user_version=7;');
   db.prepare('INSERT OR IGNORE INTO workspace VALUES (1, 0, ?, ?)')
     .run(JSON.stringify(initialData), new Date().toISOString());
 
@@ -430,13 +648,14 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   function saveConnection(connection: StoredConnection): void {
     const now = new Date().toISOString();
     db.prepare(`INSERT INTO provider_connections (
-      provider, state, scopes, token_envelope, connected_at, updated_at, last_synced_at, last_error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      provider, connection_id, state, scopes, token_envelope, connected_at, updated_at, last_synced_at, last_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(provider) DO UPDATE SET
-      state=excluded.state, scopes=excluded.scopes, token_envelope=excluded.token_envelope,
+      connection_id=excluded.connection_id, state=excluded.state, scopes=excluded.scopes, token_envelope=excluded.token_envelope,
       updated_at=excluded.updated_at, last_synced_at=excluded.last_synced_at, last_error=excluded.last_error`)
       .run(
         connection.provider,
+        connection.connectionId,
         connection.state,
         JSON.stringify([...new Set(connection.scopes)].sort()),
         connection.tokenEnvelope,
@@ -521,26 +740,28 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     const marker = randomUUID();
     const now = new Date().toISOString();
     const upsert = db.prepare(`INSERT INTO provider_records (
-      provider, kind, container_id, container_name, external_id, title, status,
-      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at,
-      source_url, source_time_zone, imported_at, sync_marker, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      provider, connection_id, kind, container_id, container_name, external_id, title, status,
+      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
+      completion_writable, source_url, source_time_zone, imported_at, sync_marker, deleted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(provider, kind, container_id, external_id) DO UPDATE SET
-      container_name=excluded.container_name, title=excluded.title, status=excluded.status,
+      connection_id=excluded.connection_id, container_name=excluded.container_name, title=excluded.title, status=excluded.status,
       starts_at=excluded.starts_at, ends_at=excluded.ends_at,
       starts_on=excluded.starts_on, ends_on=excluded.ends_on, all_day=excluded.all_day,
       due_on=excluded.due_on, completed_at=excluded.completed_at,
-      source_updated_at=excluded.source_updated_at, source_url=excluded.source_url,
+      source_updated_at=excluded.source_updated_at, source_version=excluded.source_version,
+      completion_writable=excluded.completion_writable, source_url=excluded.source_url,
       source_time_zone=excluded.source_time_zone, imported_at=excluded.imported_at,
       sync_marker=excluded.sync_marker, deleted_at=NULL`);
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const record of records) {
         upsert.run(
-          record.provider, record.kind, record.containerId, record.containerName,
+          record.provider, record.connectionId ?? null, record.kind, record.containerId, record.containerName,
           record.externalId, record.title, record.status, record.startsAt, record.endsAt,
           record.startsOn, record.endsOn, record.allDay ? 1 : 0, record.dueOn,
-          record.completedAt, record.sourceUpdatedAt,
+          record.completedAt, record.sourceUpdatedAt, record.sourceVersion ?? null,
+          (record.completionWritable ?? (record.provider === 'google' && record.kind === 'task')) ? 1 : 0,
           record.sourceUrl, record.sourceTimeZone, now, marker,
         );
       }
@@ -580,18 +801,17 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     }
   }
 
-  function listProviderRecords(limit = 1000): StoredRecord[] {
-    const safeLimit = Math.max(1, Math.min(limit, 1000));
-    const query = db.prepare(`SELECT id, provider, kind, container_id, container_name, external_id, title, status,
-      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_url,
-      source_time_zone, imported_at
+  function listProviderRecords(limit = 1000, kind?: ProviderRecordKind): StoredRecord[] {
+    const safeLimit = Math.max(1, Math.min(limit, 5_000));
+    const query = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
+      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
+      completion_writable, source_url, source_time_zone, imported_at
       FROM provider_records WHERE deleted_at IS NULL AND kind=?
       ORDER BY COALESCE(starts_at, due_on, source_updated_at, imported_at), title COLLATE NOCASE
       LIMIT ?`);
-    const rows = [
-      ...query.all('calendar_event', safeLimit),
-      ...query.all('task', safeLimit),
-    ] as Record<string, unknown>[];
+    const rows = (kind
+      ? query.all(kind, safeLimit)
+      : [...query.all('calendar_event', safeLimit), ...query.all('task', safeLimit)]) as Record<string, unknown>[];
     return rows.flatMap(row => {
       const record = rowToRecord(row);
       return record ? [record] : [];
@@ -915,6 +1135,351 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     }
   }
 
+  function getProviderRecord(id: number): StoredRecord | null {
+    const row = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
+      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
+      completion_writable,
+      source_url, source_time_zone, imported_at
+      FROM provider_records WHERE id=? AND deleted_at IS NULL`).get(id) as Record<string, unknown> | undefined;
+    return row ? rowToRecord(row) : null;
+  }
+
+  function findProviderRecord(
+    provider: Provider,
+    kind: ProviderRecordKind,
+    connectionId: string,
+    containerId: string,
+    externalId: string,
+  ): StoredRecord | null {
+    const row = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
+      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
+      completion_writable, source_url, source_time_zone, imported_at
+      FROM provider_records WHERE deleted_at IS NULL AND provider=? AND kind=? AND connection_id=? AND container_id=? AND external_id=?`)
+      .get(provider, kind, connectionId, containerId, externalId) as Record<string, unknown> | undefined;
+    return row ? rowToRecord(row) : null;
+  }
+
+  function countProviderRecords(provider: Provider, kind: ProviderRecordKind): number {
+    const row = db.prepare('SELECT COUNT(*) AS total FROM provider_records WHERE deleted_at IS NULL AND provider=? AND kind=?')
+      .get(provider, kind) as Record<string, unknown> | undefined;
+    return typeof row?.total === 'number' ? row.total : 0;
+  }
+
+  function createTaskAction(request: Omit<TaskActionRequest, 'status' | 'approvedAt' | 'finishedAt' | 'attemptCount' | 'leaseExpiresAt' | 'result' | 'lastError'>): TaskActionRequest {
+    const existingRow = db.prepare('SELECT * FROM task_action_requests WHERE idempotency_key=?')
+      .get(request.idempotencyKey) as Record<string, unknown> | undefined;
+    const existing = rowToTaskAction(existingRow);
+    if (existing) return existing;
+    db.prepare(`INSERT INTO task_action_requests (
+      id, idempotency_key, task_id, provider, connection_id, container_id, external_id, desired_state,
+      expected_version, workspace_revision, before_json, after_json, status, created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?)`).run(
+      request.id,
+      request.idempotencyKey,
+      request.taskId,
+      request.provider,
+      request.connectionId,
+      request.containerId,
+      request.externalId,
+      request.desiredState,
+      request.expectedVersion,
+      request.workspaceRevision,
+      JSON.stringify(request.before),
+      JSON.stringify(request.after),
+      request.createdAt,
+      request.expiresAt,
+    );
+    const created = getTaskAction(request.id);
+    if (!created) throw new Error('Task action request was not stored');
+    return created;
+  }
+
+  function getTaskAction(id: string): TaskActionRequest | null {
+    return rowToTaskAction(db.prepare('SELECT * FROM task_action_requests WHERE id=?').get(id) as Record<string, unknown> | undefined);
+  }
+
+  function listTaskActions(taskId?: string, limit = 100): TaskActionRequest[] {
+    const safeLimit = Math.max(1, Math.min(limit, 500));
+    const rows = taskId
+      ? db.prepare('SELECT * FROM task_action_requests WHERE task_id=? ORDER BY created_at DESC LIMIT ?').all(taskId, safeLimit)
+      : db.prepare('SELECT * FROM task_action_requests ORDER BY created_at DESC LIMIT ?').all(safeLimit);
+    return (rows as Record<string, unknown>[]).flatMap(row => {
+      const action = rowToTaskAction(row);
+      return action ? [action] : [];
+    });
+  }
+
+  function hasRunningTaskAction(taskId: string, now: string, excludedId?: string): boolean {
+    const row = excludedId
+      ? db.prepare(`SELECT 1 AS active FROM task_action_requests
+          WHERE task_id=? AND id<>? AND status='running' AND (lease_expires_at IS NULL OR lease_expires_at>?) LIMIT 1`)
+        .get(taskId, excludedId, now) as Record<string, unknown> | undefined
+      : db.prepare(`SELECT 1 AS active FROM task_action_requests
+          WHERE task_id=? AND status='running' AND (lease_expires_at IS NULL OR lease_expires_at>?) LIMIT 1`)
+        .get(taskId, now) as Record<string, unknown> | undefined;
+    return row?.active === 1;
+  }
+
+  function beginTaskAction(id: string, now: string, retry = false): {
+    outcome: 'started' | 'conflict';
+    action: TaskActionRequest;
+    snapshot: Snapshot;
+  } | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = getTaskAction(id);
+      const staleRunning = current?.status === 'running' && current.leaseExpiresAt !== null && current.leaseExpiresAt <= now;
+      const allowed = current?.status === 'awaiting_approval' || (retry && (current?.status === 'failed' || staleRunning));
+      if (!current || !allowed) {
+        db.exec('ROLLBACK');
+        return null;
+      }
+      const snapshot = read();
+      const rejectPreview = (reason: string) => {
+        db.prepare(`UPDATE task_action_requests SET status='conflict', finished_at=?, lease_expires_at=NULL,
+          result_json=?, last_error=? WHERE id=?`).run(now, JSON.stringify({ retryable: false }), reason, id);
+        db.exec('COMMIT');
+        const action = getTaskAction(id);
+        if (!action) throw new Error('Task action disappeared');
+        return { outcome: 'conflict' as const, action, snapshot: read() };
+      };
+      if (current.status === 'awaiting_approval' && current.expiresAt <= now) {
+        return rejectPreview('The approval preview expired. Create and review a new preview.');
+      }
+      if (current.status === 'awaiting_approval' && snapshot.revision !== current.workspaceRevision) {
+        return rejectPreview('The Fox Focus task changed after this preview. Create and review a new preview.');
+      }
+      if (hasRunningTaskAction(current.taskId, now, current.id)) {
+        return rejectPreview('Another approved update for this task is still running. Wait for it to finish, then review the current state.');
+      }
+      const task = snapshot.data.tasks.find(candidate => candidate.id === current.taskId);
+      const link = task?.externalLinks?.find(candidate =>
+        candidate.provider === 'google_tasks' && candidate.policy === 'completion_only' &&
+        candidate.connectionId === current.connectionId && candidate.containerId === current.containerId &&
+        candidate.externalId === current.externalId);
+      const providerRecord = db.prepare(`SELECT id, source_version FROM provider_records
+        WHERE provider='google' AND kind='task' AND deleted_at IS NULL AND connection_id=? AND container_id=?
+          AND external_id=? AND completion_writable=1`).get(
+        current.connectionId, current.containerId, current.externalId,
+      ) as Record<string, unknown> | undefined;
+      const changedSincePreview = current.status === 'awaiting_approval' &&
+        providerRecord?.source_version !== current.expectedVersion;
+      if (!task || !link || !providerRecord || changedSincePreview) {
+        return rejectPreview(changedSincePreview
+          ? 'The imported Google task changed after this preview. Refresh and review a new preview.'
+          : 'The exact linked Google task is no longer available. Refresh and review the link.');
+      }
+      const completed = current.desiredState === 'completed';
+      const nextTask: Task = {
+        ...task,
+        completed,
+        state: completed ? 'done' : task.scheduledTime ? 'scheduled' : 'up-next',
+        ...(completed ? { completedAt: task.completedAt ?? now } : { completedAt: undefined }),
+      };
+      const data = {
+        ...snapshot.data,
+        tasks: snapshot.data.tasks.map(candidate => candidate.id === task.id ? nextTask : candidate),
+        reminders: completed
+          ? snapshot.data.reminders.filter(reminder => !(reminder.targetType === 'task' && reminder.targetId === task.id))
+          : snapshot.data.reminders,
+      };
+      if (!isPrototypeData(data)) throw new Error('Task action produced an invalid workspace');
+      if (task.completed !== completed || data.reminders.length !== snapshot.data.reminders.length) {
+        db.prepare('UPDATE workspace SET revision=revision+1, data=?, updated_at=? WHERE id=1')
+          .run(JSON.stringify(data), now);
+      }
+      const leaseExpiresAt = new Date(Date.parse(now) + TASK_ACTION_LEASE_MS).toISOString();
+      db.prepare(`UPDATE task_action_requests SET status='running', approved_at=COALESCE(approved_at, ?),
+        finished_at=NULL, attempt_count=attempt_count+1, lease_expires_at=?, result_json=NULL, last_error=NULL WHERE id=?`)
+        .run(now, leaseExpiresAt, id);
+      db.exec('COMMIT');
+      const action = getTaskAction(id);
+      if (!action) throw new Error('Task action disappeared');
+      return { outcome: 'started', action, snapshot: read() };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function finishTaskAction(
+    id: string,
+    status: Extract<TaskActionStatus, 'succeeded' | 'failed' | 'conflict'>,
+    result: Record<string, unknown> | null,
+    lastError: string | null,
+    now: string,
+  ): TaskActionRequest | null {
+    db.prepare(`UPDATE task_action_requests SET status=?, finished_at=?, lease_expires_at=NULL, result_json=?, last_error=?
+      WHERE id=? AND status='running'`).run(status, now, result ? JSON.stringify(result) : null, lastError, id);
+    return getTaskAction(id);
+  }
+
+  function updateTaskExternalState(input: {
+    taskId: string;
+    connectionId: string;
+    containerId: string;
+    externalId: string;
+    sourceStatus: string;
+    sourceVersion: string | null;
+    sourceUpdatedAt: string | null;
+    completedAt: string | null;
+    now: string;
+  }): Snapshot | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const snapshot = read();
+      const task = snapshot.data.tasks.find(candidate => candidate.id === input.taskId);
+      if (!task) {
+        db.exec('ROLLBACK');
+        return null;
+      }
+      const links = task.externalLinks?.map(link => link.provider === 'google_tasks' &&
+        link.connectionId === input.connectionId && link.containerId === input.containerId && link.externalId === input.externalId
+        ? {
+            ...link,
+            sourceStatus: input.sourceStatus,
+            ...(input.sourceVersion ? { sourceVersion: input.sourceVersion } : { sourceVersion: undefined }),
+            ...(input.sourceUpdatedAt ? { sourceUpdatedAt: input.sourceUpdatedAt } : { sourceUpdatedAt: undefined }),
+          }
+        : link);
+      const data = {
+        ...snapshot.data,
+        tasks: snapshot.data.tasks.map(candidate => candidate.id === task.id ? { ...task, externalLinks: links } : candidate),
+      };
+      if (!isPrototypeData(data)) throw new Error('Provider result produced an invalid workspace');
+      db.prepare('UPDATE workspace SET revision=revision+1, data=?, updated_at=? WHERE id=1')
+        .run(JSON.stringify(data), input.now);
+      db.prepare(`UPDATE provider_records SET status=?, completed_at=?, source_updated_at=?, source_version=?, imported_at=?
+        WHERE provider='google' AND kind='task' AND connection_id=? AND container_id=? AND external_id=?`).run(
+        input.sourceStatus,
+        input.completedAt,
+        input.sourceUpdatedAt,
+        input.sourceVersion,
+        input.now,
+        input.connectionId,
+        input.containerId,
+        input.externalId,
+      );
+      db.exec('COMMIT');
+      return read();
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function createTaskAdoption(request: Omit<TaskAdoptionRequest, 'status' | 'approvedAt' | 'adoptedTaskId'>): TaskAdoptionRequest {
+    db.prepare(`INSERT INTO task_adoption_requests (
+      id, source, external_id, container_id, workspace_revision, before_json, task_json, status, created_at, expires_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?)`).run(
+      request.id,
+      request.source,
+      request.externalId,
+      request.containerId,
+      request.workspaceRevision,
+      JSON.stringify(request.before),
+      JSON.stringify(request.task),
+      request.createdAt,
+      request.expiresAt,
+    );
+    const created = getTaskAdoption(request.id);
+    if (!created) throw new Error('Task adoption request was not stored');
+    return created;
+  }
+
+  function getTaskAdoption(id: string): TaskAdoptionRequest | null {
+    return rowToTaskAdoption(db.prepare('SELECT * FROM task_adoption_requests WHERE id=?').get(id) as Record<string, unknown> | undefined);
+  }
+
+  function approveTaskAdoption(id: string, now: string): { request: TaskAdoptionRequest; snapshot: Snapshot; adoptedTaskId: string } | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const request = getTaskAdoption(id);
+      if (!request || request.status === 'expired' || (request.status === 'awaiting_approval' && request.expiresAt <= now)) {
+        if (request?.status === 'awaiting_approval') {
+          db.prepare("UPDATE task_adoption_requests SET status='expired' WHERE id=?").run(id);
+          db.exec('COMMIT');
+        } else {
+          db.exec('ROLLBACK');
+        }
+        return null;
+      }
+      const snapshot = read();
+      if (request.status === 'awaiting_approval' && snapshot.revision !== request.workspaceRevision) {
+        db.exec('ROLLBACK');
+        return null;
+      }
+      const requestedProvider = request.source === 'google'
+        ? 'google_tasks'
+        : request.source === 'microsoft'
+          ? 'microsoft_todo'
+          : 'hermes';
+      const sourceLink = request.task.externalLinks?.find(link =>
+        link.provider === requestedProvider && link.containerId === request.containerId && link.externalId === request.externalId);
+      const existing = sourceLink ? snapshot.data.tasks.find(task => task.externalLinks?.some(link =>
+        link.provider === sourceLink.provider && link.connectionId === sourceLink.connectionId &&
+        link.containerId === sourceLink.containerId && link.externalId === sourceLink.externalId)) : undefined;
+      const target = snapshot.data.tasks.find(task => task.id === request.task.id);
+      if (!existing && request.status === 'awaiting_approval') {
+        const tasks = target
+          ? snapshot.data.tasks.map(task => task.id === target.id ? request.task : task)
+          : [request.task, ...snapshot.data.tasks];
+        const data = { ...snapshot.data, tasks };
+        if (!isPrototypeData(data)) throw new Error('Task adoption produced an invalid workspace');
+        db.prepare('UPDATE workspace SET revision=revision+1, data=?, updated_at=? WHERE id=1')
+          .run(JSON.stringify(data), now);
+      }
+      const adoptedTaskId = request.adoptedTaskId ?? existing?.id ?? request.task.id;
+      db.prepare("UPDATE task_adoption_requests SET status='approved', approved_at=COALESCE(approved_at, ?), adopted_task_id=COALESCE(adopted_task_id, ?) WHERE id=?")
+        .run(now, adoptedTaskId, id);
+      db.exec('COMMIT');
+      const approved = getTaskAdoption(id);
+      if (!approved) throw new Error('Task adoption disappeared');
+      return { request: approved, snapshot: read(), adoptedTaskId };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function findAdoptedTaskId(source: TaskAdoptionSource, connectionId: string | null, containerId: string, externalId: string): string | null {
+    const row = db.prepare(`SELECT adopted_task_id FROM task_adoption_requests
+      WHERE source=? AND container_id=? AND external_id=? AND status='approved' AND adopted_task_id IS NOT NULL
+        AND COALESCE(json_extract(before_json, '$.connectionId'), '')=?
+      ORDER BY approved_at DESC LIMIT 1`).get(source, containerId, externalId, connectionId ?? '') as Record<string, unknown> | undefined;
+    return stringOrNull(row?.adopted_task_id);
+  }
+
+  function addAgentProposal(idempotencyKey: string, requestHash: string, item: InboxItem, now: string): { created: boolean; conflict: boolean; snapshot: Snapshot; inboxItemId: string } {
+    if (!isInboxItem(item)) throw new Error('Invalid agent proposal');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = db.prepare('SELECT inbox_item_id, request_hash FROM agent_proposals WHERE idempotency_key=?')
+        .get(idempotencyKey) as Record<string, unknown> | undefined;
+      if (typeof existing?.inbox_item_id === 'string') {
+        db.exec('COMMIT');
+        return {
+          created: false,
+          conflict: existing.request_hash !== requestHash,
+          snapshot: read(),
+          inboxItemId: existing.inbox_item_id,
+        };
+      }
+      const snapshot = read();
+      const data = { ...snapshot.data, inboxItems: [item, ...snapshot.data.inboxItems] };
+      if (!isPrototypeData(data)) throw new Error('Agent proposal produced an invalid workspace');
+      db.prepare('UPDATE workspace SET revision=revision+1, data=?, updated_at=? WHERE id=1')
+        .run(JSON.stringify(data), now);
+      db.prepare('INSERT INTO agent_proposals (idempotency_key, request_hash, inbox_item_id, created_at) VALUES (?, ?, ?, ?)')
+        .run(idempotencyKey, requestHash, item.id, now);
+      db.exec('COMMIT');
+      return { created: true, conflict: false, snapshot: read(), inboxItemId: item.id };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
   return {
     read,
     save,
@@ -944,6 +1509,21 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     listPushDeliveries,
     markPushDelivered,
     prunePushDeliveries,
+    getProviderRecord,
+    findProviderRecord,
+    countProviderRecords,
+    createTaskAction,
+    getTaskAction,
+    listTaskActions,
+    hasRunningTaskAction,
+    beginTaskAction,
+    finishTaskAction,
+    updateTaskExternalState,
+    createTaskAdoption,
+    getTaskAdoption,
+    approveTaskAdoption,
+    findAdoptedTaskId,
+    addAgentProposal,
     close: () => db.close(),
   };
 }

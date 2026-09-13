@@ -1,9 +1,13 @@
 /**
- * Read-only provider adapters.
+ * Narrow provider adapters.
  *
- * The callers own OAuth, token persistence, scheduling, and database writes.
- * This module deliberately accepts an injected fetch implementation so it never
- * discovers, reads, logs, or persists credentials itself.
+ * The callers own OAuth, token persistence, scheduling, database writes, and
+ * approval. Reads are intentionally field-limited. The sole write operation is
+ * an exact Google Task status transition followed by a readback; this module
+ * exposes no create, delete, clear, or broad update primitive.
+ *
+ * An injected fetch implementation keeps the adapter deterministic and means
+ * it never discovers, reads, logs, or persists credentials itself.
  */
 
 const GOOGLE_CALENDAR_API = "https://www.googleapis.com/calendar/v3";
@@ -21,6 +25,7 @@ export type ProviderOperation =
   | "google.calendar-changes"
   | "google.task-lists"
   | "google.tasks"
+  | "google.task-status-update"
   | "microsoft.calendar-list"
   | "microsoft.calendar-view"
   | "microsoft.todo-lists"
@@ -66,6 +71,33 @@ export interface ProviderReadSuccess<T> {
 }
 
 export type ProviderReadResult<T> = ProviderReadSuccess<T> | ProviderReadFailure;
+
+export type ProviderWriteFailureStatus =
+  | ProviderReadFailureStatus
+  | "conflict"
+  | "verification-failed";
+
+export type ProviderWritePhase = "preflight" | "update" | "readback";
+
+export interface ProviderWriteFailure {
+  readonly status: ProviderWriteFailureStatus;
+  readonly provider: Provider;
+  readonly operation: ProviderOperation;
+  readonly phase: ProviderWritePhase;
+  /** Present only when the provider returned an HTTP response. */
+  readonly httpStatus?: number;
+  /** A safe, parsed Retry-After value when the provider supplied one. */
+  readonly retryAfterSeconds?: number;
+}
+
+export interface ProviderWriteSuccess<T> {
+  readonly status: "ok";
+  readonly provider: Provider;
+  readonly operation: ProviderOperation;
+  readonly value: T;
+}
+
+export type ProviderWriteResult<T> = ProviderWriteSuccess<T> | ProviderWriteFailure;
 
 /** A source time intentionally distinguishes a date-only value from an instant. */
 export type ImportedTime =
@@ -125,8 +157,12 @@ export interface ImportedTask {
   /** Only populated when the source provides an unambiguous UTC instant. */
   readonly completedAt: string | null;
   readonly updatedAt: string | null;
+  /** Provider concurrency token. Google supplies the task ETag. */
+  readonly version: string | null;
   /** Google supplies task tombstones; Microsoft polling does not. */
   readonly isDeleted: boolean;
+  /** False for provider-owned assignments that this app must not mutate. */
+  readonly completionWritable?: boolean;
 }
 
 export interface GoogleCalendarEventsInput {
@@ -147,6 +183,23 @@ export interface GoogleCalendarSnapshotInput {
 
 export interface GoogleTaskListTasksInput {
   readonly taskListId: string;
+}
+
+export interface GoogleTaskStatusUpdateInput {
+  readonly taskListId: string;
+  readonly taskId: string;
+  readonly state: "open" | "completed";
+  /** The task ETag captured during import. Sent as If-Match when present. */
+  readonly expectedEtag?: string;
+}
+
+export interface GoogleTaskStatusUpdate {
+  readonly taskListId: string;
+  readonly taskId: string;
+  readonly requestedState: "open" | "completed";
+  readonly etag: string;
+  /** Exact task returned by a GET after the PATCH completed. */
+  readonly task: ImportedTask;
 }
 
 export interface MicrosoftCalendarViewInput {
@@ -199,6 +252,24 @@ function success<T>(
   value: T,
 ): ProviderReadSuccess<T> {
   return { status: "ok", provider, operation, pageCount, value };
+}
+
+function writeFailure(
+  status: ProviderWriteFailureStatus,
+  provider: Provider,
+  operation: ProviderOperation,
+  phase: ProviderWritePhase,
+  extras: Pick<ProviderWriteFailure, "httpStatus" | "retryAfterSeconds"> = {},
+): ProviderWriteFailure {
+  return { status, provider, operation, phase, ...extras };
+}
+
+function writeSuccess<T>(
+  provider: Provider,
+  operation: ProviderOperation,
+  value: T,
+): ProviderWriteSuccess<T> {
+  return { status: "ok", provider, operation, value };
 }
 
 function isNonEmptyText(value: unknown): value is string {
@@ -254,6 +325,13 @@ function optionalText(value: unknown): string | null | Invalid {
   return typeof value === "string" ? value : INVALID;
 }
 
+function optionalVersion(value: unknown): string | null | Invalid {
+  if (value === undefined || value === null) return null;
+  return isNonEmptyText(value) && value.length <= 1_024 && !/[\r\n]/.test(value)
+    ? value
+    : INVALID;
+}
+
 function optionalBoolean(value: unknown, fallback: boolean): boolean | Invalid {
   if (value === undefined || value === null) return fallback;
   return typeof value === "boolean" ? value : INVALID;
@@ -286,6 +364,36 @@ function httpFailure(
   if (response.status === 410) return failure("resync-required", provider, operation, extras);
   if (response.status === 429) return failure("rate-limited", provider, operation, extras);
   return failure("remote-error", provider, operation, extras);
+}
+
+function writeHttpFailure(
+  provider: Provider,
+  operation: ProviderOperation,
+  phase: ProviderWritePhase,
+  response: Response,
+): ProviderWriteFailure {
+  const retryAfterSeconds = parseRetryAfter(response.headers.get("retry-after"));
+  const extras = {
+    httpStatus: response.status,
+    ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+  };
+  if (response.status === 409 || response.status === 412) {
+    return writeFailure("conflict", provider, operation, phase, extras);
+  }
+  const readFailure = httpFailure(provider, operation, response);
+  return writeFailure(readFailure.status, provider, operation, phase, extras);
+}
+
+function asWriteFailure(
+  readFailure: ProviderReadFailure,
+  phase: ProviderWritePhase,
+): ProviderWriteFailure {
+  return writeFailure(readFailure.status, readFailure.provider, readFailure.operation, phase, {
+    ...(readFailure.httpStatus === undefined ? {} : { httpStatus: readFailure.httpStatus }),
+    ...(readFailure.retryAfterSeconds === undefined
+      ? {}
+      : { retryAfterSeconds: readFailure.retryAfterSeconds }),
+  });
 }
 
 function validateClient(
@@ -496,11 +604,15 @@ function parseGoogleTask(taskListId: string, value: unknown): ImportedTask | nul
   const due = optionalText(value.due);
   const completedAt = optionalInstant(value.completed);
   const updatedAt = optionalInstant(value.updated);
+  const version = optionalVersion(value.etag);
+  const isAssigned = value.assignmentInfo !== undefined && value.assignmentInfo !== null;
   if (
     title === INVALID
     || due === INVALID
     || completedAt === INVALID
     || updatedAt === INVALID
+    || version === INVALID
+    || (isAssigned && !isRecord(value.assignmentInfo))
   ) return null;
   const dueDate = due === null ? null : dateFromProviderDue(due);
   if (due !== null && dueDate === null) return null;
@@ -514,11 +626,13 @@ function parseGoogleTask(taskListId: string, value: unknown): ImportedTask | nul
     dueDate,
     completedAt,
     updatedAt,
+    version,
     isDeleted,
+    ...(isAssigned ? { completionWritable: false } : {}),
   };
 }
 
-function googleHeaders(accessToken: string): HeadersInit {
+function googleHeaders(accessToken: string): Readonly<Record<string, string>> {
   return {
     Accept: "application/json",
     Authorization: `Bearer ${accessToken}`,
@@ -549,7 +663,8 @@ function googlePagedUrl(
 const googleCalendarListFields = "items(id,summary,primary),nextPageToken";
 const googleCalendarEventFields = "items(id,status,summary,start(date,dateTime,timeZone),end(date,dateTime,timeZone),updated),nextPageToken,nextSyncToken";
 const googleTaskListFields = "items(id,title),nextPageToken";
-const googleTaskFields = "items(id,title,status,due,completed,updated,deleted),nextPageToken";
+const googleTaskResourceFields = "id,title,status,due,completed,updated,deleted,etag,assignmentInfo";
+const googleTaskFields = `items(${googleTaskResourceFields}),nextPageToken`;
 
 /** Lists visible Google calendars. No calendar contents are requested here. */
 export async function listGoogleCalendars(
@@ -701,6 +816,7 @@ export async function listGoogleTasks(
   const makeBaseUrl = () => googleTasksUrl(`/lists/${encodedTaskListId}/tasks`, {
     fields: googleTaskFields,
     maxResults: "100",
+    showAssigned: "true",
     showCompleted: "true",
     showDeleted: "true",
     showHidden: "true",
@@ -720,6 +836,117 @@ export async function listGoogleTasks(
   });
   if (result.status !== "ok") return result;
   return success("google", operation, result.pageCount, { records: result.value.records });
+}
+
+/**
+ * Changes only the completion state of one already-existing Google Task.
+ *
+ * The caller must perform and persist user approval before invoking this. An
+ * imported ETag should be supplied whenever available so a changed upstream
+ * task fails safely instead of being overwritten. A successful PATCH is never
+ * trusted on its own: the exact task is fetched and verified before success is
+ * returned.
+ */
+export async function updateGoogleTaskStatus(
+  client: ProviderReadClient,
+  input: GoogleTaskStatusUpdateInput,
+): Promise<ProviderWriteResult<GoogleTaskStatusUpdate>> {
+  const operation: ProviderOperation = "google.task-status-update";
+  if (
+    !isNonEmptyText(input.taskListId)
+    || !isNonEmptyText(input.taskId)
+    || (input.state !== "open" && input.state !== "completed")
+    || (input.expectedEtag !== undefined && optionalVersion(input.expectedEtag) === INVALID)
+  ) return writeFailure("invalid-request", "google", operation, "update");
+
+  const clientError = validateClient(client, "google", operation);
+  if (clientError) return asWriteFailure(clientError, "update");
+
+  const encodedTaskListId = encodeURIComponent(input.taskListId);
+  const encodedTaskId = encodeURIComponent(input.taskId);
+  const resourcePath = `/lists/${encodedTaskListId}/tasks/${encodedTaskId}`;
+  const requestedSourceState = input.state === "completed" ? "completed" : "needsAction";
+  const readUrl = googleTasksUrl(resourcePath, { fields: googleTaskResourceFields });
+  const preflight = await fetchJson(client, "google", operation, readUrl, googleHeaders(client.accessToken));
+  if ("error" in preflight) return asWriteFailure(preflight.error, "preflight");
+  const currentTask = parseGoogleTask(input.taskListId, preflight.payload);
+  if (currentTask === null || currentTask.externalId !== input.taskId) {
+    return writeFailure("invalid-response", "google", operation, "preflight");
+  }
+  if (currentTask.isDeleted || currentTask.version === null) {
+    return writeFailure("verification-failed", "google", operation, "preflight");
+  }
+  if (currentTask.completionWritable === false) {
+    return writeFailure("verification-failed", "google", operation, "preflight");
+  }
+  if (currentTask.state === input.state && (input.state === "completed" || currentTask.completedAt === null)) {
+    return writeSuccess("google", operation, {
+      taskListId: input.taskListId,
+      taskId: input.taskId,
+      requestedState: input.state,
+      etag: currentTask.version,
+      task: currentTask,
+    });
+  }
+  if (input.expectedEtag !== undefined && currentTask.version !== input.expectedEtag) {
+    return writeFailure("conflict", "google", operation, "preflight", { httpStatus: 412 });
+  }
+
+  const patchUrl = googleTasksUrl(resourcePath, { fields: "id,status,etag" });
+
+  let patchResponse: Response;
+  try {
+    patchResponse = await client.fetch(patchUrl, {
+      method: "PATCH",
+      headers: {
+        ...googleHeaders(client.accessToken),
+        "Content-Type": "application/json",
+        "If-Match": currentTask.version,
+      },
+      body: JSON.stringify({ status: requestedSourceState }),
+      signal: client.signal,
+    });
+  } catch {
+    return writeFailure("network-error", "google", operation, "update");
+  }
+
+  if (!patchResponse.ok) return writeHttpFailure("google", operation, "update", patchResponse);
+  if (patchResponse.body !== null) {
+    try {
+      await patchResponse.body.cancel();
+    } catch {
+      // The status write has already succeeded. Verification below is the
+      // authoritative result even if the unused response body cannot close.
+    }
+  }
+
+  const readback = await fetchJson(
+    client,
+    "google",
+    operation,
+    readUrl,
+    googleHeaders(client.accessToken),
+  );
+  if ("error" in readback) return asWriteFailure(readback.error, "readback");
+
+  const task = parseGoogleTask(input.taskListId, readback.payload);
+  if (task === null || task.externalId !== input.taskId) {
+    return writeFailure("invalid-response", "google", operation, "readback");
+  }
+  if (
+    task.isDeleted
+    || task.state !== input.state
+    || task.version === null
+    || (input.state === "open" && task.completedAt !== null)
+  ) return writeFailure("verification-failed", "google", operation, "readback");
+
+  return writeSuccess("google", operation, {
+    taskListId: input.taskListId,
+    taskId: input.taskId,
+    requestedState: input.state,
+    etag: task.version,
+    task,
+  });
 }
 
 function graphUrl(path: string, parameters: Readonly<Record<string, string>>): string {
@@ -973,6 +1200,7 @@ function parseMicrosoftTask(taskListId: string, value: unknown): ImportedTask | 
     dueDate,
     completedAt: null,
     updatedAt,
+    version: null,
     isDeleted: false,
   };
 }

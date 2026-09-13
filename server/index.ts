@@ -9,6 +9,7 @@ import { openStore } from './store.ts';
 import { createHermesActionClient, createHermesMirrorService, type HermesActionClient } from './hermes.ts';
 import webPush from 'web-push';
 import { deliverDuePushNotifications, deliveryKey, subscriptionDeliveryKey } from './push.ts';
+import { adoptedTaskIdForHermes } from './task-management.ts';
 
 const PUSH_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -29,6 +30,12 @@ const vapid: unknown = JSON.parse(readFileSync(vapidPath, 'utf8'));
 if (typeof vapid !== 'object' || vapid === null || !('publicKey' in vapid) || !('privateKey' in vapid) ||
   typeof vapid.publicKey !== 'string' || typeof vapid.privateKey !== 'string') throw new Error('Invalid VAPID key file');
 webPush.setVapidDetails('mailto:semyon.fox@gmail.com', vapid.publicKey, vapid.privateKey);
+const taskStatusTokenPath = process.env.HERMES_STATUS_TOKEN_FILE;
+let taskStatusToken: string | undefined;
+if (taskStatusTokenPath) {
+  taskStatusToken = readFileSync(taskStatusTokenPath, 'utf8').trim();
+  if (!taskStatusToken) throw new Error('Hermes task-status token file is empty');
+}
 const store = openStore(join(dataDir, 'focus.sqlite'));
 const hermesPath = process.env.HERMES_KANBAN_DB;
 const hermesActionUrl = process.env.HERMES_ACTION_API_URL;
@@ -45,7 +52,10 @@ const hermes = hermesPath
   : undefined;
 const integrationConfig = integrationConfigFromEnvironment();
 const integrations = integrationConfig ? createIntegrationService(store, integrationConfig) : undefined;
-const app = createApp(store, password, hermes, integrations, vapid.publicKey);
+const app = createApp(store, password, hermes, integrations, {
+  pushPublicKey: vapid.publicKey,
+  taskStatusToken,
+});
 // Establish a current or explicitly stale mirror before the first reminder
 // tick, so persisted rows from a previous run can never fire unchecked.
 if (hermes) await hermes.poll();
@@ -76,8 +86,15 @@ async function sendDuePushNotifications(): Promise<void> {
   pushTickRunning = true;
   try {
     const snapshot = store.read();
-    const hermesReminders = hermes ? store.listHermesReminders() : [];
-    const retainedHermesReminders = store.listHermesReminders(true);
+    const hermesBoardSlug = hermes?.feed().board?.slug;
+    const belongsToAdoptedTask = (targetId: string) => Boolean(
+      hermesBoardSlug && targetId.startsWith('hermes:') &&
+      adoptedTaskIdForHermes(snapshot, hermesBoardSlug, targetId.slice('hermes:'.length)),
+    );
+    const hermesReminders = (hermes ? store.listHermesReminders() : [])
+      .filter(reminder => !belongsToAdoptedTask(reminder.targetId));
+    const retainedHermesReminders = store.listHermesReminders(true)
+      .filter(reminder => !belongsToAdoptedTask(reminder.targetId));
     const notificationData = { ...snapshot.data, reminders: [...snapshot.data.reminders, ...hermesReminders] };
     // Keep delivery keys for the last good Hermes mirror while polling is
     // stale or disabled, but never send reminders from that unverified view.
@@ -109,7 +126,7 @@ if (hermes) {
   hermesTimer.unref();
 }
 if (integrations) {
-  // Polling keeps this private deployment read-only and avoids public webhooks.
+  // Polling keeps inbound sync private and avoids public webhooks.
   const initialSync = setTimeout(() => { void integrations.syncConnected(); }, 5_000);
   initialSync.unref();
   const syncTimer = setInterval(() => { void integrations.syncConnected(); }, 15 * 60_000);

@@ -9,6 +9,7 @@ import {
   listMicrosoftCalendarView,
   listMicrosoftCalendars,
   listMicrosoftTodoTasks,
+  updateGoogleTaskStatus,
   type ProviderFetch,
   type ProviderReadClient,
 } from "./providers.ts";
@@ -203,16 +204,24 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
     json({
       items: [{
         id: "done",
+        etag: '"task-v1"',
         title: "Renew library book",
         status: "completed",
         due: "2026-09-12T00:00:00.000Z",
         completed: "2026-09-11T08:00:00Z",
         updated: "2026-09-11T08:00:00Z",
         notes: "private task note",
+      }, {
+        id: "assigned",
+        etag: '"assigned-v1"',
+        title: "Source-managed assignment",
+        status: "needsAction",
+        updated: "2026-09-11T09:00:00Z",
+        assignmentInfo: { surfaceType: "DOCUMENT" },
       }],
       nextPageToken: "next",
     }),
-    json({ items: [{ id: "deleted", title: "Old item", deleted: true }] }),
+    json({ items: [{ id: "deleted", etag: '"deleted-v1"', title: "Old item", deleted: true }] }),
   );
 
   const result = await listGoogleTasks(client(transport.fetch), { taskListId: "list/with slash" });
@@ -230,7 +239,22 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       dueDate: "2026-09-12",
       completedAt: "2026-09-11T08:00:00.000Z",
       updatedAt: "2026-09-11T08:00:00.000Z",
+      version: '"task-v1"',
       isDeleted: false,
+    },
+    {
+      provider: "google",
+      taskListId: "list/with slash",
+      externalId: "assigned",
+      title: "Source-managed assignment",
+      state: "open",
+      sourceState: "needsAction",
+      dueDate: null,
+      completedAt: null,
+      updatedAt: "2026-09-11T09:00:00.000Z",
+      version: '"assigned-v1"',
+      isDeleted: false,
+      completionWritable: false,
     },
     {
       provider: "google",
@@ -242,18 +266,239 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       dueDate: null,
       completedAt: null,
       updatedAt: null,
+      version: '"deleted-v1"',
       isDeleted: true,
     },
   ]);
   assert.ok(!JSON.stringify(result).includes("private task note"));
   const first = new URL(transport.requests[0].url);
   assert.equal(first.pathname, "/tasks/v1/lists/list%2Fwith%20slash/tasks");
+  assert.equal(first.searchParams.get("showAssigned"), "true");
   assert.equal(first.searchParams.get("showCompleted"), "true");
   assert.equal(first.searchParams.get("showHidden"), "true");
   assert.equal(first.searchParams.get("showDeleted"), "true");
+  assert.ok(first.searchParams.get("fields")?.includes("etag"));
+  assert.ok(first.searchParams.get("fields")?.includes("assignmentInfo"));
   assert.ok(!first.searchParams.get("fields")?.includes("notes"));
   assert.equal(new URL(transport.requests[1].url).searchParams.get("pageToken"), "next");
   assertReadOnly(transport.requests);
+});
+
+test("Google task completion patches only status with an ETag and verifies an exact readback", async () => {
+  const transport = queuedFetch(
+    json({ id: "task/id", title: "Renew library book", status: "needsAction", etag: '"task-v1"', updated: "2026-09-13T08:00:00Z" }),
+    json({ id: "task/id", status: "completed", etag: '"task-v2"' }),
+    json({
+      id: "task/id",
+      etag: '"task-v2"',
+      title: "Renew library book",
+      status: "completed",
+      completed: "2026-09-13T08:15:00Z",
+      updated: "2026-09-13T08:15:00Z",
+    }),
+  );
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list/with slash",
+    taskId: "task/id",
+    state: "completed",
+    expectedEtag: '"task-v1"',
+  });
+
+  assert.deepEqual(result, {
+    status: "ok",
+    provider: "google",
+    operation: "google.task-status-update",
+    value: {
+      taskListId: "list/with slash",
+      taskId: "task/id",
+      requestedState: "completed",
+      etag: '"task-v2"',
+      task: {
+        provider: "google",
+        taskListId: "list/with slash",
+        externalId: "task/id",
+        title: "Renew library book",
+        state: "completed",
+        sourceState: "completed",
+        dueDate: null,
+        completedAt: "2026-09-13T08:15:00.000Z",
+        updatedAt: "2026-09-13T08:15:00.000Z",
+        version: '"task-v2"',
+        isDeleted: false,
+      },
+    },
+  });
+  assert.equal(transport.requests.length, 3);
+
+  const preflight = transport.requests[0];
+  assert.equal(preflight.init.method, "GET");
+  const patch = transport.requests[1];
+  const patchUrl = new URL(patch.url);
+  assert.equal(patch.init.method, "PATCH");
+  assert.equal(patchUrl.pathname, "/tasks/v1/lists/list%2Fwith%20slash/tasks/task%2Fid");
+  assert.equal(patchUrl.searchParams.get("fields"), "id,status,etag");
+  assert.equal(headers(patch).get("authorization"), "Bearer test-access-token");
+  assert.equal(headers(patch).get("content-type"), "application/json");
+  assert.equal(headers(patch).get("if-match"), '"task-v1"');
+  assert.deepEqual(JSON.parse(String(patch.init.body)), { status: "completed" });
+
+  const readback = transport.requests[2];
+  const readbackUrl = new URL(readback.url);
+  assert.equal(readback.init.method, "GET");
+  assert.equal(readbackUrl.pathname, patchUrl.pathname);
+  assert.equal(
+    readbackUrl.searchParams.get("fields"),
+    "id,title,status,due,completed,updated,deleted,etag,assignmentInfo",
+  );
+  assert.equal(headers(readback).get("if-match"), null);
+});
+
+test("Google refuses to PATCH a source-managed assigned task", async () => {
+  const transport = queuedFetch(json({
+    id: "assigned-task",
+    etag: '"assigned-v1"',
+    title: "Source-managed assignment",
+    status: "needsAction",
+    updated: "2026-09-13T08:00:00Z",
+    assignmentInfo: { surfaceType: "DOCUMENT" },
+  }));
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "assigned-list",
+    taskId: "assigned-task",
+    state: "completed",
+    expectedEtag: '"assigned-v1"',
+  });
+
+  assert.deepEqual(result, {
+    status: "verification-failed",
+    provider: "google",
+    operation: "google.task-status-update",
+    phase: "preflight",
+  });
+  assert.equal(transport.requests.length, 1);
+  assert.equal(transport.requests[0].init.method, "GET");
+});
+
+test("Google task reopen works without a known ETag and verifies completion was cleared", async () => {
+  const transport = queuedFetch(
+    json({
+      id: "task-1", etag: '"task-v2"', title: "Completed task", status: "completed",
+      completed: "2026-09-13T08:00:00Z", updated: "2026-09-13T08:00:00Z",
+    }),
+    new Response(null, { status: 204 }),
+    json({
+      id: "task-1",
+      etag: '"task-v3"',
+      title: "Reopened task",
+      status: "needsAction",
+      updated: "2026-09-13T09:00:00Z",
+    }),
+  );
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "open",
+  });
+
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.equal(result.value.task.state, "open");
+  assert.equal(result.value.task.completedAt, null);
+  assert.equal(result.value.etag, '"task-v3"');
+  assert.equal(headers(transport.requests[1]).get("if-match"), '"task-v2"');
+  assert.deepEqual(JSON.parse(String(transport.requests[1].init.body)), { status: "needsAction" });
+});
+
+test("Google task status update reports an ETag conflict before writing", async () => {
+  const transport = queuedFetch(json({
+    id: "task-1", etag: '"fresh"', title: "Changed upstream", status: "needsAction",
+    updated: "2026-09-13T09:00:00Z",
+  }));
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "completed",
+    expectedEtag: '"stale"',
+  });
+
+  assert.deepEqual(result, {
+    status: "conflict",
+    provider: "google",
+    operation: "google.task-status-update",
+    phase: "preflight",
+    httpStatus: 412,
+  });
+  assert.equal(transport.requests.length, 1);
+});
+
+test("Google task status update fails verification when readback does not match", async () => {
+  const transport = queuedFetch(
+    json({ id: "task-1", status: "needsAction", etag: '"task-v1"', title: "Before update" }),
+    json({ id: "task-1", status: "completed", etag: '"task-v2"' }),
+    json({
+      id: "task-1",
+      etag: '"task-v2"',
+      title: "Still open",
+      status: "needsAction",
+      updated: "2026-09-13T09:00:00Z",
+    }),
+  );
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "completed",
+    expectedEtag: '"task-v1"',
+  });
+
+  assert.deepEqual(result, {
+    status: "verification-failed",
+    provider: "google",
+    operation: "google.task-status-update",
+    phase: "readback",
+  });
+  assert.equal(transport.requests.length, 3);
+});
+
+test("Google task retry treats an already-applied state as verified without another PATCH", async () => {
+  const transport = queuedFetch(json({
+    id: "task-1", etag: '"task-v2"', title: "Already completed", status: "completed",
+    completed: "2026-09-13T09:00:00Z", updated: "2026-09-13T09:00:00Z",
+  }));
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "completed",
+    expectedEtag: '"task-v1"',
+  });
+
+  assert.equal(result.status, "ok");
+  assert.equal(transport.requests.length, 1);
+  assert.equal(transport.requests[0].init.method, "GET");
+});
+
+test("Google task status update rejects unsafe ETags before any request", async () => {
+  const transport = queuedFetch();
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "completed",
+    expectedEtag: '"safe"\r\nx-injected: yes',
+  });
+
+  assert.deepEqual(result, {
+    status: "invalid-request",
+    provider: "google",
+    operation: "google.task-status-update",
+    phase: "update",
+  });
+  assert.equal(transport.requests.length, 0);
 });
 
 test("Microsoft calendar view preserves Dublin all-day dates and normalizes timed events across DST", async () => {
@@ -363,6 +608,7 @@ test("Microsoft To Do requests no body fields, maps task states, and rejects unt
     dueDate: "2026-09-18",
     completedAt: null,
     updatedAt: "2026-09-11T12:00:00.000Z",
+    version: null,
     isDeleted: false,
   }]);
   assert.ok(!JSON.stringify(result).includes("private note"));
