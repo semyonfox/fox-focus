@@ -33,6 +33,21 @@ test('a fresh workspace starts empty', () => {
   } finally { store.close(); }
 });
 
+test('an existing legacy workspace password remains valid', async () => {
+  const store = openStore(':memory:');
+  const legacyPassword = 'legacy-8';
+  const legacyAuthorization = `Basic ${Buffer.from(`fox:${legacyPassword}`).toString('base64')}`;
+  try {
+    const app = createApp(store, legacyPassword);
+    assert.equal((await app.request('/api/v1/workspace', { headers: { authorization: legacyAuthorization } })).status, 200);
+    assert.throws(() => createApp(store, 'shorter'), /at least 8 characters/);
+    assert.throws(
+      () => createApp(store, legacyPassword, undefined, undefined, { taskStatusToken: 'shorter' }),
+      /Hermes task-status token must have at least 24 characters/,
+    );
+  } finally { store.close(); }
+});
+
 const password = 'test-only-password-at-least-24-characters';
 const authorization = `Basic ${Buffer.from(`fox:${password}`).toString('base64')}`;
 
