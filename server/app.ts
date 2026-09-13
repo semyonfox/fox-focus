@@ -67,7 +67,10 @@ export function createApp(
   integrations?: IntegrationService,
   options: AppOptions = {},
 ) {
-  if (password.length < 24) throw new Error('Workspace password must have at least 24 characters');
+  // Existing self-hosted workspaces accepted eight-character passwords. Keep
+  // those installations bootable; new passwords are still generated at 43
+  // characters and the operator guidance requires at least 24.
+  if (password.length < 8) throw new Error('Workspace password must have at least 8 characters');
   if (options.taskStatusToken !== undefined && options.taskStatusToken.length < 24) {
     throw new Error('Hermes task-status token must have at least 24 characters');
   }
