@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createIntegrationService, integrationConfigFromEnvironment } from './integrations.ts';
+import { openOAuthTokenSet, sealOAuthTokenSet, serializeOAuthTokenEnvelope } from './oauth.ts';
 import { openStore } from './store.ts';
 
 const masterKey = Buffer.alloc(32, 9).toString('base64url');
@@ -71,6 +72,8 @@ test('runtime configuration accepts mounted files and rejects credential environ
     assert.equal(configured?.providers.microsoft?.tokenEndpoint,
       'https://login.microsoftonline.com/consumers/oauth2/v2.0/token');
     assert.equal(configured?.tokenMasterKey, masterKey);
+    assert.ok(configured?.providers.google?.scopes.includes('https://www.googleapis.com/auth/tasks'));
+    assert.ok(!configured?.providers.google?.scopes.includes('https://www.googleapis.com/auth/tasks.readonly'));
     assert.equal(integrationConfigFromEnvironment({
       APP_BASE_URL: 'https://focus.example.test',
       GOOGLE_CLIENT_ID: 'test-client-id',
@@ -85,6 +88,190 @@ test('runtime configuration accepts mounted files and rejects credential environ
     }), /Invalid OAuth token-encryption key/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('legacy provider token envelopes are authenticated and resealed to the migrated connection generation', async () => {
+  const store = openStore(':memory:');
+  const scopes = ['https://www.googleapis.com/auth/calendar.calendarlist.readonly'];
+  const connectionId = 'migrated-generation';
+  const tokens = {
+    accessToken: 'legacy-access-token',
+    refreshToken: 'legacy-refresh-token',
+    tokenType: 'Bearer',
+    scopes,
+    expiresAt: '2026-09-14T10:00:00.000Z',
+  } as const;
+  const legacyEnvelope = serializeOAuthTokenEnvelope(
+    sealOAuthTokenSet(tokens, masterKey, { provider: 'google', connectionId: 'google' }),
+  );
+  try {
+    store.saveConnection({
+      provider: 'google',
+      connectionId,
+      state: 'connected',
+      scopes,
+      tokenEnvelope: legacyEnvelope,
+      connectedAt: '2026-09-11T10:00:00.000Z',
+      updatedAt: '2026-09-11T10:00:00.000Z',
+      lastSyncedAt: null,
+      lastError: null,
+    });
+    const authorizationHeaders: string[] = [];
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test',
+      tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-13T10:00:00.000Z'),
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        authorizationHeaders.push(new Headers(init?.headers).get('Authorization') ?? '');
+        if (url.pathname === '/calendar/v3/users/me/calendarList') return json({ items: [] });
+        if (url.pathname === '/tasks/v1/users/@me/lists') return json({ items: [] });
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes, additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    assert.deepEqual(await integrations.sync('google'), { outcome: 'synced', recordCount: 0 });
+    assert.deepEqual(authorizationHeaders, ['Bearer legacy-access-token', 'Bearer legacy-access-token']);
+    const migrated = store.getConnection('google');
+    assert.equal(migrated?.state, 'connected');
+    assert.notEqual(migrated?.tokenEnvelope, legacyEnvelope);
+    assert.deepEqual(
+      openOAuthTokenSet(migrated?.tokenEnvelope ?? '', masterKey, { provider: 'google', connectionId }),
+      tokens,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('Google task writes abort before their action lease can be recovered', async () => {
+  const store = openStore(':memory:');
+  const connectionId = 'bounded-write-generation';
+  const scopes = ['https://www.googleapis.com/auth/tasks'];
+  let requestSignal: AbortSignal | null | undefined;
+  let requests = 0;
+  try {
+    store.saveConnection({
+      provider: 'google', connectionId, state: 'connected', scopes,
+      tokenEnvelope: serializeOAuthTokenEnvelope(sealOAuthTokenSet({
+        accessToken: 'bounded-write-access', refreshToken: 'bounded-write-refresh', scopes,
+        expiresAt: '2026-09-14T10:00:00.000Z', tokenType: 'Bearer',
+      }, masterKey, { provider: 'google', connectionId })),
+      connectedAt: '2026-09-13T09:00:00.000Z', updatedAt: '2026-09-13T09:00:00.000Z',
+      lastSyncedAt: null, lastError: null,
+    });
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test', tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-13T10:00:00.000Z'), taskActionTimeoutMs: 10,
+      fetch: async (_input, init) => {
+        requests += 1;
+        requestSignal = init?.signal;
+        if (!requestSignal) throw new Error('missing task-action signal');
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => reject(new Error('test request aborted'));
+          if (requestSignal?.aborted) abort();
+          else requestSignal?.addEventListener('abort', abort, { once: true });
+        });
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes, additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    assert.deepEqual(await integrations.updateGoogleTaskCompletion({
+      connectionId, containerId: 'list-1', externalId: 'task-1', desiredState: 'completed', expectedVersion: 'etag-1',
+    }), {
+      outcome: 'failed', notice: 'The Google task was not confirmed. Your Fox Focus task was kept.', retryable: true,
+    });
+    assert.equal(requests, 1);
+    assert.equal(requestSignal?.aborted, true);
+  } finally {
+    store.close();
+  }
+});
+
+test('Google completion write uses the connected write scope and preserves the exact linked IDs and ETag', async () => {
+  const store = openStore(':memory:');
+  const writes: Array<{ method: string; path: string; body: string | null; ifMatch: string | null }> = [];
+  let upstreamCompleted = false;
+  try {
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test',
+      tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-13T10:00:00.000Z'),
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        const method = init?.method ?? 'GET';
+        if (url.origin === 'https://oauth.example.test') {
+          return json({
+            access_token: 'write-access', refresh_token: 'write-refresh', token_type: 'Bearer',
+            scope: 'https://www.googleapis.com/auth/tasks', expires_in: 3_600,
+          });
+        }
+        if (url.pathname === '/calendar/v3/users/me/calendarList') return json({ items: [] });
+        if (url.pathname === '/tasks/v1/users/@me/lists') return json({ items: [] });
+        if (url.pathname === '/tasks/v1/lists/list-1/tasks/task-1') {
+          writes.push({
+            method,
+            path: url.pathname,
+            body: typeof init?.body === 'string' ? init.body : null,
+            ifMatch: new Headers(init?.headers).get('If-Match'),
+          });
+          if (method === 'PATCH') {
+            upstreamCompleted = true;
+            return json({ id: 'ignored-by-readback' });
+          }
+          return upstreamCompleted
+            ? json({
+                id: 'task-1', title: 'Linked task', status: 'completed', etag: 'etag-2',
+                completed: '2026-09-13T10:00:00.000Z', updated: '2026-09-13T10:00:00.000Z',
+              })
+            : json({
+                id: 'task-1', title: 'Linked task', status: 'needsAction', etag: 'etag-1',
+                updated: '2026-09-13T09:00:00.000Z',
+              });
+        }
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes: ['https://www.googleapis.com/auth/tasks'], additionalAuthorizationParameters: {},
+        },
+      },
+    });
+    const state = new URL(integrations.startAuthorization('google') ?? '').searchParams.get('state');
+    assert.ok(state);
+    assert.equal((await integrations.completeAuthorization('google', new URLSearchParams({ state, code: 'write-code' }))).outcome, 'connected');
+    const connectionId = store.getConnection('google')?.connectionId;
+    assert.ok(connectionId);
+    const result = await integrations.updateGoogleTaskCompletion({
+      connectionId, containerId: 'list-1', externalId: 'task-1', desiredState: 'completed', expectedVersion: 'etag-1',
+    });
+    assert.deepEqual(result, {
+      outcome: 'succeeded', sourceStatus: 'completed', sourceVersion: 'etag-2',
+      sourceUpdatedAt: '2026-09-13T10:00:00.000Z', completedAt: '2026-09-13T10:00:00.000Z',
+    });
+    assert.deepEqual(writes, [
+      { method: 'GET', path: '/tasks/v1/lists/list-1/tasks/task-1', body: null, ifMatch: null },
+      { method: 'PATCH', path: '/tasks/v1/lists/list-1/tasks/task-1', body: '{"status":"completed"}', ifMatch: 'etag-1' },
+      { method: 'GET', path: '/tasks/v1/lists/list-1/tasks/task-1', body: null, ifMatch: null },
+    ]);
+  } finally {
+    store.close();
   }
 });
 
@@ -178,6 +365,7 @@ test('Google callback stores encrypted offline credentials and imports only read
         {
           id: 'task-1', title: 'Renew library book', status: 'needsAction', due: '2026-09-14T00:00:00.000Z',
           notes: 'This must never be retained.', updated: '2026-09-11T09:00:00Z',
+          assignmentInfo: { surfaceType: 'DOCUMENT' },
         },
       ] });
     }
@@ -246,6 +434,7 @@ test('Google callback stores encrypted offline credentials and imports only read
     assert.ok(stored?.tokenEnvelope);
     assert.ok(!stored.tokenEnvelope.includes('test-access-token'));
     assert.ok(!stored.tokenEnvelope.includes('test-refresh-token'));
+    assert.equal(overview.records.find(record => record.externalId === 'task-1')?.completionWritable, false);
     assert.ok(!JSON.stringify(overview).includes('client-secret'));
     assert.ok(!JSON.stringify(overview).includes('must never be retained'));
 
@@ -391,6 +580,134 @@ test('a reconnect requires its own refresh token instead of retaining a previous
     assert.equal((await integrations.completeAuthorization('google', new URLSearchParams({ state: secondState, code: 'second-code' }))).outcome, 'failed');
     assert.equal(store.getConnection('google')?.state, 'needs_reconnect');
   } finally {
+    store.close();
+  }
+});
+
+test('reauthorization isolates a failing old-generation sync and starts a distinct new-generation sync', async () => {
+  const store = openStore(':memory:');
+  let oldCalendarReads = 0;
+  let releaseOldCalendar!: (response: Response) => void;
+  let releaseNewCalendar!: (response: Response) => void;
+  let signalOldSyncRead!: () => void;
+  const oldCalendarResponse = new Promise<Response>(resolve => { releaseOldCalendar = resolve; });
+  const newCalendarResponse = new Promise<Response>(resolve => { releaseNewCalendar = resolve; });
+  const oldSyncReadStarted = new Promise<void>(resolve => { signalOldSyncRead = resolve; });
+  const pending: Promise<unknown>[] = [];
+
+  const calendarList = (id: string, title: string) => json({ items: [{ id, summary: title }] });
+  const calendarEvent = (id: string, title: string) => json({ items: [{
+    id,
+    status: 'confirmed',
+    summary: title,
+    start: { dateTime: '2026-09-13T10:00:00Z' },
+    end: { dateTime: '2026-09-13T11:00:00Z' },
+    updated: '2026-09-13T09:00:00Z',
+  }] });
+
+  try {
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test',
+      tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-13T09:00:00.000Z'),
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        if (url.origin === 'https://oauth.example.test') {
+          const parameters = new URLSearchParams(String(init?.body ?? ''));
+          const code = parameters.get('code');
+          const generation = code === 'new-code' ? 'new' : 'old';
+          return json({
+            access_token: `${generation}-access`,
+            refresh_token: `${generation}-refresh`,
+            token_type: 'Bearer',
+            scope: 'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+            expires_in: 3_600,
+          });
+        }
+
+        const token = new Headers(init?.headers).get('Authorization');
+        if (url.pathname === '/calendar/v3/users/me/calendarList') {
+          if (token === 'Bearer old-access') {
+            oldCalendarReads += 1;
+            if (oldCalendarReads === 1) return json({ items: [] });
+            signalOldSyncRead();
+            return oldCalendarResponse;
+          }
+          if (token === 'Bearer new-access') return newCalendarResponse;
+        }
+        if (url.pathname === '/calendar/v3/calendars/old-calendar/events') {
+          return calendarEvent('old-account-event', 'Old account event');
+        }
+        if (url.pathname === '/calendar/v3/calendars/new-calendar/events') {
+          return calendarEvent('new-account-event', 'New account event');
+        }
+        if (url.pathname === '/tasks/v1/users/@me/lists') return json({ items: [] });
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes: ['https://www.googleapis.com/auth/calendar.calendarlist.readonly'], additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    const firstState = new URL(integrations.startAuthorization('google') ?? '').searchParams.get('state');
+    assert.ok(firstState);
+    assert.equal((await integrations.completeAuthorization('google', new URLSearchParams({
+      state: firstState,
+      code: 'old-code',
+    }))).outcome, 'connected');
+    const oldConnectionId = store.getConnection('google')?.connectionId;
+    assert.ok(oldConnectionId);
+
+    const oldSync = integrations.sync('google');
+    pending.push(oldSync);
+    await oldSyncReadStarted;
+
+    const secondState = new URL(integrations.startAuthorization('google') ?? '').searchParams.get('state');
+    assert.ok(secondState);
+    const newAuthorization = integrations.completeAuthorization('google', new URLSearchParams({
+      state: secondState,
+      code: 'new-code',
+    }));
+    pending.push(newAuthorization);
+
+    let newConnection = store.getConnection('google');
+    for (let attempt = 0; attempt < 100 && newConnection?.connectionId === oldConnectionId; attempt += 1) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      newConnection = store.getConnection('google');
+    }
+    assert.ok(newConnection);
+    assert.notEqual(newConnection.connectionId, oldConnectionId);
+
+    const newSync = integrations.sync('google');
+    pending.push(newSync);
+    assert.notStrictEqual(newSync, oldSync, 'a new connection generation must not reuse the old in-flight promise');
+
+    releaseNewCalendar(calendarList('new-calendar', 'New account'));
+    releaseOldCalendar(json({ error: 'old authorization was revoked' }, 401));
+    const [oldResult, newResult, authorizationResult] = await Promise.all([oldSync, newSync, newAuthorization]);
+
+    assert.equal(oldResult.outcome, 'failed');
+    assert.match(oldResult.outcome === 'failed' ? oldResult.notice : '', /connection changed/i);
+    assert.deepEqual(newResult, { outcome: 'synced', recordCount: 1 });
+    assert.equal(authorizationResult.outcome, 'connected');
+    assert.equal(store.getConnection('google')?.state, 'connected');
+    assert.deepEqual(store.listProviderRecords().map(record => ({
+      externalId: record.externalId,
+      title: record.title,
+      connectionId: record.connectionId,
+    })), [{
+      externalId: 'new-account-event',
+      title: 'New account event',
+      connectionId: newConnection.connectionId,
+    }]);
+  } finally {
+    releaseNewCalendar(calendarList('new-calendar', 'New account'));
+    releaseOldCalendar(calendarList('old-calendar', 'Old account'));
+    await Promise.allSettled(pending);
     store.close();
   }
 });

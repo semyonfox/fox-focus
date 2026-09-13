@@ -55,16 +55,21 @@ pipeline {
           google_client="${GOOGLE_OAUTH_CLIENT_FILE_HOST:?GOOGLE_OAUTH_CLIENT_FILE_HOST is required}"
           microsoft_client="${MICROSOFT_OAUTH_CLIENT_FILE_HOST:-$source_dir/empty-oauth/microsoft-client.placeholder}"
           token_key="${OAUTH_TOKEN_KEY_FILE_HOST:?OAUTH_TOKEN_KEY_FILE_HOST is required}"
+          hermes_status_token="$(mktemp)"
+          chmod 600 "$hermes_status_token"
+          openssl rand -base64 32 > "$hermes_status_token"
           candidate="fox-focus-candidate-$BUILD_NUMBER"
-          trap 'docker rm -f "$candidate" >/dev/null 2>&1 || true' EXIT
-          docker run -d --rm --name "$candidate" --network none \\
-            -e APP_BASE_URL \\
-            -e GOOGLE_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/google-client.json \\
-            -e MICROSOFT_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/microsoft-client.json \\
-            -e OAUTH_TOKEN_KEY_FILE=/run/secrets/fox-focus/token-key \\
-            -v "$google_client":/run/secrets/fox-focus/google-client.json:ro \\
-            -v "$microsoft_client":/run/secrets/fox-focus/microsoft-client.json:ro \\
-            -v "$token_key":/run/secrets/fox-focus/token-key:ro \\
+          trap 'docker rm -f "$candidate" >/dev/null 2>&1 || true; rm -f "$hermes_status_token"' EXIT
+          docker run -d --rm --name "$candidate" --network none \
+            -e APP_BASE_URL \
+            -e GOOGLE_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/google-client.json \
+            -e MICROSOFT_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/microsoft-client.json \
+            -e OAUTH_TOKEN_KEY_FILE=/run/secrets/fox-focus/token-key \
+            -e HERMES_STATUS_TOKEN_FILE=/run/secrets/fox-focus/hermes-status-token \
+            -v "$google_client":/run/secrets/fox-focus/google-client.json:ro \
+            -v "$microsoft_client":/run/secrets/fox-focus/microsoft-client.json:ro \
+            -v "$token_key":/run/secrets/fox-focus/token-key:ro \
+            -v "$hermes_status_token":/run/secrets/fox-focus/hermes-status-token:ro \
             "$image"
           healthy=false
           for attempt in $(seq 1 20); do
@@ -72,7 +77,8 @@ pipeline {
             sleep 2
           done
           [ "$healthy" = true ]
-          docker exec "$candidate" node -e "Promise.all(['/', '/app', '/api/v1/workspace', '/api/v1/hermes', '/api/v1/integrations'].map(p=>fetch('http://127.0.0.1:8789'+p).then(r=>r.status))).then(s=>{if(s.join(',')!=='401,401,401,401,401')process.exit(1)})"
+          docker exec "$candidate" node -e "Promise.all(['/', '/app', '/api/v1/workspace', '/api/v1/hermes', '/api/v1/integrations', '/api/v1/task-status'].map(p=>fetch('http://127.0.0.1:8789'+p).then(r=>r.status))).then(s=>{if(s.join(',')!=='401,401,401,401,401,401')process.exit(1)})"
+          docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const response=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers:{authorization:'Bearer '+token}}); const status=await response.json(); process.exit(response.ok&&Number.isInteger(status.revision)&&Array.isArray(status.tasks)?0:1);"
           docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; try { const password=readFileSync('/data/workspace-password','utf8').trim(); const authorization='Basic '+Buffer.from('fox:'+password).toString('base64'); const response=await fetch('http://127.0.0.1:8789/api/v1/integrations',{headers:{authorization}}); const overview=await response.json(); const google=overview.providers?.find(provider=>provider.provider==='google'); process.exit(response.ok&&google?.configured===true?0:1); } catch { process.exit(1); }"
         '''
       }
@@ -88,6 +94,14 @@ pipeline {
             oauth_env=/home/semyon/server-stacks/jenkins/fox-focus/oauth.env
             deploy_compose=/home/semyon/server-stacks/jenkins/fox-focus/compose.yaml
             [ -f "$oauth_env" ]
+            set -a
+            . "$oauth_env"
+            set +a
+            hermes_status_required=false
+            if [ -n "${HERMES_STATUS_TOKEN_FILE_HOST:-}" ]; then
+              [ -f "$HERMES_STATUS_TOKEN_FILE_HOST" ]
+              hermes_status_required=true
+            fi
             [ "$(docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$commit" ]
 
             data_volume_before="$(docker inspect fox-focus-app-1 --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')"
@@ -114,8 +128,15 @@ pipeline {
                 oauth_read_only_after="$(docker inspect fox-focus-app-1 --format '{{range .Mounts}}{{if eq .Destination "'"$target"'"}}{{.RW}}{{end}}{{end}}')"
                 [ "$oauth_read_only_after" = false ] || return 1
               done
+              if [ "$hermes_status_required" = true ]; then
+                hermes_status_source_after="$(docker inspect fox-focus-app-1 --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/fox-focus/hermes-status-token"}}{{.Source}}{{end}}{{end}}')"
+                hermes_status_rw_after="$(docker inspect fox-focus-app-1 --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/fox-focus/hermes-status-token"}}{{.RW}}{{end}}{{end}}')"
+                [ -n "$hermes_status_source_after" ] || return 1
+                [ "$hermes_status_rw_after" = false ] || return 1
+              fi
             }
             assert_runtime() {
+              capability_level="${1:-current}"
               healthy=false
               for attempt in $(seq 1 30); do
                 if [ "$(docker inspect fox-focus-app-1 --format '{{.State.Health.Status}}')" = healthy ]; then healthy=true; break; fi
@@ -124,18 +145,29 @@ pipeline {
               [ "$healthy" = true ] || return 1
               docker run --rm --network host --entrypoint node "$image" -e "fetch('http://127.0.0.1:8789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" || return 1
               curl --fail --silent --show-error https://focus.semyon.ie/healthz || return 1
-              for path in / /app /api/v1/workspace /api/v1/hermes /api/v1/integrations; do
+              protected_paths="/ /app /api/v1/workspace /api/v1/hermes /api/v1/integrations"
+              if [ "$capability_level" = current ]; then
+                protected_paths="$protected_paths /api/v1/task-status"
+              fi
+              for path in $protected_paths; do
                 http_status=$(curl --silent --output /dev/null --write-out '%{http_code}' "https://focus.semyon.ie$path") || return 1
                 [ "$http_status" = 401 ] || return 1
               done
+              if [ "$capability_level" = current ] && [ "$hermes_status_required" = true ]; then
+                docker exec fox-focus-app-1 node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const response=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers:{authorization:'Bearer '+token}}); const status=await response.json(); process.exit(response.ok&&Number.isInteger(status.revision)&&Array.isArray(status.tasks)?0:1);" || return 1
+              fi
             }
             assert_integration_runtime() {
               docker exec fox-focus-app-1 node --input-type=module -e "import { readFileSync } from 'node:fs'; try { const password=readFileSync('/data/workspace-password','utf8').trim(); const authorization='Basic '+Buffer.from('fox:'+password).toString('base64'); const response=await fetch('http://127.0.0.1:8789/api/v1/integrations',{headers:{authorization}}); const overview=await response.json(); const google=overview.providers?.find(provider=>provider.provider==='google'); process.exit(response.ok&&google?.configured===true?0:1); } catch { process.exit(1); }"
             }
+            report_integration_state() {
+              docker exec fox-focus-app-1 node --input-type=module -e "import { readFileSync } from 'node:fs'; try { const password=readFileSync('/data/workspace-password','utf8').trim(); const authorization='Basic '+Buffer.from('fox:'+password).toString('base64'); const response=await fetch('http://127.0.0.1:8789/api/v1/integrations',{headers:{authorization}}); if(!response.ok) process.exit(1); const overview=await response.json(); const states=(overview.providers??[]).map(provider=>({provider:provider.provider,configured:provider.configured===true,state:provider.connection?.state??'disconnected'})); console.log('Rollback provider state: '+JSON.stringify(states)); } catch { process.exit(1); }"
+            }
             rollback() {
               FOX_FOCUS_IMAGE="fox-focus-app:rollback-$BUILD_NUMBER" docker compose -f "$deploy_compose" --env-file "$env_file" --env-file "$oauth_env" -p fox-focus up -d --no-build --no-deps app || return 1
-              assert_runtime || return 1
+              assert_runtime baseline || return 1
               assert_mounts || return 1
+              report_integration_state || echo 'Rollback provider state could not be read; inspect integrations manually.' >&2
             }
             failure() {
               failure_code=$?
@@ -147,7 +179,7 @@ pipeline {
             }
 
             FOX_FOCUS_IMAGE="$image" docker compose -f "$deploy_compose" --env-file "$env_file" --env-file "$oauth_env" -p fox-focus config -q
-            FOX_FOCUS_IMAGE="$image" docker compose -f "$deploy_compose" --env-file "$env_file" --env-file "$oauth_env" -p fox-focus config --format json | FOX_FOCUS_DATA_VOLUME="$data_volume_before" FOX_FOCUS_HERMES_SOURCE="$hermes_source_before" node --input-type=module -e '
+            FOX_FOCUS_IMAGE="$image" docker compose -f "$deploy_compose" --env-file "$env_file" --env-file "$oauth_env" -p fox-focus config --format json | FOX_FOCUS_DATA_VOLUME="$data_volume_before" FOX_FOCUS_HERMES_SOURCE="$hermes_source_before" FOX_FOCUS_HERMES_STATUS_REQUIRED="$hermes_status_required" node --input-type=module -e '
               let config = "";
               process.stdin.setEncoding("utf8");
               process.stdin.on("data", chunk => { config += chunk; });
@@ -157,6 +189,7 @@ pipeline {
                 const data = mounts.find(mount => mount.target === "/data");
                 const hermes = mounts.find(mount => mount.target === "/hermes/personal-tasks");
                 const oauthTargets = ["/run/secrets/fox-focus/google-client.json", "/run/secrets/fox-focus/microsoft-client.json", "/run/secrets/fox-focus/token-key"];
+                if (process.env.FOX_FOCUS_HERMES_STATUS_REQUIRED === "true") oauthTargets.push("/run/secrets/fox-focus/hermes-status-token");
                 const dataVolume = data && (parsed.volumes?.[data.source]?.name ?? data.source);
                 if (!data || data.type !== "volume" || dataVolume !== process.env.FOX_FOCUS_DATA_VOLUME || data.read_only === true) throw new Error("Deployment config changes the /data mount");
                 if (!hermes || hermes.type !== "bind" || hermes.source !== process.env.FOX_FOCUS_HERMES_SOURCE || hermes.read_only !== true) throw new Error("Deployment config changes the Hermes mount");

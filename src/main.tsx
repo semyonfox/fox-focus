@@ -3,6 +3,7 @@ import {
   Bell,
   Bot,
   CalendarDays,
+  CalendarRange,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -16,6 +17,7 @@ import {
   Moon,
   Pencil,
   Plus,
+  RefreshCw,
   RotateCcw,
   SlidersHorizontal,
   Sun,
@@ -89,6 +91,11 @@ function isValidTime(value: string): boolean {
   return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
 }
 
+function timeValueToMinutes(value: string): number {
+  const [hours, minutes] = value.split(":").map(Number);
+  return hours * 60 + minutes;
+}
+
 function formatStatus(status: InboxStatus): string {
   if (status === "draft-ready") return "Draft ready";
   if (status === "waiting-on-agent") return "Saved locally";
@@ -109,6 +116,24 @@ function formatCreatedAt(createdAt: string | undefined): string | null {
     month: "short",
     timeZone: "Europe/Dublin",
   }).format(new Date(createdAt));
+}
+
+function legacyDeadlineDate(due: string, today: string): string {
+  if (due === "Today") return today;
+  if (due === "Tomorrow") return addCalendarDays(today, 1);
+  if (due !== "Friday") return "";
+  const day = new Date(`${today}T12:00:00Z`).getUTCDay();
+  return addCalendarDays(today, (5 - day + 7) % 7);
+}
+
+function deadlineDateLabel(deadlineDate: string, today: string): string {
+  if (deadlineDate === today) return "Today";
+  if (deadlineDate === addCalendarDays(today, 1)) return "Tomorrow";
+  return formatDublinDateKey(deadlineDate, { day: "numeric", month: "short" });
+}
+
+function taskDeadlineLabel(task: Task, today: string): string {
+  return task.deadlineDate ? deadlineDateLabel(task.deadlineDate, today) : task.due;
 }
 
 function taskFilterLabel(filter: TaskFilter): string {
@@ -136,6 +161,13 @@ function compareCalendarEvents(first: TimelineEvent, second: TimelineEvent, lega
 }
 
 type CalendarMode = "day" | "upcoming";
+type WorkspaceView = Exclude<SectionAnchor, "signals">;
+
+function workspaceViewFromLocation(): WorkspaceView {
+  if (typeof window === "undefined") return "today";
+  const value = window.location.hash.slice(1);
+  return value === "agenda" || value === "tasks" || value === "review" ? value : "today";
+}
 
 function taskSortLabel(sort: TaskSort): string {
   return sort === "created" ? "Created newest" : "Due first";
@@ -192,27 +224,85 @@ function PaneHeader({ eyebrow, title, action }: { eyebrow: string; title: string
   );
 }
 
+type ClientTaskActionStatus = "awaiting_approval" | "running" | "succeeded" | "failed" | "conflict";
+type ClientTaskAction = {
+  id: string;
+  taskId: string;
+  desiredState: "open" | "completed";
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  status: ClientTaskActionStatus;
+  result: Record<string, unknown> | null;
+  lastError: string | null;
+  createdAt: string;
+  expiresAt?: string;
+  leaseExpiresAt?: string | null;
+};
+
+type TaskActionPreview = ClientTaskAction & { status: "awaiting_approval"; expiresAt: string };
+type HermesAdoptionPreview = {
+  id: string;
+  status: "awaiting_approval";
+  before: Record<string, unknown>;
+  after: Task;
+  expiresAt: string;
+};
+
+function isClientTaskAction(value: unknown): value is ClientTaskAction {
+  return isRecord(value) && typeof value.id === "string" && typeof value.taskId === "string" &&
+    (value.desiredState === "open" || value.desiredState === "completed") &&
+    ["awaiting_approval", "running", "succeeded", "failed", "conflict"].includes(String(value.status)) &&
+    isRecord(value.before) && isRecord(value.after) &&
+    (value.result === null || isRecord(value.result)) &&
+    (value.lastError === null || typeof value.lastError === "string") && typeof value.createdAt === "string";
+}
+
+function isTaskActionPreview(value: unknown): value is TaskActionPreview {
+  return isClientTaskAction(value) && value.status === "awaiting_approval" && typeof value.expiresAt === "string";
+}
+
+function isHermesAdoptionPreview(value: unknown): value is HermesAdoptionPreview {
+  return isRecord(value) && typeof value.id === "string" && value.status === "awaiting_approval" &&
+    isRecord(value.before) && isTask(value.after) && typeof value.expiresAt === "string";
+}
+
+function isServerSnapshot(value: unknown): value is ServerSnapshot {
+  return isRecord(value) && typeof value.revision === "number" && Number.isSafeInteger(value.revision) &&
+    value.revision >= 0 && isPrototypeData(value.data);
+}
+
+function actionStateLabel(action: ClientTaskAction | undefined): string | null {
+  if (!action) return null;
+  if (action.status === "awaiting_approval" || action.status === "running") return "Google pending";
+  if (action.status === "failed") return "Google retry needed";
+  if (action.status === "conflict") return "Google changed";
+  return null;
+}
+
 function TaskRow({
   task,
   onToggle,
   onEdit,
-  onSchedule,
   plannedDate,
   compact = false,
   sourceBadge,
   toggleDisabled = false,
   toggleBusy = false,
+  dueLabel,
+  latestAction,
 }: {
   task: Task;
   onToggle: (task: Task) => void;
   onEdit: (task: Task) => void;
-  onSchedule: (task: Task) => void;
   plannedDate?: string;
   compact?: boolean;
   sourceBadge?: ReactNode;
   toggleDisabled?: boolean;
   toggleBusy?: boolean;
+  dueLabel?: string;
+  latestAction?: ClientTaskAction;
 }) {
+  const createdAt = formatCreatedAt(task.createdAt);
   const planned = task.scheduledTime && !task.completed
     ? `${plannedDate ? `${formatDublinDateKey(plannedDate, { weekday: "short", day: "numeric" })} ` : ""}${task.scheduledTime}`
     : null;
@@ -229,25 +319,23 @@ function TaskRow({
       >
         {task.completed ? <Check size={14} strokeWidth={3} /> : <Circle size={16} strokeWidth={2} />}
       </button>
-      <div className="task-copy">
-        <strong className={task.completed ? "task-title--done" : undefined}>{task.title}</strong>
-        <span>
-          <i className={`area-dot area-dot--${areaClass(task.area)}`} />
-          {task.area} · {task.duration}
-          {planned ? <em className="task-planned"><CalendarDays size={11} /> {planned}</em> : null}
-          {task.origin === "inbox" ? <em className="source-chip" title={task.source} aria-label={`From ${task.source ?? "Inbox"}`}>{task.source?.replace(/^Inbox · /, "") ?? "Inbox"}</em> : null}
-          {sourceBadge}
+      <button className="task-row-main" type="button" onClick={() => onEdit(task)} aria-label={`Open ${task.title}`}>
+        <span className="task-copy">
+          <strong className={task.completed ? "task-title--done" : undefined}>{task.title}</strong>
+          <span>
+            <i className={`area-dot area-dot--${areaClass(task.area)}`} />
+            {task.area} · {task.duration}
+            {planned ? <em className="task-sync-chip">{task.completed ? "Calendar done" : `${planned} on calendar`}</em> : null}
+            {task.origin === "inbox" ? <em className="source-chip" title={task.source} aria-label={`From ${task.source ?? "Inbox"}`}>{task.source?.replace(/^Inbox · /, "") ?? "Inbox"}</em> : null}
+            {task.externalLinks?.some((link) => link.provider === "google_tasks") ? <em className="source-chip">Google linked</em> : task.origin === "migration" ? <em className="source-chip">Imported</em> : null}
+            {sourceBadge}
+            {actionStateLabel(latestAction) ? <em className={`task-action-state task-action-state--${latestAction?.status}`}>{actionStateLabel(latestAction)}</em> : null}
+            {!compact ? <em className={`task-created${createdAt ? "" : " task-created--unknown"}`}>{createdAt ? `Added ${createdAt}` : "Created date unknown"}</em> : null}
+          </span>
         </span>
-      </div>
-      <time>{task.due}</time>
-      <div className="task-row-actions">
-        <button type="button" className="mini-action" onClick={() => onEdit(task)}>
-          Edit
-        </button>
-        <button type="button" className="mini-action" onClick={() => onSchedule(task)}>
-          {task.scheduledTime ? "Calendar" : "Schedule"}
-        </button>
-      </div>
+        <time dateTime={task.deadlineDate}>{dueLabel ?? task.due}</time>
+        <ChevronRight className="task-row-arrow" size={15} aria-hidden="true" />
+      </button>
     </article>
   );
 }
@@ -266,6 +354,27 @@ function ImportedTaskRow({ task, area }: { task: ImportedRecord; area: Area }) {
         <span>{area}<em className="source-chip" title={`${providerLabel(task.provider)} · ${task.containerName}`}>{providerLabel(task.provider)} · {task.containerName}</em></span>
       </div>
       <time dateTime={task.dueOn ?? undefined}>{status}</time>
+    </article>
+  );
+}
+
+function HermesTaskRow({ task, onAdopt, busy }: { task: HermesTask; onAdopt: (task: HermesTask) => void; busy: boolean }) {
+  const updatedAt = formatCreatedAt(task.updatedAt);
+
+  return (
+    <article className={`task-row hermes-task-row${task.status === "done" ? " hermes-task-row--done" : ""}`}>
+      <span className="hermes-task-mark" title="Managed in Hermes" aria-label="Managed in Hermes"><Bot size={16} /></span>
+      <div className="task-copy">
+        <strong className={task.status === "done" ? "task-title--done" : undefined}>{task.title}</strong>
+        <span>
+          <em className="source-chip source-chip--hermes">Hermes</em>
+          <em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>
+          {task.priority > 0 ? <em className="task-created">Priority {task.priority}</em> : null}
+          {task.parentTitle ? <em className="task-created" title={`Part of ${task.parentTitle}`}>Part of {task.parentTitle}</em> : null}
+        </span>
+      </div>
+      <time dateTime={task.updatedAt}>{updatedAt ? `Updated ${updatedAt}` : "Updated"}</time>
+      <button className="mini-action hermes-adopt-action" type="button" disabled={busy} onClick={() => onAdopt(task)}>{busy ? "Preparing…" : "Adopt"}</button>
     </article>
   );
 }
@@ -384,7 +493,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const lastSaved = useRef(data);
   const saveQueue = useRef(Promise.resolve());
   const saveFailed = useRef(false);
-  const [activeSection, setActiveSection] = useState<SectionAnchor>("today");
+  const [activeSection, setActiveSection] = useState<WorkspaceView>(workspaceViewFromLocation);
   const [themeMode, setThemeMode] = useState<ThemeMode>(loadTheme);
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() =>
     typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches ? "black" : "light",
@@ -416,6 +525,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [hermesCompletionApproval, setHermesCompletionApproval] = useState<HermesTask | null>(null);
   const [hermesTaskDraft, setHermesTaskDraft] = useState<TaskDraft>(defaultTaskDraft);
   const [hermesCompletionPending, setHermesCompletionPending] = useState<string | null>(null);
+  const [taskActions, setTaskActions] = useState<ClientTaskAction[]>([]);
+  const [taskActionPreview, setTaskActionPreview] = useState<TaskActionPreview | null>(null);
+  const [taskActionBusy, setTaskActionBusy] = useState(false);
+  const [hermesAdoption, setHermesAdoption] = useState<HermesAdoptionPreview | null>(null);
+  const [adoptingHermesId, setAdoptingHermesId] = useState<string | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
   const [showIntegrations, setShowIntegrations] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("integration"));
   const [agentRequest, setAgentRequest] = useState("");
@@ -426,7 +540,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const calendarTabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const firedHermesReminderIds = useRef(new Set<string>());
   const hermesBoard = hermes.feed && hermes.feed.state !== "unavailable" ? hermes.feed.board : null;
-  const hermesTasks = hermesBoard?.tasks ?? [];
+  const adoptedHermesIds = new Set(data.tasks.flatMap((task) => task.externalLinks ?? [])
+    .filter((link) => link.provider === "hermes")
+    .map((link) => link.externalId));
+  const hermesTasks = (hermesBoard?.tasks ?? []).filter((task) => !adoptedHermesIds.has(task.id));
   const hermesReminders = useMemo<Reminder[]>(() =>
     (hermes.feed?.state === "connected" ? hermesTasks : []).flatMap(task =>
     task.status !== "done" && task.reminderMode !== "none"
@@ -473,6 +590,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [data, initial]);
 
   useEffect(() => {
+    if (!initial) return;
+    void refreshTaskActions();
+  }, [initial]);
+
+  useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = () => setSystemTheme(mediaQuery.matches ? "black" : "light");
     syncSystemTheme();
@@ -480,7 +602,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations);
+  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || taskActionPreview || hermesAdoption);
 
   useEffect(() => {
     if (!isOverlayOpen) {
@@ -630,11 +752,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setHermesCompletionApproval(null);
       setShowReminderTray(false);
       setActiveReminderId(null);
+      setShowIntegrations(false);
+      if (!taskActionBusy) setTaskActionPreview(null);
+      if (!adoptingHermesId) setHermesAdoption(null);
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [adoptingHermesId, taskActionBusy]);
 
   useEffect(() => {
     if (!completionUndo) return;
@@ -694,6 +819,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const selectedInbox = reviewItems.find((item) => item.id === selectedInboxId) ?? reviewItems[0] ?? null;
   const selectedInboxIndex = selectedInbox ? reviewItems.findIndex((item) => item.id === selectedInbox.id) : -1;
   const activeTasks = data.tasks.filter((task) => !task.completed);
+  const activeBlock = visibleCalendarEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
   const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
   const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
   const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
@@ -701,6 +827,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     integrations.overview?.providers.some((status) => status.provider === provider && status.connection?.state === "connected") === true;
   const googleTasksAvailable = providerIsAvailable("google");
   const microsoftTasksAvailable = providerIsAvailable("microsoft");
+  const latestActionByTask = new Map<string, ClientTaskAction>();
+  for (const action of taskActions) {
+    if (!latestActionByTask.has(action.taskId)) latestActionByTask.set(action.taskId, action);
+  }
   const categoryLocalTasks = taskCategory === allTaskCategories
     ? data.tasks
     : taskCategory === unclassifiedTaskCategory
@@ -724,7 +854,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const visibleTasks = useMemo(() => {
     const filtered = categoryLocalTasks.filter((task) => {
       if (taskFilter === "all") return true;
-      if (taskFilter === "due-today") return task.due === "Today" && !task.completed;
+      if (taskFilter === "due-today") return (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed;
       if (taskFilter === "planned") return Boolean(task.scheduledTime) && !task.completed;
       if (taskFilter === "waiting") return task.state === "waiting" && !task.completed;
       if (taskFilter === "done") return task.completed;
@@ -780,6 +910,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleImportedTasks.filter((task) => task.provider === "google").length });
   if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
   const isExternalOnlyScope = taskSource === googleTaskSource || taskSource === microsoftTaskSource;
+  const isHermesOnlyScope = taskSource === hermesTaskSource;
 
   const shownLocalTasks = taskSource === allTaskSources || taskSource === localTaskSource ? visibleTasks : [];
   const shownHermesTasks = taskSource === allTaskSources || taskSource === hermesTaskSource ? visibleHermesTasks : [];
@@ -796,10 +927,43 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
   const activeImportedTaskCount = importedTasks.filter((task) => task.status !== "completed" &&
     !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`)).length;
-  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
   const openTaskCount = activeTasks.length + activeHermesTaskCount + activeImportedTaskCount;
   const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
   const selectedTaskCategoryLabel = taskCategory === allTaskCategories ? "all areas" : taskCategory === unclassifiedTaskCategory ? "uncategorised" : taskCategory;
+  const taskFilterCounts: Record<TaskFilter, number> = {
+    all: categoryLocalTasks.length + categoryHermesTasks.length,
+    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length,
+    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length,
+    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length,
+    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length,
+    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length,
+  };
+  const activeTaskFilterCount = Number(taskFilter !== "all") + Number(taskSource !== allTaskSources) + Number(taskSort !== "due");
+  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length;
+  const todayEvents = sortedEvents.filter((event) => eventDateKey(event, todayDate) === todayDate);
+  const currentTime = timeValueToMinutes(dublinTimeValue(new Date()));
+  const currentEvent = todayEvents.find((event) => {
+    const startsAt = timeValueToMinutes(eventTimeValue(event));
+    return startsAt <= currentTime && startsAt + event.duration > currentTime;
+  });
+  const nextEvents = todayEvents.filter((event) => timeValueToMinutes(eventTimeValue(event)) >= currentTime && event.id !== currentEvent?.id);
+  const todayFocusEvents = [...(currentEvent ? [currentEvent] : []), ...nextEvents].slice(0, 3);
+  const priorityOrder: Record<Priority, number> = { high: 0, medium: 1, low: 2 };
+  const attentionDueOrder: Record<string, number> = { Today: 0, Tomorrow: 1, Friday: 2, Waiting: 4, "No deadline": 5 };
+  const attentionTasks = [...activeTasks]
+    .sort((first, second) => {
+      const firstWaiting = Number(first.state === "waiting");
+      const secondWaiting = Number(second.state === "waiting");
+      return firstWaiting - secondWaiting ||
+        (first.deadlineDate ?? "9999-12-31").localeCompare(second.deadlineDate ?? "9999-12-31") ||
+        (attentionDueOrder[first.due] ?? 3) - (attentionDueOrder[second.due] ?? 3) ||
+        priorityOrder[first.priority] - priorityOrder[second.priority] || compareTasksByCreatedAt(first, second);
+    })
+    .slice(0, 5);
+  const dueTodayCount = activeTasks.filter((task) => task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today").length;
+  const tomorrowDate = addCalendarDays(todayDate, 1);
+  const dueTomorrowCount = activeTasks.filter((task) => task.deadlineDate ? task.deadlineDate === tomorrowDate : task.due === "Tomorrow").length;
+  const waitingTaskCount = activeTasks.filter((task) => task.state === "waiting").length;
 
   useEffect(() => {
     if ((taskSource === hermesTaskSource && !hermesBoard) ||
@@ -815,14 +979,21 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setAgentRequest(selectedInbox?.moreWork ?? "");
   }, [selectedInbox?.id, selectedInbox?.moreWork]);
 
-  function scrollToSection(section: SectionAnchor) {
+  function openWorkspaceView(section: WorkspaceView) {
     setActiveSection(section);
-    document.getElementById(section)?.scrollIntoView({ behavior: "auto", block: "start" });
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${section}`);
+    window.scrollTo({ top: 0, behavior: "auto" });
   }
 
   function selectTaskFilter(filter: TaskFilter) {
     setTaskFilter(filter);
     if ((filter === "planned" || filter === "waiting") && isExternalOnlyScope) setTaskSource(allTaskSources);
+  }
+
+  function resetTaskFilters() {
+    setTaskFilter("all");
+    setTaskSource(allTaskSources);
+    setTaskSort("due");
   }
 
   function selectTaskCategory(category: TaskCategory) {
@@ -880,6 +1051,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       area: hermesTaskArea(task, data.listAreas) ?? task.area,
       priority: task.priority >= 4 ? "high" : task.priority >= 2 ? "medium" : "low",
       due: task.due,
+      deadlineDate: task.sourceDueOn ?? "",
       duration: task.duration,
       state: task.localState === "scheduled" ? "up-next" : task.localState,
       scheduledDate: task.scheduledAt ? dublinDateKey(new Date(task.scheduledAt)) : "",
@@ -955,6 +1127,131 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
   }
 
+  async function waitForWorkspaceSaves() {
+    await saveQueue.current;
+    if (saveFailed.current) throw new Error("Fix the workspace save error before changing a linked source.");
+  }
+
+  function applyServerSnapshot(snapshot: ServerSnapshot) {
+    revision.current = snapshot.revision;
+    lastSaved.current = snapshot.data;
+    saveFailed.current = false;
+    setSaveError(null);
+    setData(snapshot.data);
+  }
+
+  async function refreshTaskActions() {
+    if (!initial) return;
+    try {
+      const response = await fetch("/api/v1/task-actions");
+      const value: unknown = await response.json();
+      if (!response.ok || !isRecord(value) || !Array.isArray(value.actions) || !value.actions.every(isClientTaskAction)) return;
+      setTaskActions(value.actions);
+    } catch {
+      // Task data remains usable when the optional action ledger cannot load.
+    }
+  }
+
+  async function previewLinkedTaskAction(task: Task, desiredState: "open" | "completed" = task.completed ? "open" : "completed") {
+    if (!initial) return;
+    setTaskActionBusy(true);
+    setStatusMessage("");
+    try {
+      await waitForWorkspaceSaves();
+      const response = await fetch("/api/v1/task-actions/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: task.id, desiredState, idempotencyKey: makeId("task-action") }),
+      });
+      const value: unknown = await response.json();
+      if (!response.ok || !isTaskActionPreview(value)) {
+        throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Could not prepare the Google task preview.");
+      }
+      setTaskActionPreview(value);
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Could not prepare the Google task preview.");
+    } finally {
+      setTaskActionBusy(false);
+    }
+  }
+
+  async function executeTaskAction(action: ClientTaskAction, retry: boolean) {
+    setTaskActionBusy(true);
+    try {
+      await waitForWorkspaceSaves();
+      const suffix = retry ? "retry" : "approve";
+      const response = await fetch(`/api/v1/task-actions/${encodeURIComponent(action.id)}/${suffix}`, { method: "POST" });
+      const value: unknown = await response.json();
+      const snapshot = isRecord(value) && isServerSnapshot(value.snapshot) ? value.snapshot : null;
+      const resultAction = isRecord(value) && isClientTaskAction(value.action) ? value.action : null;
+      if (snapshot) applyServerSnapshot(snapshot);
+      if (resultAction) {
+        setTaskActions(current => [resultAction, ...current.filter(candidate => candidate.id !== resultAction.id)]);
+      }
+      setTaskActionPreview(null);
+      if (!resultAction) {
+        throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "The linked action could not be recorded.");
+      }
+      if (resultAction.status === "succeeded") {
+        setStatusMessage(resultAction.desiredState === "completed"
+          ? "Completed here and confirmed in Google Tasks."
+          : "Reopened here and confirmed in Google Tasks.");
+      } else {
+        setStatusMessage(resultAction.lastError ?? (response.status === 409
+          ? "Google changed after the preview. Your Fox Focus task was kept."
+          : "Your Fox Focus task was kept, but Google still needs attention."));
+      }
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "The linked task action did not finish.");
+    } finally {
+      setTaskActionBusy(false);
+    }
+  }
+
+  async function previewHermesAdoption(task: HermesTask) {
+    if (!initial) return;
+    setAdoptingHermesId(task.id);
+    setStatusMessage("");
+    try {
+      await waitForWorkspaceSaves();
+      const response = await fetch("/api/v1/task-adoptions/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source: "hermes", externalId: task.id }),
+      });
+      const value: unknown = await response.json();
+      if (!response.ok || !isHermesAdoptionPreview(value)) {
+        throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Could not prepare this Hermes task.");
+      }
+      setHermesAdoption(value);
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Could not prepare this Hermes task.");
+    } finally {
+      setAdoptingHermesId(null);
+    }
+  }
+
+  async function approveHermesAdoption() {
+    if (!hermesAdoption) return;
+    setAdoptingHermesId(hermesAdoption.after.id);
+    try {
+      await waitForWorkspaceSaves();
+      const response = await fetch(`/api/v1/task-adoptions/${encodeURIComponent(hermesAdoption.id)}/approve`, { method: "POST" });
+      const value: unknown = await response.json();
+      const snapshot = isRecord(value) && isServerSnapshot(value.snapshot) ? value.snapshot : null;
+      if (!response.ok || !snapshot) {
+        throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Could not adopt this task.");
+      }
+      applyServerSnapshot(snapshot);
+      setHermesAdoption(null);
+      setStatusMessage("Task adopted. Fox Focus now owns its history.");
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Could not adopt this task.");
+    } finally {
+      setAdoptingHermesId(null);
+    }
+  }
+
   function openTaskComposer(task?: Task, inboxItem?: InboxItem) {
     const linkedEvent = task?.linkedEventId
       ? data.events.find((event) => event.id === task.linkedEventId)
@@ -964,6 +1261,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       area: task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal"),
       priority: task?.priority ?? "medium",
       due: task?.due ?? "No deadline",
+      deadlineDate: task?.deadlineDate ?? (task ? legacyDeadlineDate(task.due, todayDate) : ""),
       duration: task?.duration ?? "30 min",
       state: task && task.state !== "done" ? task.state : "up-next",
       scheduledDate: linkedEvent ? eventDateKey(linkedEvent, todayDate) : task?.scheduledDate ?? selectedDate,
@@ -995,12 +1293,21 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function toggleTask(task: Task) {
+    if (initial && task.externalLinks?.some(link => link.provider === "google_tasks" && link.policy === "completion_only")) {
+      if (!taskActionBusy) void previewLinkedTaskAction(task);
+      return;
+    }
     const nowCompleted = !task.completed;
     setData((current) => ({
       ...current,
       tasks: current.tasks.map((candidate) =>
         candidate.id === task.id
-          ? { ...candidate, completed: nowCompleted, state: nowCompleted ? "done" : candidate.scheduledTime ? "scheduled" : "up-next" }
+          ? {
+              ...candidate,
+              completed: nowCompleted,
+              state: nowCompleted ? "done" : candidate.scheduledTime ? "scheduled" : "up-next",
+              completedAt: nowCompleted ? new Date().toISOString() : undefined,
+            }
           : candidate,
       ),
       reminders: nowCompleted
@@ -1029,7 +1336,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ...current,
       tasks: current.tasks.map((candidate) =>
         candidate.id === task.id
-          ? { ...candidate, completed: false, state: completionUndo.state }
+          ? { ...candidate, completed: false, state: completionUndo.state, completedAt: undefined }
           : candidate,
       ),
       reminders: completionUndo.reminder
@@ -1057,7 +1364,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setCalendarAnchor(date);
     setCalendarMode("day");
     setSelectedEventId(task.linkedEventId);
-    scrollToSection("agenda");
+    openWorkspaceView("agenda");
   }
 
   function saveTask(event: FormEvent<HTMLFormElement>) {
@@ -1079,6 +1386,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : null;
     if (taskDraft.scheduledTime && (!isDateKey(scheduledDate) || !plannedStartAt)) {
       setModalError("Choose a valid Dublin date and time. Times skipped or repeated at a clock change need another time.");
+      return;
+    }
+    if (taskDraft.deadlineDate && !isDateKey(taskDraft.deadlineDate)) {
+      setModalError("Choose a valid deadline or leave it blank.");
       return;
     }
 
@@ -1110,14 +1421,18 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       area: taskDraft.area,
       state: existingTask?.completed ? "done" : taskDraft.scheduledTime ? "scheduled" : taskDraft.state,
       duration: taskDraft.duration,
-      due: taskDraft.due,
+      due: taskDraft.deadlineDate ? deadlineDateLabel(taskDraft.deadlineDate, todayDate) : "No deadline",
       priority: taskDraft.priority,
       completed: existingTask?.completed ?? false,
       scheduledTime: taskDraft.scheduledTime || null,
+      ...(taskDraft.scheduledTime ? { scheduledDate } : {}),
       linkedEventId,
       origin,
       ...(source ? { source } : {}),
       ...(createdAt ? { createdAt } : {}),
+      ...(taskDraft.deadlineDate ? { deadlineDate: taskDraft.deadlineDate } : {}),
+      ...(existingTask?.completedAt ? { completedAt: existingTask.completedAt } : {}),
+      ...(existingTask?.externalLinks ? { externalLinks: existingTask.externalLinks } : {}),
     };
 
     setData((current) => {
@@ -1478,229 +1793,182 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     );
   }
 
-  function renderLifeboard() {
-    return (
-      <>
-        <section className="lifeboard-strip" id="today">
-          <div className="lifeboard-title">
-            <h1>Today</h1>
-            <p>{formatDublinDateKey(todayDate, { weekday: "long", day: "numeric", month: "long" })}</p>
-          </div>
-        </section>
+  function openTodayEvent(event: TimelineEvent) {
+    returnCalendarToToday();
+    setSelectedEventId(event.id);
+    openWorkspaceView("agenda");
+  }
 
-        <section className="lifeboard-grid" aria-label="Fox Focus lifeboard">
-          <div className="lifeboard-column lifeboard-column--agenda">
-          <article className="pane lifeboard-agenda" id="agenda">
-            <PaneHeader
-              eyebrow="Calendar"
-              title={calendarMode === "day"
-                ? (selectedDate === todayDate ? `Today, ${formatDublinDateKey(selectedDate, { day: "numeric", month: "short" })}` : formatDublinDateKey(selectedDate))
-                : `${formatDublinDateKey(calendarRangeStart, { day: "numeric", month: "short" })} – ${formatDublinDateKey(calendarRangeEnd, { day: "numeric", month: "short" })}`}
-              action={<button className="pane-link" type="button" onClick={() => openEventComposer()}><Plus size={12} /> Add block</button>}
-            />
-            <div className="calendar-view-bar">
-              <div className="calendar-view-switch" role="group" aria-label="Calendar view">
-                <button className={calendarMode === "day" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "day"} onClick={() => setCalendarMode("day")}>Day</button>
-                <button className={calendarMode === "upcoming" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "upcoming"} onClick={() => setCalendarMode("upcoming")}>Week</button>
-              </div>
-              <button className="calendar-today-action" type="button" onClick={returnCalendarToToday} disabled={selectedDate === todayDate && calendarMode === "day"}>Today</button>
-              <div className="calendar-steps">
-                <button className="calendar-step" type="button" onClick={() => moveCalendarDate(-1)} aria-label="Previous day"><ChevronLeft size={15} /></button>
-                <button className="calendar-step" type="button" onClick={() => moveCalendarDate(1)} aria-label="Next day"><ChevronRight size={15} /></button>
-              </div>
-            </div>
-            <div className="calendar-date-strip" role="tablist" aria-label="Choose a day">
-              {calendarDays.map((date, index) => {
-                const localCount = sortedEvents.filter((event) => eventDateKey(event, todayDate) === date).length;
-                const fullLabel = formatDublinDateKey(date, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
-                return <button
-                  className={`calendar-date-tab${date === selectedDate ? " calendar-date-tab--selected" : ""}${date === todayDate ? " calendar-date-tab--today" : ""}`}
-                  id={`calendar-date-${date}`}
-                  key={date}
-                  type="button"
-                  role="tab"
-                  aria-controls="calendar-day-panel"
-                  aria-current={date === todayDate ? "date" : undefined}
-                  aria-label={`${fullLabel}${date === todayDate ? ", today" : ""}, ${localCount} ${localCount === 1 ? "block" : "blocks"}`}
-                  aria-selected={date === selectedDate}
-                  tabIndex={date === selectedDate ? 0 : -1}
-                  ref={(element) => { calendarTabRefs.current[index] = element; }}
-                  onClick={() => selectCalendarDate(date)}
-                  onKeyDown={(event) => handleCalendarTabKeyDown(event, index)}
-                >
-                  <span>{formatDublinDateKey(date, { weekday: "short" })}</span>
-                  <strong>{formatDublinDateKey(date, { day: "numeric" })}</strong>
-                  <i className={localCount ? "calendar-date-dot" : "calendar-date-dot calendar-date-dot--empty"} aria-hidden="true" />
-                </button>;
-              })}
-            </div>
-            <div className="schedule-list agenda-list" id="calendar-day-panel" role="tabpanel" aria-labelledby={`calendar-date-${selectedDate}`}>
-              {calendarMode === "day"
-                ? visibleCalendarEvents.map((event) => renderScheduleRow(event))
-                : calendarDateWindow(selectedDate, 0, 6).map((date) => {
-                    const dayEvents = visibleCalendarEvents.filter((event) => eventDateKey(event, todayDate) === date);
-                    if (!dayEvents.length) return null;
-                    return <section className="agenda-day-group" key={date}>
-                      <button className="agenda-day-heading" type="button" onClick={() => selectCalendarDate(date)}><span>{date === todayDate ? "Today" : formatDublinDateKey(date, { weekday: "long" })}</span><strong>{formatDublinDateKey(date, { day: "numeric", month: "long" })}</strong><ChevronRight size={13} /></button>
-                      {dayEvents.map((event) => renderScheduleRow(event, true))}
-                    </section>;
-                  })}
-              {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={16} /><span>{calendarMode === "day" ? "Nothing planned." : "Nothing planned this week."}</span></div> : null}
-            </div>
-            {selectedEvent ? (
-              <div className="agenda-detail">
-                <div className="agenda-detail-main">
-                  <i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} />
-                  <span>
-                    <strong>{selectedEvent.title}</strong>
-                    <small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}{selectedEventTask?.completed ? " · done" : selectedEventHermesTask ? " · Hermes" : !selectedEvent.editable ? " · imported" : ""}</small>
-                  </span>
-                </div>
-                <div className="agenda-detail-actions">
-                  {selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : selectedEventHermesTask ? <button className="mini-action" type="button" onClick={() => openHermesTaskEditor(selectedEventHermesTask)}><Pencil size={12} /> Edit task plan</button> : null}
-                  {selectedEventHermesTask ? null : selectedEvent.editable ? (
-                    <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button>
-                  ) : (
-                    <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>
-                  )}
-                </div>
-              </div>
-            ) : null}
-            {initial ? <IntegrationCalendarContext overviewState={integrations} onOpen={() => setShowIntegrations(true)} startDate={calendarRangeStart} endDate={calendarRangeEnd} /> : null}
-          </article>
+  function openTodayInbox(item: InboxItem) {
+    selectInbox(item);
+    openWorkspaceView("review");
+  }
 
-          <article className="pane lifeboard-tasks" id="tasks">
-            <PaneHeader
-              eyebrow={`${openTaskCount} open${plannedTaskCount ? ` · ${plannedTaskCount} planned` : ""}${hermesBoard ? " · Hermes connected" : ""}`}
-              title="Tasks"
-              action={<button className="pane-link" type="button" onClick={() => openTaskComposer()}><Plus size={12} /> Add task</button>}
-            />
-            <div className="task-toolbar-row">
-              <nav className="task-category-strip" aria-label="Task categories">
-                {taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}
-              </nav>
-              <div className="task-toolbar-controls">
-                <label className="task-select"><span className="visually-hidden">Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)}</option>)}</select></label>
-                {hermesBoard || googleTasksAvailable || microsoftTasksAvailable ? <label className="task-select"><span className="visually-hidden">Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id}>{source.label} ({source.count})</option>)}</select></label> : null}
-                <label className="task-select"><span className="visually-hidden">Sort</span><select value={taskSort} disabled={isExternalOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>
-                {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={() => void hermes.poll().catch(error => setSaveError(error instanceof Error ? error.message : "Hermes could not be refreshed."))} aria-label="Refresh Hermes"><RotateCcw size={13} /></button> : null}
-              </div>
-            </div>
-            {initial && hermes.failed ? <p className="task-filter-boundary"><Bot size={13} /> Hermes could not be refreshed. Local tasks are unaffected.</p> : null}
-            {hermes.feed?.state === "stale" ? <p className="task-filter-boundary"><Bot size={13} /> Showing the last Hermes sync. Completion is paused until the board can be read again.</p> : null}
-            {hermesBoard && hermes.feed?.completionAvailable === false ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks are mirrored, but completion is not configured on this server.</p> : null}
-            {importedTasks.length && (taskFilter === "planned" || taskFilter === "waiting") ? <p className="task-filter-boundary"><Bot size={13} /> Provider tasks do not have local planning details yet.</p> : null}
-            <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks, ${selectedTaskCategoryLabel}, ${selectedTaskSourceLabel}`} tabIndex={0}>
-              {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} onSchedule={openTaskSchedule} />)}
-              {shownHermesTasks.map((task) => {
-                const projected = hermesTaskProjection(task, todayDate, hermesTaskArea(task, data.listAreas) ?? "Personal");
-                return <TaskRow
-                  key={`hermes:${task.id}`}
-                  task={projected}
-                  plannedDate={projected.scheduledDate}
-                  onToggle={() => setHermesCompletionApproval(task)}
-                  onEdit={() => openHermesTaskEditor(task)}
-                  onSchedule={() => openHermesTaskEditor(task)}
-                  toggleDisabled={task.status === "done" || task.status === "running" ||
-                    hermes.feed?.state === "stale" || hermes.feed?.completionAvailable === false}
-                  toggleBusy={hermesCompletionPending === task.id}
-                  sourceBadge={<><em className="source-chip source-chip--hermes" title={task.sourceProvider === "google" ? `Managed in Hermes · From Google Tasks · ${task.source}` : `Managed in Hermes · ${task.source}`}>{task.sourceProvider === "google" ? "Hermes · Google Tasks" : `Hermes · ${task.source}`}</em><em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>{task.status === "done" && task.sourceProvider === "google" && task.sourceStatus && task.sourceStatus !== "completed" ? <em className="task-created">Google still open</em> : null}</>}
-                />;
-              })}
-              {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
-              {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "Nothing completed yet" : "Nothing here"}</strong><p>{taskFilter === "done" ? "Completed tasks will show up here." : "Try another area or source, or add a task."}</p></div> : null}
-            </div>
-          </article>
-          </div>
+  function renderTodayView() {
+    const openReviewItems = reviewItems.filter((item) => item.status !== "handled").slice(0, 3);
 
-          <div className="lifeboard-column lifeboard-column--review">
-          <article className="pane lifeboard-review" id="review">
-            <PaneHeader eyebrow={reviewCount ? `${reviewCount} to review` : "Nothing waiting"} title="Inbox" />
-            <div className="review-workbench">
-              <div className="inbox-list inbox-list--lifeboard">
-                {reviewItems.map((item) => (
-                  <div className={`inbox-list-row${item.status === "handled" ? " inbox-list-row--handled" : ""}`} key={item.id}>
-                    <button
-                      className={`inbox-list-item${selectedInbox?.id === item.id ? " inbox-list-item--selected" : ""}`}
-                      type="button"
-                      aria-pressed={selectedInbox?.id === item.id}
-                      onClick={() => selectInbox(item)}
-                    >
-                      <span className={`calendar-event-mark calendar-event-mark--${areaClass(item.accent)}`} />
-                      <span><strong>{item.title}</strong><small>{item.source}</small></span>
-                      <span className={`review-status review-status--${item.status}`}>{formatStatus(item.status)}</span>
-                    </button>
-                    <button className={`inbox-complete${item.status === "handled" ? " inbox-complete--done" : ""}`} type="button" onClick={() => toggleInboxHandled(item)} aria-label={`${item.status === "handled" ? "Return" : "Mark"} ${item.title} ${item.status === "handled" ? "to review" : "as handled"}`}>{item.status === "handled" ? <Check size={13} /> : <Circle size={15} />}</button>
-                  </div>
-                ))}
-                {!reviewItems.length ? <p className="empty-line">Inbox is clear.</p> : null}
-              </div>
-              {selectedInbox ? (
-                <div className="review-detail">
-                  <div className="review-queue-nav">
-                    <span>{selectedInboxIndex + 1} of {reviewItems.length}</span>
-                    <div><button type="button" onClick={() => moveInboxSelection(-1)} disabled={selectedInboxIndex <= 0} aria-label="Previous review item"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveInboxSelection(1)} disabled={selectedInboxIndex >= reviewItems.length - 1} aria-label="Next review item"><ChevronRight size={14} /></button></div>
-                  </div>
-                  <div className="review-item-meta">
-                    <i className={`area-dot area-dot--${areaClass(selectedInbox.accent)}`} />
-                    <span>{selectedInbox.actor}</span>
-                    <span className={`review-status review-status--${selectedInbox.status}`}>{formatStatus(selectedInbox.status)}</span>
-                  </div>
-                  <h3>{selectedInbox.title}</h3>
-                  <p>{selectedInbox.summary}</p>
-                  <p className="review-source">{selectedInbox.source}</p>
-                  {selectedInbox.draft ? <div className="saved-draft"><span>Draft · not sent</span><pre>{selectedInbox.draft}</pre></div> : null}
-                  {selectedInbox.moreWork ? <div className="saved-request"><span>Note for Hermes · not delivered</span><p>{selectedInbox.moreWork}</p></div> : null}
-                  {selectedInbox.status === "handled" ? <div className="review-detail-actions"><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><RotateCcw size={13} /> Return to review</button></div> : <div className="review-detail-actions">
-                    <button className="page-primary-action" type="button" onClick={() => acceptInbox("task")}><ListTodo size={13} /> Create task</button>
-                    <button className="secondary-action" type="button" onClick={() => openDraft(selectedInbox)}><Pencil size={13} /> Draft reply</button>
-                    <button className="secondary-action" type="button" onClick={() => acceptInbox("event")}><CalendarDays size={13} /> Schedule block</button>
-                    <button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><CheckCircle2 size={13} /> No action</button>
-                  </div>}
-                  <details className="agent-request agent-request--compact">
-                    <summary>Note for Hermes</summary>
-                    <textarea id="more-work" aria-label="Note for Hermes" value={agentRequest} onChange={(event) => setAgentRequest(event.target.value)} placeholder="What should Hermes check or change later?" />
-                    <button className="quiet-panel-action" type="button" onClick={saveMoreWork}>Save note</button>
-                  </details>
-                </div>
-              ) : null}
-            </div>
-          </article>
-          <aside className="pane lifeboard-signals" id="signals">
-            <PaneHeader eyebrow="Sources and sync" title="Connections" />
-            <div className="control-list">
-              <button className="control-row control-row--button" type="button" onClick={() => setShowIntegrations(true)}>
-                <span className="control-icon control-icon--blue"><Link2 size={14} /></span>
-                <span><strong>Google &amp; Microsoft</strong><small>Calendars and tasks</small></span>
-                <ChevronRight className="control-arrow" size={14} />
-              </button>
-              <button className="control-row control-row--button" type="button" onClick={() => scrollToSection("tasks")}>
-                <span className="control-icon control-icon--stone"><Bot size={14} /></span>
-                <span><strong>Hermes</strong><small>{initial ? hermes.feed?.state === "connected" ? `${activeHermesTaskCount} active tasks` : hermes.feed?.state === "stale" ? `${activeHermesTaskCount} active · sync delayed` : hermes.loading ? "Checking board…" : hermes.failed ? "Could not refresh" : "Not connected" : "Preview only"}</small></span>
-                <ChevronRight className="control-arrow" size={14} />
-              </button>
-              <button className="control-row control-row--button" type="button" onClick={() => setShowReminderTray(true)}>
-                <span className="control-icon control-icon--amber"><Bell size={14} /></span>
-                <span><strong>Reminders</strong><small>{reminderCount ? `${reminderCount} saved` : "None saved"} · {pushSubscribed ? "device notifications on" : "while open"}</small></span>
-                <ChevronRight className="control-arrow" size={14} />
-              </button>
-            </div>
-          </aside>
+    return <section className="workspace-page workspace-page--today" aria-labelledby="today-heading">
+      <header className="workspace-heading today-heading">
+        <div>
+          <p className="eyebrow">{formatDublinDateKey(todayDate, { weekday: "long", day: "numeric", month: "long" })}</p>
+          <h1 id="today-heading">Today</h1>
+          <p>A short view of what needs your attention now.</p>
+        </div>
+      </header>
+
+      {initial && hermes.failed ? <p className="workspace-alert"><Bot size={14} /> Hermes could not refresh. Your Fox Focus tasks are still available.</p> : null}
+
+      <div className="today-grid">
+        <article className="pane today-card today-card--schedule">
+          <PaneHeader eyebrow="Calendar" title={currentEvent ? "Now and next" : "Next today"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("agenda")}>Full calendar <ChevronRight size={12} /></button>} />
+          <div className="today-event-list">
+            {todayFocusEvents.map((event, index) => <button className="today-event-row" type="button" key={event.id} onClick={() => openTodayEvent(event)}>
+              <time dateTime={event.startsAt ?? eventTimeValue(event)}><span>{event.id === currentEvent?.id ? "Now" : index === 0 ? "Next" : "Then"}</span><strong>{eventTimeValue(event)}</strong></time>
+              <i className={`calendar-event-mark calendar-event-mark--${areaClass(event.area)}`} />
+              <span><strong>{event.title}</strong><small>{event.subtitle || `${formatDuration(event.duration)} · ${event.area}`}</small></span>
+              <ChevronRight size={14} />
+            </button>)}
+            {!todayFocusEvents.length ? <div className="today-empty"><CalendarDays size={17} /><span><strong>Nothing else on today</strong><small>Add a block only if it helps.</small></span></div> : null}
           </div>
-        </section>
-      </>
-    );
+        </article>
+
+        <article className="pane today-card today-card--tasks">
+          <PaneHeader eyebrow="Attention" title={attentionTasks.length ? `${attentionTasks.length} task${attentionTasks.length === 1 ? "" : "s"}` : "All clear"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("tasks")}>All tasks <ChevronRight size={12} /></button>} />
+          <div className="task-browser-list today-task-list">
+            {attentionTasks.map((task) => <TaskRow compact key={task.id} task={task} dueLabel={taskDeadlineLabel(task, todayDate)} latestAction={latestActionByTask.get(task.id)} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} />)}
+            {!attentionTasks.length ? <div className="today-empty"><CheckCircle2 size={17} /><span><strong>No open local tasks</strong><small>Add one when something comes up.</small></span></div> : null}
+          </div>
+        </article>
+
+        <article className="pane today-card today-card--due">
+          <PaneHeader eyebrow="Due soon" title="What is coming" />
+          <div className="today-stat-list">
+            <button type="button" onClick={() => { selectTaskFilter("due-today"); openWorkspaceView("tasks"); }}><span>Today</span><strong>{dueTodayCount}</strong></button>
+            <button type="button" onClick={() => { selectTaskFilter("open"); openWorkspaceView("tasks"); }}><span>Tomorrow</span><strong>{dueTomorrowCount}</strong></button>
+            <button type="button" onClick={() => { selectTaskFilter("waiting"); openWorkspaceView("tasks"); }}><span>Waiting</span><strong>{waitingTaskCount}</strong></button>
+          </div>
+        </article>
+
+        <article className="pane today-card today-card--inbox">
+          <PaneHeader eyebrow="Inbox" title={reviewCount ? `${reviewCount} decision${reviewCount === 1 ? "" : "s"}` : "Nothing waiting"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("review")}>Open Inbox <ChevronRight size={12} /></button>} />
+          <div className="today-inbox-list">
+            {openReviewItems.map((item) => <button type="button" key={item.id} onClick={() => openTodayInbox(item)}><i className={`area-dot area-dot--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><ChevronRight size={14} /></button>)}
+            {!openReviewItems.length ? <div className="today-empty"><Inbox size={17} /><span><strong>Inbox is clear</strong><small>New proposals will appear here.</small></span></div> : null}
+          </div>
+        </article>
+      </div>
+
+      <div className="today-tools" aria-label="Workspace tools">
+        <button type="button" onClick={() => setShowIntegrations(true)}><Link2 size={14} /><span>Sources</span></button>
+        <button type="button" onClick={() => setShowReminderTray(true)}><Bell size={14} /><span>Reminders</span>{reminderCount ? <b>{reminderCount}</b> : null}</button>
+      </div>
+    </section>;
+  }
+
+  function renderCalendarView() {
+    return <section className="workspace-page workspace-page--calendar" aria-labelledby="calendar-heading">
+      <header className="workspace-heading">
+        <div><p className="eyebrow">Calendar / Dublin time</p><h1 id="calendar-heading">Calendar</h1><p>See your time, then add a local block when it is useful.</p></div>
+        <button className="page-primary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Add block</button>
+      </header>
+      <article className="pane calendar-workspace">
+        <PaneHeader eyebrow={calendarMode === "day" ? "Selected day" : "Seven day view"} title={calendarMode === "day" ? formatDublinDateKey(selectedDate) : "Upcoming seven days"} />
+        <div className="calendar-view-bar">
+          <div className="calendar-view-switch" role="group" aria-label="Calendar view">
+            <button className={calendarMode === "day" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "day"} onClick={() => setCalendarMode("day")}><CalendarDays size={13} /> Day</button>
+            <button className={calendarMode === "upcoming" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "upcoming"} onClick={() => setCalendarMode("upcoming")}><CalendarRange size={13} /> Upcoming</button>
+          </div>
+          <button className="calendar-today-action" type="button" onClick={returnCalendarToToday} disabled={selectedDate === todayDate && calendarMode === "day"}>Today</button>
+          <span className="calendar-range-copy">{calendarMode === "day" ? `${visibleCalendarEvents.length} local block${visibleCalendarEvents.length === 1 ? "" : "s"}` : `${formatDublinDateKey(calendarRangeStart, { day: "numeric", month: "short" })} to ${formatDublinDateKey(calendarRangeEnd, { day: "numeric", month: "short" })}`}</span>
+        </div>
+        <div className="calendar-date-shell">
+          <button className="calendar-step" type="button" onClick={() => moveCalendarDate(-1)} aria-label="Previous day"><ChevronLeft size={16} /></button>
+          <div className="calendar-date-strip" role="tablist" aria-label="Choose a day">
+            {calendarDays.map((date, index) => {
+              const localCount = sortedEvents.filter((event) => eventDateKey(event, todayDate) === date).length;
+              const fullLabel = formatDublinDateKey(date, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+              return <button className={`calendar-date-tab${date === selectedDate ? " calendar-date-tab--selected" : ""}${date === todayDate ? " calendar-date-tab--today" : ""}`} id={`calendar-date-${date}`} key={date} type="button" role="tab" aria-controls="calendar-day-panel" aria-current={date === todayDate ? "date" : undefined} aria-label={`${fullLabel}${date === todayDate ? ", today" : ""}, ${localCount} local ${localCount === 1 ? "block" : "blocks"}`} aria-selected={date === selectedDate} tabIndex={date === selectedDate ? 0 : -1} ref={(element) => { calendarTabRefs.current[index] = element; }} onClick={() => selectCalendarDate(date)} onKeyDown={(event) => handleCalendarTabKeyDown(event, index)}>
+                <span>{formatDublinDateKey(date, { weekday: "short" })}</span><strong>{formatDublinDateKey(date, { day: "numeric" })}</strong><small>{date === todayDate ? "Today" : localCount ? `${localCount} local` : "No local"}</small>
+              </button>;
+            })}
+          </div>
+          <button className="calendar-step" type="button" onClick={() => moveCalendarDate(1)} aria-label="Next day"><ChevronRight size={16} /></button>
+        </div>
+        {initial ? <IntegrationCalendarContext overviewState={integrations} onOpen={() => setShowIntegrations(true)} startDate={calendarRangeStart} endDate={calendarRangeEnd} /> : null}
+        {activeBlock ? <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}><div className="active-block-copy"><span className="live-label"><span /> Local block in this view</span><strong>{activeBlock.title}</strong><small>{eventTimeValue(activeBlock)} · {formatDuration(activeBlock.duration)} · {activeBlock.taskId ? "linked task" : "local block"}</small></div><button className="open-note" type="button" onClick={() => setSelectedEventId(activeBlock.id)}>Inspect <ChevronRight size={12} /></button></div> : null}
+        <div className="schedule-list agenda-list" id="calendar-day-panel" role="tabpanel" aria-labelledby={`calendar-date-${selectedDate}`}>
+          {calendarMode === "day" ? visibleCalendarEvents.map((event) => renderScheduleRow(event)) : calendarDateWindow(selectedDate, 0, 6).map((date) => {
+            const dayEvents = visibleCalendarEvents.filter((event) => eventDateKey(event, todayDate) === date);
+            if (!dayEvents.length) return null;
+            return <section className="agenda-day-group" key={date}><button className="agenda-day-heading" type="button" onClick={() => selectCalendarDate(date)}><span>{date === todayDate ? "Today" : formatDublinDateKey(date, { weekday: "long" })}</span><strong>{formatDublinDateKey(date, { day: "numeric", month: "long" })}</strong><ChevronRight size={13} /></button>{dayEvents.map((event) => renderScheduleRow(event, true))}</section>;
+          })}
+          {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>{calendarMode === "day" ? "No local blocks on this day." : "No local blocks in these seven days."}</span></div> : null}
+        </div>
+        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button> : <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>}</div></div> : null}
+      </article>
+    </section>;
+  }
+
+  function renderTasksView() {
+    return <section className="workspace-page workspace-page--tasks" aria-labelledby="tasks-heading">
+      <header className="workspace-heading"><div><p className="eyebrow">Your work</p><h1 id="tasks-heading">Tasks</h1><p>Everything stays visible here. Complete with the checkbox or open a task to change it.</p></div><button className="page-primary-action" type="button" onClick={() => openTaskComposer()}><Plus size={13} /> Add task</button></header>
+      <article className="pane tasks-workspace">
+        {initial && hermes.failed ? <p className="task-sync-note task-sync-note--warning"><Bot size={13} /> Hermes could not refresh. Fox Focus tasks are unaffected.</p> : initial && hermes.loading && !hermesBoard ? <p className="task-sync-note"><Bot size={13} /> Checking Hermes tasks…</p> : null}
+        <nav className="task-category-strip" aria-label="Task categories">{taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}</nav>
+        {hermesBoard && (taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory) && taskFilter !== "all" && taskFilter !== "open" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks appear in All, Open, or Done because they do not have Fox Focus deadlines yet.</p> : null}
+        <div className="task-compact-toolbar">
+          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
+          <span className="task-view-count" role="status" aria-live="polite">{shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
+          {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
+        </div>
+        <p className="planned-note"><CalendarDays size={13} /> {plannedTaskCount ? `${plannedTaskCount} planned task${plannedTaskCount === 1 ? "" : "s"} on the local calendar.` : "Open a task to give it calendar time."}</p>
+        <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`}>
+          {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} dueLabel={taskDeadlineLabel(task, todayDate)} latestAction={latestActionByTask.get(task.id)} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} />)}
+          {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} busy={adoptingHermesId === task.id} onAdopt={(candidate) => void previewHermesAdoption(candidate)} />)}
+          {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Change the category or filters, or add a task."}</p></div> : null}
+        </div>
+      </article>
+    </section>;
+  }
+
+  function renderReviewView() {
+    return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
+      <header className="workspace-heading"><div><p className="eyebrow">One decision at a time</p><h1 id="review-heading">Inbox</h1><p>Turn a proposal into a task, a calendar block, a draft, or nothing.</p></div><span className="review-page-count">{reviewCount} open</span></header>
+      <article className="pane review-workspace">
+        <div className="review-workbench">
+          <div className="inbox-list inbox-list--lifeboard">
+            {reviewItems.map((item) => <div className={`inbox-list-row${item.status === "handled" ? " inbox-list-row--handled" : ""}`} key={item.id}><button className={`inbox-list-item${selectedInbox?.id === item.id ? " inbox-list-item--selected" : ""}`} type="button" aria-pressed={selectedInbox?.id === item.id} onClick={() => selectInbox(item)}><span className={`calendar-event-mark calendar-event-mark--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><span className={`review-status review-status--${item.status}`}>{formatStatus(item.status)}</span></button><button className={`inbox-complete${item.status === "handled" ? " inbox-complete--done" : ""}`} type="button" onClick={() => toggleInboxHandled(item)} aria-label={`${item.status === "handled" ? "Return" : "Mark"} ${item.title} ${item.status === "handled" ? "to review" : "as handled"}`}>{item.status === "handled" ? <Check size={13} /> : <Circle size={15} />}</button></div>)}
+            {!reviewItems.length ? <p className="empty-line">Inbox is clear.</p> : null}
+          </div>
+          {selectedInbox ? <div className="review-detail"><div className="review-queue-nav"><span>{selectedInboxIndex + 1} of {reviewItems.length}</span><div><button type="button" onClick={() => moveInboxSelection(-1)} disabled={selectedInboxIndex <= 0} aria-label="Previous review item"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveInboxSelection(1)} disabled={selectedInboxIndex >= reviewItems.length - 1} aria-label="Next review item"><ChevronRight size={14} /></button></div></div><div className="review-item-meta"><i className={`area-dot area-dot--${areaClass(selectedInbox.accent)}`} /><span>{selectedInbox.actor}</span><span className={`review-status review-status--${selectedInbox.status}`}>{formatStatus(selectedInbox.status)}</span></div><h3>{selectedInbox.title}</h3><p>{selectedInbox.summary}</p><div className="evidence-card evidence-card--compact"><span>Source evidence</span><strong>{selectedInbox.source}</strong><p>No connected email body is available in this review surface.</p></div>{selectedInbox.draft ? <div className="saved-draft"><span>Saved draft · not sent</span><pre>{selectedInbox.draft}</pre></div> : null}{selectedInbox.moreWork ? <div className="saved-request"><span>Feedback note · not delivered</span><p>{selectedInbox.moreWork}</p></div> : null}<div className="review-next-step"><span>Choose the next step</span><p>Local outcomes happen now. Nothing is sent back to its source.</p></div>{selectedInbox.status === "handled" ? <div className="review-detail-actions"><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><RotateCcw size={13} /> Return to review</button></div> : <div className="review-detail-actions"><button className="page-primary-action" type="button" onClick={() => acceptInbox("task")}><ListTodo size={13} /> Create task</button><button className="secondary-action" type="button" onClick={() => openDraft(selectedInbox)}><Pencil size={13} /> Draft reply</button><button className="secondary-action" type="button" onClick={() => acceptInbox("event")}><CalendarDays size={13} /> Schedule block</button><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><CheckCircle2 size={13} /> No action</button></div>}<div className="agent-request agent-request--compact"><label htmlFor="more-work">Feedback note</label><textarea id="more-work" value={agentRequest} onChange={(event) => setAgentRequest(event.target.value)} placeholder="What should Hermes check or change later?" /><button className="quiet-panel-action" type="button" onClick={saveMoreWork}>Save note</button></div></div> : null}
+        </div>
+      </article>
+    </section>;
+  }
+
+  function renderWorkspaceView() {
+    if (activeSection === "agenda") return renderCalendarView();
+    if (activeSection === "tasks") return renderTasksView();
+    if (activeSection === "review") return renderReviewView();
+    return renderTodayView();
   }
 
   const taskModal = modal?.kind === "task" ? modal : null;
   const eventModal = modal?.kind === "event" ? modal : null;
   const draftModal = modal?.kind === "draft" ? modal : null;
   const editingHermesTask = hermesTasks.find(task => task.id === editingHermesTaskId) ?? null;
+  const modalTask = taskModal?.taskId ? data.tasks.find((task) => task.id === taskModal.taskId) : null;
+  const modalTaskAction = modalTask ? latestActionByTask.get(modalTask.id) : undefined;
+  const modalTaskGoogleLink = modalTask?.externalLinks?.find(link => link.provider === "google_tasks");
   const modalInbox = taskModal?.inboxId
     ? data.inboxItems.find((item) => item.id === taskModal.inboxId)
     : eventModal?.inboxId
       ? data.inboxItems.find((item) => item.id === eventModal.inboxId)
       : null;
+  const actionBeforeGoogle = taskActionPreview && isRecord(taskActionPreview.before.google) ? taskActionPreview.before.google : null;
+  const actionAfterGoogle = taskActionPreview && isRecord(taskActionPreview.after.google) ? taskActionPreview.after.google : null;
+  const actionBeforeFox = taskActionPreview && isRecord(taskActionPreview.before.foxFocus) ? taskActionPreview.before.foxFocus : null;
+  const actionAfterFox = taskActionPreview && isRecord(taskActionPreview.after.foxFocus) ? taskActionPreview.after.foxFocus : null;
 
   return (
     <div className="control-room">
@@ -1709,11 +1977,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <span className="fox-mark" aria-hidden="true"><span /><span /></span>
           <div><strong>Fox Focus</strong></div>
         </div>
-        <nav className="workspace-nav" aria-label="Jump to a section">
-          <button className={activeSection === "today" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "today"} onClick={() => scrollToSection("today")}><Clock3 size={14} /><span>Today</span></button>
-          <button className={activeSection === "agenda" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "agenda"} onClick={() => scrollToSection("agenda")}><CalendarDays size={14} /><span>Agenda</span></button>
-          <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "tasks"} onClick={() => scrollToSection("tasks")}><ListTodo size={14} /><span>Tasks</span></button>
-          <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-pressed={activeSection === "review"} onClick={() => scrollToSection("review")}><Inbox size={14} /><span>Review</span><b>{reviewCount}</b></button>
+        <nav className="workspace-nav" aria-label="Workspace views">
+          <button className={activeSection === "today" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "today" ? "page" : undefined} onClick={() => openWorkspaceView("today")}><Clock3 size={14} /><span>Today</span></button>
+          <button className={activeSection === "agenda" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "agenda" ? "page" : undefined} onClick={() => openWorkspaceView("agenda")}><CalendarDays size={14} /><span>Calendar</span></button>
+          <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "tasks" ? "page" : undefined} onClick={() => openWorkspaceView("tasks")}><ListTodo size={14} /><span>Tasks</span></button>
+          <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => openWorkspaceView("review")}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
         </nav>
         <div className="command-actions">
           <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
@@ -1727,7 +1995,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <p>{saveError ?? statusMessage}</p>
         {completionUndo ? <button className="status-undo" type="button" onClick={undoTaskCompletion}>Undo</button> : reviewUndo ? <button className="status-undo" type="button" onClick={undoInboxChange}>Undo</button> : null}
       </div> : null}
-      <main aria-hidden={isOverlayOpen}>{renderLifeboard()}</main>
+      <main aria-hidden={isOverlayOpen}>{renderWorkspaceView()}</main>
 
       {hermesCompletionApproval ? (
         <DialogFrame title="Confirm Hermes completion" onClose={() => setHermesCompletionApproval(null)} className="editor-dialog--confirmation">
@@ -1781,9 +2049,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             </div>
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
             {modalInbox ? <div className="source-notice"><Inbox size={14} /> Accepting from <strong>{modalInbox.source}</strong>. It will stay on the created task.</div> : null}
+            {modalTaskGoogleLink ? <div className="source-notice"><Link2 size={14} /> Fox Focus owns this task. Its existing Google task can only be completed or reopened after a preview.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
+            {modalTaskAction && modalTaskAction.status !== "succeeded" ? <div className={`task-action-notice task-action-notice--${modalTaskAction.status}`}><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.lastError ?? "The approved Google update is still being checked."}</span></div> : null}
             <div className="editor-grid editor-grid--quick-task">
               <label className="field field--full"><span>Task</span><input autoFocus required value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
-              <label className="field field--full"><span>Deadline</span><select value={taskDraft.due} onChange={(event) => setTaskDraft((current) => ({ ...current, due: event.target.value }))}><option value="Today">Today</option><option value="Tomorrow">Tomorrow</option><option value="Friday">Friday</option><option value="Waiting">Waiting</option><option value="No deadline">No deadline</option></select></label>
+              <label className="field field--full"><span>Deadline</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
             {showTaskDetails ? <div className="editor-grid editor-grid--task-details" id="task-more-options">
@@ -1795,7 +2065,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Planned time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
               <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
             </div> : null}
-            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div><button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
+            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{modalTaskAction?.status === "failed" && modalTaskAction.result?.retryable === true ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Retry Google</button> : null}{modalTaskAction?.status === "running" ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Check Google</button> : null}{modalTask && modalTaskGoogleLink && (modalTaskAction?.status === "failed" || modalTaskAction?.status === "conflict") ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void previewLinkedTaskAction(modalTask, modalTask.completed ? "completed" : "open"); }}><Link2 size={13} /> Send current state</button> : null}{modalTaskAction?.status === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Refresh Google</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -1859,7 +2129,38 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </DialogFrame>
       ) : null}
 
-      <IntegrationsDrawer open={showIntegrations} onClose={() => setShowIntegrations(false)} overviewState={integrations} listAreas={data.listAreas} onListAreaChange={changeListArea} />
+      {taskActionPreview ? (
+        <DialogFrame title="Confirm linked task change" onClose={() => { if (!taskActionBusy) setTaskActionPreview(null); }} className="editor-dialog--alert">
+          <div className="editor-heading"><div className="composer-icon"><Link2 size={17} /></div><div><p className="eyebrow">Exact Google change</p><h2>{taskActionPreview.desiredState === "completed" ? "Complete linked task?" : "Reopen linked task?"}</h2></div><button className="close-composer" type="button" disabled={taskActionBusy} onClick={() => setTaskActionPreview(null)} aria-label="Cancel linked task change"><X size={17} /></button></div>
+          <div className="task-action-preview">
+            <div><span>Before</span><strong>{String(actionBeforeGoogle?.title ?? actionBeforeFox?.title ?? "Linked task")}</strong><small>Fox Focus: {String(actionBeforeFox?.state ?? "unknown")} · Google: {String(actionBeforeGoogle?.state ?? "unknown")}</small><small>{String(actionBeforeGoogle?.connection ?? "Current Google connection")} · {String(actionBeforeGoogle?.list ?? "task list")}</small><small>Task {String(actionBeforeGoogle?.taskId ?? "unknown")} · ETag {String(actionBeforeGoogle?.version ?? "unknown")}</small></div>
+            <ChevronRight size={16} aria-hidden="true" />
+            <div><span>After</span><strong>{String(actionAfterGoogle?.title ?? actionAfterFox?.title ?? "Linked task")}</strong><small>Fox Focus: {String(actionAfterFox?.state ?? taskActionPreview.desiredState)} · Google: {String(actionAfterGoogle?.state ?? "unknown")}</small><small>Same connection, list, task ID, and ETag shown at left.</small></div>
+          </div>
+          <p className="draft-context">Fox Focus changes first and keeps that result even if Google is unavailable. This approval cannot create, delete, or clear Google tasks.</p>
+          <div className="alert-actions"><button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => setTaskActionPreview(null)}>Cancel</button><button className="submit-button" type="button" disabled={taskActionBusy} onClick={() => void executeTaskAction(taskActionPreview, false)}>{taskActionBusy ? "Confirming…" : taskActionPreview.desiredState === "completed" ? "Complete both" : "Reopen both"}</button></div>
+        </DialogFrame>
+      ) : null}
+
+      {hermesAdoption ? (
+        <DialogFrame title="Adopt Hermes task" onClose={() => { if (!adoptingHermesId) setHermesAdoption(null); }} className="editor-dialog--alert">
+          <div className="editor-heading"><div className="composer-icon"><Bot size={17} /></div><div><p className="eyebrow">Legacy task handover</p><h2>Move this task home?</h2></div><button className="close-composer" type="button" disabled={Boolean(adoptingHermesId)} onClick={() => setHermesAdoption(null)} aria-label="Cancel task adoption"><X size={17} /></button></div>
+          <div className="task-action-preview"><div><span>Before</span><strong>Hermes owns it</strong><small>{String(hermesAdoption.before.state ?? "open")} · {String(hermesAdoption.before.source ?? "Unsorted")}</small></div><ChevronRight size={16} aria-hidden="true" /><div><span>After</span><strong>Fox Focus owns it</strong><small>{hermesAdoption.after.title} · Hermes link kept as provenance</small></div></div>
+          <p className="draft-context">Approving this is the cutover for this task. Fox Focus becomes its working home, while Hermes is unchanged and remains canonical for every task not adopted.</p>
+          <div className="alert-actions"><button className="secondary-action" type="button" disabled={Boolean(adoptingHermesId)} onClick={() => setHermesAdoption(null)}>Cancel</button><button className="submit-button" type="button" disabled={Boolean(adoptingHermesId)} onClick={() => void approveHermesAdoption()}>{adoptingHermesId ? "Adopting…" : "Adopt into Fox Focus"}</button></div>
+        </DialogFrame>
+      ) : null}
+
+      <IntegrationsDrawer
+        open={showIntegrations}
+        onClose={() => setShowIntegrations(false)}
+        overviewState={integrations}
+        listAreas={data.listAreas}
+        onListAreaChange={changeListArea}
+        beforeWorkspaceMutation={waitForWorkspaceSaves}
+        onWorkspaceChanged={applyServerSnapshot}
+        localTasks={data.tasks}
+      />
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import {
   OAuthSecurityError,
   createOAuthAuthorizationRequest,
@@ -23,25 +24,29 @@ import {
   listMicrosoftCalendars,
   listMicrosoftTodoLists,
   listMicrosoftTodoTasks,
+  updateGoogleTaskStatus,
   type ImportedCalendar,
   type ImportedCalendarEvent,
   type ImportedTask,
   type ProviderReadFailure,
   type ProviderReadResult,
 } from './providers.ts';
-import type {
-  ConnectionSummary,
-  ImportedRecord,
-  Provider,
-  StoredConnection,
-  Store,
-  SyncSummary,
+import {
+  TASK_ACTION_LEASE_MS,
+  type ConnectionSummary,
+  type ImportedRecord,
+  type Provider,
+  type StoredConnection,
+  type Store,
+  type SyncSummary,
 } from './store.ts';
+// Leave time for response handling and the final SQLite write before recovery.
+const DEFAULT_TASK_ACTION_TIMEOUT_MS = TASK_ACTION_LEASE_MS - 30_000;
 
 const googleScopes = [
   'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
   'https://www.googleapis.com/auth/calendar.events.readonly',
-  'https://www.googleapis.com/auth/tasks.readonly',
+  'https://www.googleapis.com/auth/tasks',
 ] as const;
 
 const microsoftScopes = [
@@ -72,6 +77,7 @@ export type IntegrationConfig = {
   now?: () => Date;
   syncWindowPastDays?: number;
   syncWindowFutureDays?: number;
+  taskActionTimeoutMs?: number;
 };
 
 export type IntegrationProviderStatus = {
@@ -98,6 +104,17 @@ export type SyncResult =
   | { outcome: 'synced'; recordCount: number }
   | { outcome: 'failed'; notice: string };
 
+export type GoogleTaskWriteResult =
+  | {
+      outcome: 'succeeded';
+      sourceStatus: string;
+      sourceVersion: string;
+      sourceUpdatedAt: string | null;
+      completedAt: string | null;
+    }
+  | { outcome: 'conflict'; notice: string }
+  | { outcome: 'failed'; notice: string; retryable: boolean };
+
 type TokenExchangeResult =
   | { kind: 'ok'; tokens: OAuthTokenSet }
   | { kind: 'failed'; needsReconnect: boolean };
@@ -107,6 +124,7 @@ type RuntimeConfig = IntegrationConfig & {
   now: () => Date;
   syncWindowPastDays: number;
   syncWindowFutureDays: number;
+  taskActionTimeoutMs: number;
 };
 
 class SyncFailure extends Error {
@@ -118,6 +136,8 @@ class SyncFailure extends Error {
     this.needsReconnect = needsReconnect;
   }
 }
+
+class ConnectionChanged extends Error {}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -242,8 +262,12 @@ function normalizeConfig(config: IntegrationConfig): RuntimeConfig {
   if (!baseUrl || !isOAuthTokenMasterKey(config.tokenMasterKey)) throw new Error('Invalid integration configuration');
   const past = config.syncWindowPastDays ?? 14;
   const future = config.syncWindowFutureDays ?? 90;
+  const taskActionTimeoutMs = config.taskActionTimeoutMs ?? DEFAULT_TASK_ACTION_TIMEOUT_MS;
   if (!Number.isSafeInteger(past) || past < 0 || past > 366 || !Number.isSafeInteger(future) || future < 1 || future > 366) {
     throw new Error('Invalid integration sync window');
+  }
+  if (!Number.isSafeInteger(taskActionTimeoutMs) || taskActionTimeoutMs < 1 || taskActionTimeoutMs > DEFAULT_TASK_ACTION_TIMEOUT_MS) {
+    throw new Error('Invalid task action timeout');
   }
   return {
     ...config,
@@ -253,6 +277,7 @@ function normalizeConfig(config: IntegrationConfig): RuntimeConfig {
     now: config.now ?? (() => new Date()),
     syncWindowPastDays: past,
     syncWindowFutureDays: future,
+    taskActionTimeoutMs,
   };
 }
 
@@ -278,11 +303,26 @@ function connectionToken(
   try {
     return {
       connection,
-      tokens: openOAuthTokenSet(connection.tokenEnvelope, config.tokenMasterKey, { provider, connectionId: provider }),
+      tokens: openOAuthTokenSet(connection.tokenEnvelope, config.tokenMasterKey, { provider, connectionId: connection.connectionId }),
     };
   } catch {
-    store.markConnectionNeedsReconnect(provider, 'Stored authorization needs reconnection.');
-    return null;
+    try {
+      // Before connection generations existed, the provider name was the AAD
+      // connection identifier. Open that authenticated legacy envelope once,
+      // then immediately bind it to the migrated generation identifier.
+      const tokens = openOAuthTokenSet(connection.tokenEnvelope, config.tokenMasterKey, { provider, connectionId: provider });
+      const migratedConnection = {
+        ...connection,
+        tokenEnvelope: serializeOAuthTokenEnvelope(
+          sealOAuthTokenSet(tokens, config.tokenMasterKey, { provider, connectionId: connection.connectionId }),
+        ),
+      };
+      store.saveConnection(migratedConnection);
+      return { connection: migratedConnection, tokens };
+    } catch {
+      store.markConnectionNeedsReconnect(provider, 'Stored authorization needs reconnection.');
+      return null;
+    }
   }
 }
 
@@ -295,11 +335,13 @@ function recordToken(
   resetSyncHistory = false,
 ): StoredConnection {
   const now = config.now().toISOString();
+  const connectionId = resetSyncHistory || !existing ? randomUUID() : existing.connectionId;
   const tokenEnvelope = serializeOAuthTokenEnvelope(
-    sealOAuthTokenSet(tokens, config.tokenMasterKey, { provider, connectionId: provider }),
+    sealOAuthTokenSet(tokens, config.tokenMasterKey, { provider, connectionId }),
   );
   const connection: StoredConnection = {
     provider,
+    connectionId,
     state: 'connected',
     scopes: [...(tokens.scopes ?? providerConfig(config, provider)?.scopes ?? [])],
     tokenEnvelope,
@@ -316,6 +358,7 @@ async function tokenRequest(
   config: RuntimeConfig,
   provider: Provider,
   parameters: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<TokenExchangeResult> {
   const settings = providerConfig(config, provider);
   if (!settings) return { kind: 'failed', needsReconnect: false };
@@ -329,6 +372,7 @@ async function tokenRequest(
         client_secret: settings.clientSecret,
         ...parameters,
       }),
+      signal,
     });
   } catch {
     return { kind: 'failed', needsReconnect: false };
@@ -408,6 +452,8 @@ function taskRecord(
     dueOn: task.dueDate,
     completedAt: task.completedAt,
     sourceUpdatedAt: task.updatedAt,
+    sourceVersion: task.version,
+    completionWritable: provider === 'google' && task.completionWritable !== false,
     sourceUrl: null,
     sourceTimeZone: null,
   };
@@ -480,14 +526,24 @@ export type IntegrationService = {
   completeAuthorization: (provider: Provider, search: URLSearchParams) => Promise<OAuthCallbackResult>;
   sync: (provider: Provider) => Promise<SyncResult>;
   syncConnected: () => Promise<void>;
+  updateGoogleTaskCompletion: (input: {
+    connectionId: string;
+    containerId: string;
+    externalId: string;
+    desiredState: 'open' | 'completed';
+    expectedVersion?: string;
+  }) => Promise<GoogleTaskWriteResult>;
 };
 
 export function createIntegrationService(store: Store, input: IntegrationConfig): IntegrationService {
   const config = normalizeConfig(input);
-  const activeSyncs = new Map<Provider, Promise<SyncResult>>();
+  const activeSyncs = new Map<string, Promise<SyncResult>>();
 
   function overview(): IntegrationOverview {
-    const records = store.listProviderRecords();
+    const records = [
+      ...store.listProviderRecords(2_000, 'calendar_event'),
+      ...store.listProviderRecords(2_000, 'task'),
+    ];
     const connections = new Map(store.listConnections().map(connection => [connection.provider, connection]));
     return {
       providers: (['google', 'microsoft'] as const).map(provider => ({
@@ -496,8 +552,8 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
         configured: providerConfig(config, provider) !== null,
         connection: connections.get(provider) ?? null,
         sync: store.getSyncSummary(provider),
-        calendarEventCount: records.filter(record => record.provider === provider && record.kind === 'calendar_event').length,
-        taskCount: records.filter(record => record.provider === provider && record.kind === 'task').length,
+        calendarEventCount: store.countProviderRecords(provider, 'calendar_event'),
+        taskCount: store.countProviderRecords(provider, 'task'),
       })),
       records,
     };
@@ -583,10 +639,13 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
     }
   }
 
-  async function freshAccessToken(provider: Provider): Promise<string> {
+  async function freshAccessToken(provider: Provider, expectedConnectionId?: string, signal?: AbortSignal): Promise<{ accessToken: string; connectionId: string }> {
     const loaded = connectionToken(store, config, provider);
     if (!loaded) throw new SyncFailure(true);
-    if (!tokenNeedsRefresh(loaded.tokens, config.now())) return loaded.tokens.accessToken;
+    if (expectedConnectionId && loaded.connection.connectionId !== expectedConnectionId) throw new ConnectionChanged();
+    if (!tokenNeedsRefresh(loaded.tokens, config.now())) {
+      return { accessToken: loaded.tokens.accessToken, connectionId: loaded.connection.connectionId };
+    }
     if (!loaded.tokens.refreshToken) {
       store.markConnectionNeedsReconnect(provider, 'Provider authorization needs reconnection.');
       throw new SyncFailure(true);
@@ -594,7 +653,8 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
     const refreshed = await tokenRequest(config, provider, {
       grant_type: 'refresh_token',
       refresh_token: loaded.tokens.refreshToken,
-    });
+    }, signal);
+    if (store.getConnection(provider)?.connectionId !== loaded.connection.connectionId) throw new ConnectionChanged();
     if (refreshed.kind !== 'ok') {
       if (refreshed.needsReconnect) store.markConnectionNeedsReconnect(provider, 'Provider authorization needs reconnection.');
       throw new SyncFailure(refreshed.needsReconnect);
@@ -606,20 +666,28 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
     }
     const tokens = mergeOAuthTokenSets(loaded.tokens, refreshed.tokens);
     recordToken(store, config, provider, tokens, loaded.connection);
-    return tokens.accessToken;
+    return { accessToken: tokens.accessToken, connectionId: loaded.connection.connectionId };
   }
 
-  async function syncNow(provider: Provider): Promise<SyncResult> {
+  async function syncNow(provider: Provider, expectedConnectionId: string | null): Promise<SyncResult> {
     if (!providerConfig(config, provider)) return { outcome: 'failed', notice: 'This provider is not configured on the server.' };
     store.setSyncState(provider, 'syncing');
     try {
-      const accessToken = await freshAccessToken(provider);
+      if (!expectedConnectionId) throw new SyncFailure(true);
+      const grant = await freshAccessToken(provider, expectedConnectionId);
       const records = provider === 'google'
-        ? await syncGoogle(config, accessToken)
-        : await syncMicrosoft(config, accessToken);
-      const recordCount = store.replaceProviderRecords(provider, records);
+        ? await syncGoogle(config, grant.accessToken)
+        : await syncMicrosoft(config, grant.accessToken);
+      if (store.getConnection(provider)?.connectionId !== grant.connectionId) throw new ConnectionChanged();
+      const recordCount = store.replaceProviderRecords(provider, records.map(record => ({ ...record, connectionId: grant.connectionId })));
       return { outcome: 'synced', recordCount };
     } catch (error) {
+      if (error instanceof ConnectionChanged) {
+        return { outcome: 'failed', notice: `${providerNames[provider]} connection changed while an older refresh was running.` };
+      }
+      if (store.getConnection(provider)?.connectionId !== expectedConnectionId) {
+        return { outcome: 'failed', notice: `${providerNames[provider]} connection changed while an older refresh was running.` };
+      }
       const needsReconnect = error instanceof SyncFailure && error.needsReconnect;
       const notice = needsReconnect
         ? `${providerNames[provider]} needs to be reconnected.`
@@ -638,10 +706,12 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
   }
 
   function sync(provider: Provider): Promise<SyncResult> {
-    const current = activeSyncs.get(provider);
+    const connectionId = store.getConnection(provider)?.connectionId ?? null;
+    const key = `${provider}:${connectionId ?? 'none'}`;
+    const current = activeSyncs.get(key);
     if (current) return current;
-    const next = syncNow(provider).finally(() => activeSyncs.delete(provider));
-    activeSyncs.set(provider, next);
+    const next = syncNow(provider, connectionId).finally(() => activeSyncs.delete(key));
+    activeSyncs.set(key, next);
     return next;
   }
 
@@ -651,5 +721,80 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
       .map(async provider => { await sync(provider); }));
   }
 
-  return { overview, startAuthorization, completeAuthorization, sync, syncConnected };
+  async function updateGoogleTaskCompletion(input: {
+    connectionId: string;
+    containerId: string;
+    externalId: string;
+    desiredState: 'open' | 'completed';
+    expectedVersion?: string;
+  }): Promise<GoogleTaskWriteResult> {
+    const connection = store.getConnection('google');
+    if (!providerConfig(config, 'google') || !connection || connection.state !== 'connected') {
+      return { outcome: 'failed', notice: 'Google Tasks needs to be connected.', retryable: false };
+    }
+    if (connection.connectionId !== input.connectionId) {
+      return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
+    }
+    if (!connection.scopes.includes('https://www.googleapis.com/auth/tasks')) {
+      store.markConnectionNeedsReconnect('google', 'Reconnect Google to approve task completion updates.');
+      return { outcome: 'failed', notice: 'Reconnect Google before updating this linked task.', retryable: false };
+    }
+    try {
+      const signal = AbortSignal.timeout(config.taskActionTimeoutMs);
+      const grant = await freshAccessToken('google', input.connectionId, signal);
+      if (store.getConnection('google')?.connectionId !== input.connectionId) {
+        return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
+      }
+      const result = await updateGoogleTaskStatus(
+        { accessToken: grant.accessToken, fetch: config.fetch, signal },
+        {
+          taskListId: input.containerId,
+          taskId: input.externalId,
+          state: input.desiredState,
+          ...(input.expectedVersion ? { expectedEtag: input.expectedVersion } : {}),
+        },
+      );
+      if (store.getConnection('google')?.connectionId !== input.connectionId) {
+        return { outcome: 'conflict', notice: 'The Google connection changed while the approved update was running. Refresh and reconcile this task.' };
+      }
+      if (result.status === 'ok') {
+        return {
+          outcome: 'succeeded',
+          sourceStatus: result.value.task.sourceState,
+          sourceVersion: result.value.etag,
+          sourceUpdatedAt: result.value.task.updatedAt,
+          completedAt: result.value.task.completedAt,
+        };
+      }
+      if (result.status === 'conflict') {
+        return { outcome: 'conflict', notice: 'The Google task changed after it was imported. Refresh before trying again.' };
+      }
+      const needsReconnect = result.status === 'reauthorization-required' || result.status === 'permission-denied';
+      if (needsReconnect) store.markConnectionNeedsReconnect('google', 'Reconnect Google to update linked tasks.');
+      const retryable = ['network-error', 'rate-limited', 'remote-error'].includes(result.status);
+      return {
+        outcome: 'failed',
+        notice: needsReconnect
+          ? 'Reconnect Google before updating this linked task.'
+          : result.status === 'verification-failed'
+            ? 'Google accepted the change but the readback did not match. Refresh before retrying.'
+            : 'The Google task was not confirmed. Your Fox Focus task was kept.',
+        retryable,
+      };
+    } catch (error) {
+      if (error instanceof ConnectionChanged) {
+        return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
+      }
+      const needsReconnect = error instanceof SyncFailure && error.needsReconnect;
+      return {
+        outcome: 'failed',
+        notice: needsReconnect
+          ? 'Reconnect Google before updating this linked task.'
+          : 'Google could not be reached. Your Fox Focus task was kept.',
+        retryable: !needsReconnect,
+      };
+    }
+  }
+
+  return { overview, startAuthorization, completeAuthorization, sync, syncConnected, updateGoogleTaskCompletion };
 }

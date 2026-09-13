@@ -37,6 +37,31 @@ test("accepts valid optional creation instants and preserves legacy tasks", () =
   assert.equal(isTask(task("not-an-instant", { createdAt: "yesterday" })), false);
 });
 
+test("accepts native task provenance without making it mandatory", () => {
+  const linked = task("linked", {
+    origin: "migration",
+    deadlineDate: "2026-09-14",
+    externalLinks: [{
+      provider: "google_tasks",
+      containerId: "personal",
+      externalId: "source-task",
+      containerName: "Personal",
+      policy: "completion_only",
+      sourceStatus: "needsAction",
+      sourceVersion: "etag-1",
+      sourceUpdatedAt: "2026-09-11T10:00:00.000Z",
+      linkedAt: "2026-09-11T10:01:00.000Z",
+    }],
+  });
+  assert.equal(isTask(linked), true);
+  assert.equal(isTask({ ...linked, deadlineDate: "2026-02-30" }), false);
+  assert.equal(isTask({ ...linked, externalLinks: [{ ...linked.externalLinks![0], policy: "two_way" }] }), false);
+  assert.equal(isPrototypeData({
+    tasks: [linked, task("duplicate", { externalLinks: linked.externalLinks })],
+    events: [], inboxItems: [], reminders: [],
+  }), false);
+});
+
 test("orders due values using the existing UI semantics with deterministic ties", () => {
   const tasks = [
     task("no-deadline"),
@@ -48,6 +73,15 @@ test("orders due values using the existing UI semantics with deterministic ties"
   assert.deepEqual(tasks.sort(compareTasksByDue).map(({ id }) => id), [
     "today-a", "today-b", "tomorrow", "unknown", "no-deadline",
   ]);
+});
+
+test("orders exact deadline dates before legacy labels", () => {
+  const tasks = [
+    task("later", { due: "Today", deadlineDate: "2026-09-20" }),
+    task("earlier", { due: "Next week", deadlineDate: "2026-09-14" }),
+    task("legacy", { due: "Today" }),
+  ];
+  assert.deepEqual(tasks.sort(compareTasksByDue).map(({ id }) => id), ["earlier", "later", "legacy"]);
 });
 
 test("orders timestamped tasks newest-first and puts legacy tasks last", () => {

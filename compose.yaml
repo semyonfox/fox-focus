@@ -12,6 +12,9 @@ services:
       HERMES_KANBAN_DB: ${HERMES_KANBAN_DB:-}
       HERMES_ACTION_API_URL: ${HERMES_ACTION_API_URL:-}
       HERMES_ACTION_TOKEN_FILE: ${HERMES_ACTION_TOKEN_FILE:-}
+      # Setting the host file opts Hermes into its own read/proposal token.
+      # The empty default leaves the endpoint protected by owner Basic auth.
+      HERMES_STATUS_TOKEN_FILE: ${HERMES_STATUS_TOKEN_FILE_HOST:+/run/secrets/fox-focus/hermes-status-token}
       # OAuth configuration is read from individual read-only files. Keep the
       # host files outside this repository and never mount a whole credential
       # directory such as Hermes's provider state.
@@ -30,6 +33,7 @@ services:
       - ${MICROSOFT_OAUTH_CLIENT_FILE_HOST:-./empty-oauth/microsoft-client.placeholder}:/run/secrets/fox-focus/microsoft-client.json:ro
       - ${OAUTH_TOKEN_KEY_FILE_HOST:-./empty-oauth/token-key.placeholder}:/run/secrets/fox-focus/token-key:ro
       - ${HERMES_ACTION_TOKEN_FILE_HOST:-./empty-oauth/token-key.placeholder}:/run/secrets/fox-focus/hermes-action-token:ro
+      - ${HERMES_STATUS_TOKEN_FILE_HOST:-./empty-oauth/hermes-status-token.placeholder}:/run/secrets/fox-focus/hermes-status-token:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
