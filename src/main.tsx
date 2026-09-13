@@ -224,6 +224,24 @@ function PaneHeader({ eyebrow, title, action }: { eyebrow: string; title: string
   );
 }
 
+function WorkspaceUnavailable() {
+  return (
+    <main className="workspace-failure">
+      <section className="workspace-failure-card" role="alert" aria-labelledby="workspace-failure-title">
+        <span className="workspace-failure-mark" aria-hidden="true">
+          <RefreshCw size={18} />
+        </span>
+        <p className="eyebrow">Connection problem</p>
+        <h1 id="workspace-failure-title">Workspace unavailable</h1>
+        <p>Fox Focus could not load the server workspace. Nothing was changed.</p>
+        <button className="submit-button" type="button" onClick={() => window.location.reload()}>
+          <RefreshCw size={14} /> Try again
+        </button>
+      </section>
+    </main>
+  );
+}
+
 type ClientTaskActionStatus = "awaiting_approval" | "running" | "succeeded" | "failed" | "conflict";
 type ClientTaskAction = {
   id: string;
@@ -2168,11 +2186,16 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Missing application root");
 const root = createRoot(rootElement);
-if (window.location.protocol !== "file:") {
+if (import.meta.env.DEV || window.location.protocol === "file:") {
+  root.render(<App />);
+} else {
   fetch("/api/v1/workspace").then(async (response) => {
     if (!response.ok) throw new Error("Could not load the server workspace");
     const initial: unknown = await response.json();
-    if (!isRecord(initial) || typeof initial.revision !== "number" || !isPrototypeData(initial.data)) throw new Error("Invalid server workspace");
-    root.render(<App initial={{ revision: initial.revision, data: initial.data }} />);
-  }).catch(() => root.render(<main><h1>Workspace unavailable</h1><p>Your server data has not been replaced.</p><a href="/">Reload workspace</a></main>));
-} else root.render(<App />);
+    if (!isServerSnapshot(initial)) throw new Error("Invalid server workspace");
+    root.render(<App initial={initial} />);
+  }).catch(() => {
+    document.documentElement.dataset.theme = loadTheme();
+    root.render(<WorkspaceUnavailable />);
+  });
+}
