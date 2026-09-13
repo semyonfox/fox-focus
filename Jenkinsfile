@@ -58,11 +58,14 @@ pipeline {
           # The agent uses the host Docker daemon. Create bind-mounted temporary
           # files under a path shared at the same absolute location on both.
           hermes_status_token="$(mktemp "$operator_dir/.candidate-hermes-status-token.XXXXXX")"
-          chmod 600 "$hermes_status_token"
           openssl rand -base64 32 > "$hermes_status_token"
+          runtime_uid="$(docker run --rm --network none --entrypoint id "$image" -u)"
+          runtime_gid="$(docker run --rm --network none --entrypoint id "$image" -g)"
+          chown "$runtime_uid:$runtime_gid" "$hermes_status_token"
+          chmod 600 "$hermes_status_token"
           candidate="fox-focus-candidate-$BUILD_NUMBER"
           trap 'docker rm -f "$candidate" >/dev/null 2>&1 || true; rm -f "$hermes_status_token"' EXIT
-          docker run -d --rm --name "$candidate" --network none \
+          docker run -d --name "$candidate" --network none \
             -e APP_BASE_URL \
             -e GOOGLE_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/google-client.json \
             -e MICROSOFT_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/microsoft-client.json \
@@ -78,7 +81,10 @@ pipeline {
             if docker exec "$candidate" node -e "fetch('http://127.0.0.1:8789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then healthy=true; break; fi
             sleep 2
           done
-          [ "$healthy" = true ]
+          if [ "$healthy" != true ]; then
+            docker logs "$candidate" >&2 || true
+            exit 1
+          fi
           docker exec "$candidate" node -e "Promise.all(['/', '/app', '/api/v1/workspace', '/api/v1/hermes', '/api/v1/integrations', '/api/v1/task-status'].map(p=>fetch('http://127.0.0.1:8789'+p).then(r=>r.status))).then(s=>{if(s.join(',')!=='401,401,401,401,401,401')process.exit(1)})"
           docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const response=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers:{authorization:'Bearer '+token}}); const status=await response.json(); process.exit(response.ok&&Number.isInteger(status.revision)&&Array.isArray(status.tasks)?0:1);"
           docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; try { const password=readFileSync('/data/workspace-password','utf8').trim(); const authorization='Basic '+Buffer.from('fox:'+password).toString('base64'); const response=await fetch('http://127.0.0.1:8789/api/v1/integrations',{headers:{authorization}}); const overview=await response.json(); const google=overview.providers?.find(provider=>provider.provider==='google'); process.exit(response.ok&&google?.configured===true?0:1); } catch { process.exit(1); }"
