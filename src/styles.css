@@ -1537,10 +1537,6 @@ textarea:focus-visible {
     min-height: 35px;
   }
 
-  .task-row time {
-    display: none;
-  }
-
   .inbox-list-item {
     grid-template-columns: 7px minmax(0, 1fr);
   }
