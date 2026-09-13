@@ -55,9 +55,6 @@ pipeline {
           google_client="${GOOGLE_OAUTH_CLIENT_FILE_HOST:?GOOGLE_OAUTH_CLIENT_FILE_HOST is required}"
           microsoft_client="${MICROSOFT_OAUTH_CLIENT_FILE_HOST:-$operator_dir/microsoft-client.placeholder}"
           token_key="${OAUTH_TOKEN_KEY_FILE_HOST:?OAUTH_TOKEN_KEY_FILE_HOST is required}"
-          [ -f "$google_client" ]
-          [ -f "$microsoft_client" ]
-          [ -f "$token_key" ]
           # The agent uses the host Docker daemon. Create bind-mounted temporary
           # files under a path shared at the same absolute location on both.
           hermes_status_token="$(mktemp "$operator_dir/.candidate-hermes-status-token.XXXXXX")"
@@ -71,10 +68,10 @@ pipeline {
             -e MICROSOFT_OAUTH_CLIENT_FILE=/run/secrets/fox-focus/microsoft-client.json \
             -e OAUTH_TOKEN_KEY_FILE=/run/secrets/fox-focus/token-key \
             -e HERMES_STATUS_TOKEN_FILE=/run/secrets/fox-focus/hermes-status-token \
-            -v "$google_client":/run/secrets/fox-focus/google-client.json:ro \
-            -v "$microsoft_client":/run/secrets/fox-focus/microsoft-client.json:ro \
-            -v "$token_key":/run/secrets/fox-focus/token-key:ro \
-            -v "$hermes_status_token":/run/secrets/fox-focus/hermes-status-token:ro \
+            --mount "type=bind,source=$google_client,target=/run/secrets/fox-focus/google-client.json,readonly" \
+            --mount "type=bind,source=$microsoft_client,target=/run/secrets/fox-focus/microsoft-client.json,readonly" \
+            --mount "type=bind,source=$token_key,target=/run/secrets/fox-focus/token-key,readonly" \
+            --mount "type=bind,source=$hermes_status_token,target=/run/secrets/fox-focus/hermes-status-token,readonly" \
             "$image"
           healthy=false
           for attempt in $(seq 1 20); do
