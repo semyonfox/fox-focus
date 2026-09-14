@@ -41,7 +41,10 @@ export type WorkRowsSnapshot = {
   jobs: Job[];
   jobUpdates: JobUpdate[];
   actions: ActionRow[];
+  capabilities: { emailSendEnabled: boolean };
 };
+
+export type EmailSendUiState = "disabled" | "ready" | "sending" | "reconciling" | "unknown" | "failed" | "sent";
 
 export type CreateTaskInput = TaskCreateInput;
 
@@ -136,7 +139,8 @@ function isActionPayload(value: unknown): value is ActionRow["payload"] {
   }
   if (value.kind === "email-send") {
     return typeof value.inboxId === "string" && typeof value.draftId === "string" &&
-      isReplyEnvelope(value.reply) && typeof value.payloadHash === "string";
+      isReplyEnvelope(value.reply) && typeof value.payloadHash === "string" &&
+      /^[A-Za-z0-9_-]{43}$/.test(value.payloadHash);
   }
   return value.kind === "task-migration" && typeof value.migrationId === "string" && typeof value.taskId === "string" &&
     isRecord(value.source) && isDestination(value.destination) && isNullableString(value.existingExternalId) &&
@@ -213,7 +217,30 @@ export function mergeWorkRows(current: WorkRowsSnapshot | null, incoming: WorkRo
     jobUpdates: [...updates.values()].sort((first, second) => first.seq - second.seq),
     actions: mergeVersioned(current.actions, incoming.actions, (action) => action.id)
       .sort((first, second) => first.createdAt.localeCompare(second.createdAt) || first.id.localeCompare(second.id)),
+    capabilities: incoming.capabilities,
   };
+}
+
+export function emailSendUiState(
+  item: InboxItemRow,
+  draft: DraftRevision | null | undefined,
+  action: ActionRow | undefined,
+  enabled: boolean,
+): EmailSendUiState {
+  if (item.outcome === "sent" || action?.state === "succeeded") return "sent";
+  if (action?.state === "running" && action.attemptCount > 1) return "reconciling";
+  if (action?.state === "queued" || action?.state === "running") return "sending";
+  if (action?.state === "unknown" || action?.state === "conflict") return "unknown";
+  if (action?.state === "failed" && action.payload.kind === "email-send" &&
+    action.payload.draftId === draft?.id) return "failed";
+  if (!enabled || item.source.kind !== "email" || item.state === "resolved" ||
+    !draft || draft.id !== item.currentDraftId) return "disabled";
+  return "ready";
+}
+
+export function emailSendBlocksInboxMutation(action: ActionRow | undefined): boolean {
+  return action?.payload.kind === "email-send" &&
+    (action.state === "queued" || action.state === "running" || action.state === "unknown");
 }
 
 export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapshot> {
@@ -222,7 +249,8 @@ export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapsh
   if (!response.ok || !isRecord(value) || !Array.isArray(value.inbox) || !value.inbox.every(isInboxItemRow) ||
     !Array.isArray(value.drafts) || !value.drafts.every(isDraftRevision) || !Array.isArray(value.actions) ||
     !value.actions.every(isActionRow) || !Array.isArray(value.jobs) || !value.jobs.every(isJob) ||
-    !Array.isArray(value.jobUpdates) || !value.jobUpdates.every(isJobUpdate)) {
+    !Array.isArray(value.jobUpdates) || !value.jobUpdates.every(isJobUpdate) || !isRecord(value.capabilities) ||
+    typeof value.capabilities.emailSendEnabled !== "boolean") {
     throw new Error("Could not load Inbox rows");
   }
   return {
@@ -231,6 +259,7 @@ export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapsh
     jobs: value.jobs,
     jobUpdates: value.jobUpdates,
     actions: value.actions,
+    capabilities: { emailSendEnabled: value.capabilities.emailSendEnabled },
   };
 }
 
@@ -286,6 +315,16 @@ export async function saveOwnerDraft(item: Pick<InboxItemRow, "id" | "version">,
   return request(`/api/v1/inbox-items/${encodeURIComponent(item.id)}/drafts`, "POST", {
     version: item.version,
     reply,
+  });
+}
+
+export async function approveEmailSend(
+  item: Pick<InboxItemRow, "id" | "version">,
+  draft: Pick<DraftRevision, "id">,
+): Promise<unknown> {
+  return request(`/api/v1/inbox-items/${encodeURIComponent(item.id)}/send`, "POST", {
+    version: item.version,
+    draftId: draft.id,
   });
 }
 

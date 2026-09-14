@@ -32,11 +32,14 @@ if (typeof vapid !== 'object' || vapid === null || !('publicKey' in vapid) || !(
   typeof vapid.publicKey !== 'string' || typeof vapid.privateKey !== 'string') throw new Error('Invalid VAPID key file');
 webPush.setVapidDetails('mailto:semyon.fox@gmail.com', vapid.publicKey, vapid.privateKey);
 const taskStatusTokenPath = process.env.HERMES_STATUS_TOKEN_FILE;
+const emailSendRequested = process.env.EMAIL_SEND_ENABLED === 'true';
 let taskStatusToken: string | undefined;
 if (taskStatusTokenPath) {
   taskStatusToken = readFileSync(taskStatusTokenPath, 'utf8').trim();
   if (!taskStatusToken) throw new Error('Hermes task-status token file is empty');
 }
+if (emailSendRequested && !taskStatusToken) throw new Error('EMAIL_SEND_ENABLED requires HERMES_STATUS_TOKEN_FILE');
+const emailSendEnabled = emailSendRequested;
 const store = openStore(join(dataDir, 'focus.sqlite'));
 const hermesPath = process.env.HERMES_KANBAN_DB;
 const hermesActionUrl = process.env.HERMES_ACTION_API_URL;
@@ -72,6 +75,7 @@ const actionWorker = createTaskStatusActionWorker(store, integrations ?? {
 const app = createApp(store, password, hermes, integrations, {
   pushPublicKey: vapid.publicKey,
   taskStatusToken,
+  emailSendEnabled,
   actionWorker,
 });
 actionWorker.start();

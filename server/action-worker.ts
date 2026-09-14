@@ -71,6 +71,7 @@ type TaskActionStore = Pick<
   | 'settleTaskCreateAction'
 > & {
   wakeDueInboxItems?: (now: string) => number;
+  recoverExpiredEmailSendActions?: (now: string) => number;
 };
 
 export type TaskStatusActionWorkerOptions = {
@@ -178,13 +179,19 @@ export function createTaskStatusActionWorker(
     return runTaskCreateOnce();
   }
 
+  function runMaintenance(): void {
+    const timestamp = now().toISOString();
+    store.wakeDueInboxItems?.(timestamp);
+    store.recoverExpiredEmailSendActions?.(timestamp);
+  }
+
   async function runOnce(): Promise<ActionRow | null> {
-    store.wakeDueInboxItems?.(now().toISOString());
+    runMaintenance();
     return runNextAction();
   }
 
   async function runUntilIdle(limit = 100): Promise<number> {
-    store.wakeDueInboxItems?.(now().toISOString());
+    runMaintenance();
     let completed = 0;
     while (completed < limit && await runNextAction()) completed += 1;
     return completed;

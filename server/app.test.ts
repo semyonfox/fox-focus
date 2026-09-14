@@ -430,7 +430,8 @@ test('Hermes can upsert email Inbox rows and run a claim-bound job through the f
       method: 'POST', headers: { authorization: bearer },
     });
     assert.equal(claim.status, 200);
-    const claimBody = await claim.json() as { claimId: string };
+    const claimBody = await claim.json() as { kind: string; claimId: string };
+    assert.equal(claimBody.kind, 'job');
     const multiline = await app.request(`/api/v1/requests/${job.id}/result`, {
       method: 'POST',
       headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
@@ -458,6 +459,169 @@ test('Hermes can upsert email Inbox rows and run a claim-bound job through the f
     const contextBody = await context.json() as { jobs: unknown[]; jobUpdates: unknown[] };
     assert.equal(contextBody.jobs.length, 1);
     assert.equal(contextBody.jobUpdates.length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test('email sending is default-off and Hermes settles only the owner-approved envelope', async () => {
+  const store = openStore(':memory:', testData());
+  const token = 'hermes-email-send-token-at-least-24-characters';
+  const bearer = `Bearer ${token}`;
+  const clock = () => new Date('2026-09-14T10:00:00.000Z');
+  try {
+    const disabled = createApp(store, password, undefined, undefined, {
+      taskStatusToken: token,
+      now: clock,
+    });
+    const disabledRows = await disabled.request('/api/v1/rows', { headers: { authorization } });
+    assert.equal(disabledRows.status, 200);
+    assert.deepEqual((await disabledRows.json() as { capabilities: unknown }).capabilities, {
+      emailSendEnabled: false,
+    });
+    const disabledApproval = await disabled.request('/api/v1/inbox-items/missing/send', {
+      method: 'POST',
+      headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: 1, draftId: 'draft-missing' }),
+    });
+    assert.equal(disabledApproval.status, 503);
+
+    const app = createApp(store, password, undefined, undefined, {
+      taskStatusToken: token,
+      emailSendEnabled: true,
+      now: clock,
+    });
+    const rows = await app.request('/api/v1/rows', { headers: { authorization } });
+    assert.deepEqual((await rows.json() as { capabilities: unknown }).capabilities, {
+      emailSendEnabled: true,
+    });
+    const proposal = {
+      expectedVersion: null,
+      source: {
+        kind: 'email', accountId: 'mail-account', messageId: 'message-send-api', threadId: 'thread-send-api',
+      },
+      title: 'Reply to the organiser', summary: 'A reply is ready.', likelyNoise: false,
+      draft: {
+        accountId: 'mail-account', threadId: 'thread-send-api', replyToMessageId: 'message-send-api',
+        inReplyTo: '<message-send-api@example.test>', references: ['<earlier@example.test>'],
+        from: 'owner@example.test', to: ['organiser@example.test'], cc: [], bcc: [],
+        subject: 'Re: Details', bodyText: 'The exact approved reply.',
+      },
+    };
+    const upsert = await app.request('/api/v1/inbox/email-send-api', {
+      method: 'PUT',
+      headers: { authorization: bearer, 'Content-Type': 'application/json' },
+      body: JSON.stringify(proposal),
+    });
+    assert.equal(upsert.status, 201);
+    const upsertBody = await upsert.json() as {
+      item: { id: string; version: number };
+      draft: { id: string };
+    };
+    const bearerApproval = await app.request(`/api/v1/inbox-items/${upsertBody.item.id}/send`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: upsertBody.item.version, draftId: upsertBody.draft.id }),
+    });
+    assert.equal(bearerApproval.status, 401);
+
+    const approval = await app.request(`/api/v1/inbox-items/${upsertBody.item.id}/send`, {
+      method: 'POST',
+      headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: upsertBody.item.version, draftId: upsertBody.draft.id }),
+    });
+    assert.equal(approval.status, 202);
+    const approvalBody = await approval.json() as {
+      outcome: string;
+      action: { id: string; state: string; payload: { payloadHash: string; reply: unknown } };
+    };
+    assert.equal(approvalBody.outcome, 'queued');
+    assert.equal(approvalBody.action.state, 'queued');
+    assert.deepEqual(approvalBody.action.payload.reply, proposal.draft);
+    const approvalReplay = await app.request(`/api/v1/inbox-items/${upsertBody.item.id}/send`, {
+      method: 'POST',
+      headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: upsertBody.item.version, draftId: upsertBody.draft.id }),
+    });
+    assert.equal(approvalReplay.status, 200);
+    const approvalReplayBody = await approvalReplay.json() as { outcome: string; action: { id: string } };
+    assert.equal(approvalReplayBody.outcome, 'replayed');
+    assert.equal(approvalReplayBody.action.id, approvalBody.action.id);
+    assert.equal(store.listActions().filter(action => action.payload.kind === 'email-send').length, 1);
+
+    const disabledClaim = await disabled.request(`/api/v1/requests/${approvalBody.action.id}/claim`, {
+      method: 'POST', headers: { authorization: bearer },
+    });
+    assert.equal(disabledClaim.status, 503);
+    assert.equal(store.getAction(approvalBody.action.id)?.state, 'queued');
+
+    const claim = await app.request(`/api/v1/requests/${approvalBody.action.id}/claim`, {
+      method: 'POST', headers: { authorization: bearer },
+    });
+    assert.equal(claim.status, 200);
+    const claimBody = await claim.json() as {
+      kind: string;
+      mode: string;
+      claimId: string;
+      action: { payload: { payloadHash: string } };
+    };
+    assert.equal(claimBody.kind, 'email-send');
+    assert.equal(claimBody.mode, 'send');
+    assert.equal(claimBody.action.payload.payloadHash, approvalBody.action.payload.payloadHash);
+
+    const wrongHash = approvalBody.action.payload.payloadHash.endsWith('A')
+      ? `${approvalBody.action.payload.payloadHash.slice(0, -1)}B`
+      : `${approvalBody.action.payload.payloadHash.slice(0, -1)}A`;
+    const mismatch = await app.request(`/api/v1/requests/${approvalBody.action.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: JSON.stringify({
+        kind: 'email-send', payloadHash: wrongHash,
+        providerMessageId: 'sent-message-api', providerThreadId: 'thread-send-api',
+      }),
+    });
+    assert.equal(mismatch.status, 409);
+    assert.equal(store.getAction(approvalBody.action.id)?.state, 'running');
+
+    const wrongThread = await app.request(`/api/v1/requests/${approvalBody.action.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: JSON.stringify({
+        kind: 'email-send', payloadHash: approvalBody.action.payload.payloadHash,
+        providerMessageId: 'sent-message-api', providerThreadId: 'different-thread',
+      }),
+    });
+    assert.equal(wrongThread.status, 409);
+    assert.equal(store.getAction(approvalBody.action.id)?.state, 'running');
+
+    const receipt = {
+      kind: 'email-send', payloadHash: approvalBody.action.payload.payloadHash,
+      providerMessageId: 'sent-message-api', providerThreadId: 'thread-send-api',
+    };
+    const result = await app.request(`/api/v1/requests/${approvalBody.action.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: JSON.stringify(receipt),
+    });
+    assert.equal(result.status, 200);
+    const resultBody = await result.json() as { kind: string; outcome: string; item: { outcome: string } };
+    assert.equal(resultBody.kind, 'email-send');
+    assert.equal(resultBody.outcome, 'settled');
+    assert.equal(resultBody.item.outcome, 'sent');
+
+    const replay = await app.request(`/api/v1/requests/${approvalBody.action.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: JSON.stringify(receipt),
+    });
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json() as { outcome: string }).outcome, 'replayed');
+    const conflict = await app.request(`/api/v1/requests/${approvalBody.action.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: JSON.stringify({ ...receipt, providerMessageId: 'different-sent-message' }),
+    });
+    assert.equal(conflict.status, 409);
   } finally {
     store.close();
   }
@@ -506,6 +670,7 @@ test('the Hermes bearer is accepted only on the five exact Hermes routes', async
       { path: '/api/v1/jobs/not-a-job/settle', method: 'POST', body: { version: 1, outcome: 'dropped' } },
       { path: '/api/v1/inbox-items/not-an-item', method: 'PUT', body: {} },
       { path: '/api/v1/inbox-items/not-an-item/drafts', method: 'POST', body: {} },
+      { path: '/api/v1/inbox-items/not-an-item/send', method: 'POST', body: {} },
       { path: '/api/v1/push/public-key' },
       { path: '/api/v1/push/subscriptions', method: 'POST', body: {} },
       { path: '/api/v1/push/subscriptions', method: 'DELETE', body: {} },

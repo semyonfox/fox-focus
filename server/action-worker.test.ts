@@ -549,11 +549,16 @@ test('a create readback without an ETag stays unknown and retains its candidate 
   });
 });
 
-test('the worker wakes due Inbox items once before draining actions', async () => {
+test('the worker runs Inbox wake and expired email recovery once before draining actions', async () => {
   const wakeTimes: string[] = [];
+  const recoveryTimes: string[] = [];
   const worker = createTaskStatusActionWorker({
     wakeDueInboxItems: now => {
       wakeTimes.push(now);
+      return 0;
+    },
+    recoverExpiredEmailSendActions: now => {
+      recoveryTimes.push(now);
       return 0;
     },
     claimNextTaskStatusAction: () => null,
@@ -567,6 +572,7 @@ test('the worker wakes due Inbox items once before draining actions', async () =
 
   assert.equal(await worker.runUntilIdle(), 0);
   assert.deepEqual(wakeTimes, [OWNER_CLICK]);
+  assert.deepEqual(recoveryTimes, [OWNER_CLICK]);
 });
 
 test('accepting a linked job completes its Google task through the normal worker path', async () => {

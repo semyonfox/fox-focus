@@ -5,6 +5,7 @@ import { areaForList } from '../src/integration-model.ts';
 import {
   isInboxItem,
   isPrototypeData,
+  isRecord,
   isReminder,
   isTask,
   type Area,
@@ -14,11 +15,15 @@ import {
   type Task,
 } from '../src/model.ts';
 import {
+  isEmailSendReceiptInput,
+  isReplyEnvelope,
   isUtcInstant,
   taskCreateNotes,
   type ActionRow,
   type ChangeRow,
   type DraftRevision,
+  type EmailSendPayload,
+  type EmailSendReceiptInput,
   type HermesInboxUpsertInput,
   type InboxItemRow,
   type InboxOutcome,
@@ -40,7 +45,7 @@ import {
 import { filterCalendarContextByDateRange } from '../src/integration-model.ts';
 import type { ImportedRecord, Provider } from './store.ts';
 
-export const ROW_SCHEMA_VERSION = 9;
+export const ROW_SCHEMA_VERSION = 10;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -62,6 +67,14 @@ export function canonicalJson(value: unknown): string {
 
 export function canonicalHash(value: unknown): string {
   return createHash('sha256').update(canonicalJson(value)).digest('base64url');
+}
+
+export function emailSendPayloadHash(input: {
+  inboxId: string;
+  draftId: string;
+  reply: ReplyEnvelope;
+}): string {
+  return canonicalHash({ schema: 'fox-focus-email-send-v1', ...input });
 }
 
 function jsonRecord(value: unknown): Record<string, unknown> | null {
@@ -290,45 +303,182 @@ function inboxRowFromSql(row: Record<string, unknown>): InboxItemRow | null {
 
 function draftFromSql(row: Record<string, unknown>): DraftRevision | null {
   if (
-    typeof row.id !== 'string' || typeof row.inbox_id !== 'string' || typeof row.revision !== 'number' ||
-    (row.author !== 'owner' && row.author !== 'hermes') || typeof row.created_at !== 'string'
+    typeof row.id !== 'string' || typeof row.inbox_id !== 'string' || !isPositiveInteger(row.revision) ||
+    (row.author !== 'owner' && row.author !== 'hermes') || !isUtcInstant(row.created_at)
   ) return null;
   const reply = jsonRecord(row.reply_json);
-  if (!reply) return null;
-  const references = Array.isArray(reply.references) && reply.references.every(value => typeof value === 'string')
-    ? reply.references
-    : null;
-  const to = Array.isArray(reply.to) && reply.to.every(value => typeof value === 'string') ? reply.to : null;
-  const cc = Array.isArray(reply.cc) && reply.cc.every(value => typeof value === 'string') ? reply.cc : null;
-  const bcc = Array.isArray(reply.bcc) && reply.bcc.every(value => typeof value === 'string') ? reply.bcc : null;
-  if (
-    typeof reply.accountId !== 'string' || typeof reply.threadId !== 'string' ||
-    typeof reply.replyToMessageId !== 'string' || typeof reply.inReplyTo !== 'string' ||
-    typeof reply.from !== 'string' || typeof reply.subject !== 'string' || typeof reply.bodyText !== 'string' ||
-    !references || !to || !cc || !bcc
-  ) return null;
+  if (!isReplyEnvelope(reply)) return null;
   return {
     id: row.id,
     inboxId: row.inbox_id,
     revision: row.revision,
     author: row.author,
-    reply: { ...reply, references, to, cc, bcc } as ReplyEnvelope,
+    reply,
     createdAt: row.created_at,
   };
 }
 
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+function migrationSourceFromJson(value: unknown): MigrationPayload['source'] | null {
+  if (!isRecord(value) || typeof value.taskId !== 'string' ||
+    typeof value.version !== 'number' || !Number.isSafeInteger(value.version)) return null;
+  if (value.kind === 'fox' && value.version >= 1) {
+    return { kind: 'fox', taskId: value.taskId, version: value.version };
+  }
+  return value.kind === 'hermes' && value.version >= 0 && typeof value.boardSlug === 'string'
+    ? { kind: 'hermes', boardSlug: value.boardSlug, taskId: value.taskId, version: value.version }
+    : null;
+}
+
+function migrationPayloadFromJson(value: Record<string, unknown>): MigrationPayload | null {
+  const source = migrationSourceFromJson(value.source);
+  const aliases = Array.isArray(value.sourceAliases)
+    ? value.sourceAliases.map(migrationSourceFromJson)
+    : null;
+  const destination = isRecord(value.destination) && typeof value.destination.accountId === 'string' &&
+      typeof value.destination.listId === 'string'
+    ? { accountId: value.destination.accountId, listId: value.destination.listId }
+    : null;
+  const plan = isRecord(value.plan) && ['low', 'medium', 'high'].includes(String(value.plan.priority)) &&
+      typeof value.plan.waiting === 'boolean' &&
+      (value.plan.deadlineOn === null || isDateKey(value.plan.deadlineOn)) &&
+      (value.plan.plannedOn === null || isDateKey(value.plan.plannedOn)) &&
+      (value.plan.plannedAt === null || isUtcInstant(value.plan.plannedAt)) &&
+      (value.plan.estimateMinutes === null ||
+        (isPositiveInteger(value.plan.estimateMinutes) && value.plan.estimateMinutes <= 1_440)) &&
+      !(value.plan.plannedOn !== null && value.plan.plannedAt !== null)
+    ? value.plan as MigrationPayload['plan']
+    : null;
+  const reminder = value.reminder === null
+    ? null
+    : isRecord(value.reminder) && typeof value.reminder.id === 'string' && isUtcInstant(value.reminder.fireAt)
+      ? { id: value.reminder.id, fireAt: value.reminder.fireAt }
+      : undefined;
+  const preservedReminders = Array.isArray(value.preservedReminders) && value.preservedReminders.every(reminderValue =>
+    isRecord(reminderValue) && typeof reminderValue.id === 'string' && isPositiveInteger(reminderValue.version) &&
+    isUtcInstant(reminderValue.fireAt) && ['scheduled', 'fired', 'cancelled'].includes(String(reminderValue.state)))
+    ? value.preservedReminders as MigrationPayload['preservedReminders']
+    : null;
+  const targetSnapshot = value.targetSnapshot === null
+    ? null
+    : isRecord(value.targetSnapshot) && typeof value.targetSnapshot.title === 'string' &&
+        (value.targetSnapshot.status === 'open' || value.targetSnapshot.status === 'completed') &&
+        (value.targetSnapshot.doOn === null || isDateKey(value.targetSnapshot.doOn)) &&
+        isNullableString(value.targetSnapshot.etag) &&
+        (value.targetSnapshot.observedAt === null || isUtcInstant(value.targetSnapshot.observedAt))
+      ? value.targetSnapshot as MigrationPayload['targetSnapshot']
+      : undefined;
+  if (
+    value.kind !== 'task-migration' || typeof value.migrationId !== 'string' ||
+    typeof value.previewHash !== 'string' || typeof value.sourceKey !== 'string' ||
+    !isRecord(value.sourceSnapshot) || (value.operation !== 'bind' && value.operation !== 'create') ||
+    typeof value.taskId !== 'string' || !source || !aliases || aliases.some(alias => alias === null) ||
+    !destination || typeof value.destinationName !== 'string' || !isNullableString(value.existingExternalId) ||
+    targetSnapshot === undefined || !isNullableString(value.nonce) || typeof value.title !== 'string' ||
+    typeof value.notes !== 'string' || !(value.doOn === null || isDateKey(value.doOn)) || !plan ||
+    reminder === undefined || !preservedReminders || !isNullableString(value.resumedFromActionId)
+  ) return null;
+  return {
+    ...value,
+    source,
+    sourceAliases: aliases as MigrationPayload['sourceAliases'],
+    destination,
+    plan,
+    reminder,
+    preservedReminders,
+    targetSnapshot,
+  } as MigrationPayload;
+}
+
+function actionPayloadFromJson(
+  value: Record<string, unknown>,
+  kind: unknown,
+  taskId: unknown,
+  inboxId: unknown,
+): ActionRow['payload'] | null {
+  if (value.kind !== kind) return null;
+  if (value.kind === 'task-create') {
+    if (
+      typeof value.taskId !== 'string' || value.taskId !== taskId || inboxId !== null ||
+      !isRecord(value.destination) || typeof value.destination.accountId !== 'string' ||
+      typeof value.destination.listId !== 'string' || typeof value.nonce !== 'string' ||
+      typeof value.title !== 'string' || typeof value.notes !== 'string' ||
+      !(value.doOn === null || isDateKey(value.doOn))
+    ) return null;
+    return value as ActionRow['payload'];
+  }
+  if (value.kind === 'task-status') {
+    if (
+      typeof value.taskId !== 'string' || value.taskId !== taskId || inboxId !== null ||
+      !isRecord(value.target) || typeof value.target.accountId !== 'string' ||
+      typeof value.target.listId !== 'string' || typeof value.target.externalId !== 'string' ||
+      !isPositiveInteger(value.expectedTaskVersion) || !isPositiveInteger(value.intentVersion) ||
+      !isNullableString(value.expectedEtag) ||
+      (value.before !== 'open' && value.before !== 'completed') ||
+      (value.after !== 'open' && value.after !== 'completed')
+    ) return null;
+    return value as ActionRow['payload'];
+  }
+  if (value.kind === 'email-send') {
+    if (
+      Object.keys(value).length !== 5 ||
+      taskId !== null || typeof inboxId !== 'string' || typeof value.inboxId !== 'string' ||
+      value.inboxId !== inboxId || typeof value.draftId !== 'string' || !isReplyEnvelope(value.reply) ||
+      typeof value.payloadHash !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.payloadHash) ||
+      emailSendPayloadHash({ inboxId: value.inboxId, draftId: value.draftId, reply: value.reply }) !== value.payloadHash
+    ) return null;
+    return value as EmailSendPayload;
+  }
+  if (value.kind === 'task-migration') {
+    const payload = migrationPayloadFromJson(value);
+    return payload && payload.taskId === taskId && inboxId === null ? payload : null;
+  }
+  return null;
+}
+
 function actionFromSql(row: Record<string, unknown>): ActionRow | null {
   if (
-    typeof row.id !== 'string' || typeof row.version !== 'number' ||
+    typeof row.id !== 'string' || !isPositiveInteger(row.version) ||
     typeof row.operation_key !== 'string' || typeof row.request_hash !== 'string' ||
     typeof row.payload_json !== 'string' || typeof row.approval_json !== 'string' ||
-    typeof row.state !== 'string' || typeof row.attempt_count !== 'number' ||
-    typeof row.created_at !== 'string' || typeof row.updated_at !== 'string'
+    !['queued', 'running', 'succeeded', 'failed', 'conflict', 'unknown', 'superseded', 'cancelled'].includes(String(row.state)) ||
+    typeof row.attempt_count !== 'number' || !Number.isSafeInteger(row.attempt_count) || row.attempt_count < 0 ||
+    !isUtcInstant(row.created_at) || !isUtcInstant(row.updated_at)
   ) return null;
-  const payload = jsonRecord(row.payload_json);
+  const payloadRecord = jsonRecord(row.payload_json);
+  const payload = payloadRecord ? actionPayloadFromJson(payloadRecord, row.kind, row.task_id, row.inbox_id) : null;
   const approval = jsonRecord(row.approval_json);
-  if (!payload || typeof payload.kind !== 'string' || !approval || approval.actor !== 'owner' ||
-    typeof approval.at !== 'string' || typeof approval.previewText !== 'string') return null;
+  if (!payload || !approval || approval.actor !== 'owner' || !isUtcInstant(approval.at) ||
+    typeof approval.previewText !== 'string' ||
+    !(row.next_attempt_at === null || isUtcInstant(row.next_attempt_at)) ||
+    !isNullableString(row.claim_id) || !(row.lease_until === null || isUtcInstant(row.lease_until)) ||
+    !isNullableString(row.error)) return null;
+  const isRunning = row.state === 'running';
+  if (isRunning !== (row.claim_id !== null && row.lease_until !== null)) return null;
+  if (payload.kind === 'email-send' && row.request_hash !== canonicalHash(payload)) return null;
+  const receipt = row.receipt_json === null ? null : jsonRecord(row.receipt_json);
+  if (row.receipt_json !== null && !receipt) return null;
+  if (payload.kind === 'email-send') {
+    if (row.state === 'succeeded') {
+      if (!receipt || Object.keys(receipt).length !== 5 || !isUtcInstant(receipt.receivedAt)) return null;
+      const receiptInput = {
+        kind: receipt.kind,
+        payloadHash: receipt.payloadHash,
+        providerMessageId: receipt.providerMessageId,
+        providerThreadId: receipt.providerThreadId,
+      };
+      if (!isEmailSendReceiptInput(receiptInput) || receiptInput.payloadHash !== payload.payloadHash ||
+        receiptInput.providerThreadId !== payload.reply.threadId ||
+        receiptInput.providerMessageId === payload.reply.replyToMessageId) return null;
+    } else if (receipt !== null) return null;
+  }
   return {
     id: row.id,
     version: row.version,
@@ -341,7 +491,7 @@ function actionFromSql(row: Record<string, unknown>): ActionRow | null {
     nextAttemptAt: stringOrNull(row.next_attempt_at),
     claimId: stringOrNull(row.claim_id),
     leaseUntil: stringOrNull(row.lease_until),
-    receipt: row.receipt_json === null ? null : jsonRecord(row.receipt_json),
+    receipt,
     error: stringOrNull(row.error),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -586,6 +736,9 @@ function ensureSchema(db: DatabaseSync): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS actions_ready ON actions(state, next_attempt_at, created_at);
     CREATE INDEX IF NOT EXISTS actions_task_intent ON actions(task_id, kind, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS actions_one_unsettled_send_per_inbox
+      ON actions(inbox_id)
+      WHERE kind='email-send' AND state IN ('queued', 'running', 'unknown');
 
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
@@ -1088,6 +1241,23 @@ export type TaskMigrationApprovalResult =
   | { outcome: 'queued' | 'replayed'; migrationId: string; actions: ActionRow[] }
   | { outcome: 'conflict'; migrationId: string; actions: ActionRow[] };
 
+export type EmailSendAction = ActionRow & { payload: EmailSendPayload };
+
+export type EmailSendQueueResult =
+  | { outcome: 'queued' | 'replayed'; action: EmailSendAction; item: InboxItemRow }
+  | { outcome: 'not_found'; item: null }
+  | { outcome: 'conflict' | 'not_email' | 'invalid_draft' | 'unavailable'; item: InboxItemRow };
+
+export type EmailSendClaimResult =
+  | { outcome: 'claimed'; action: EmailSendAction; mode: 'send' | 'reconcile'; claimId: string }
+  | { outcome: 'not_found'; action: null }
+  | { outcome: 'disabled' | 'unavailable'; action: EmailSendAction };
+
+export type EmailSendSettlementResult =
+  | { outcome: 'settled' | 'replayed'; action: EmailSendAction; item: InboxItemRow }
+  | { outcome: 'not_found'; action: null }
+  | { outcome: 'invalid_claim' | 'hash_mismatch' | 'receipt_conflict' | 'invalid_receipt'; action: EmailSendAction };
+
 function asTaskCreateAction(action: ActionRow | null): TaskCreateAction | null {
   if (!action) return null;
   if (action.payload.kind === 'task-create') return action as TaskCreateAction;
@@ -1194,6 +1364,14 @@ export function createRowStore(db: DatabaseSync) {
     return row ? actionFromSql(row) : null;
   }
 
+  function unsettledEmailSend(inboxId: string): ActionRow | null {
+    const row = db.prepare(`SELECT * FROM actions
+      WHERE kind='email-send' AND inbox_id=? AND state IN ('queued', 'running', 'unknown')
+      ORDER BY created_at DESC, id DESC LIMIT 1`).get(inboxId) as Record<string, unknown> | undefined;
+    const action = row ? actionFromSql(row) : null;
+    return action?.payload.kind === 'email-send' ? action : null;
+  }
+
   function listJobs(includeSettled = true): Job[] {
     const rows = includeSettled
       ? db.prepare('SELECT * FROM jobs ORDER BY updated_at DESC, id').all()
@@ -1284,6 +1462,10 @@ export function createRowStore(db: DatabaseSync) {
         db.exec('ROLLBACK');
         return null;
       }
+      if (current.outcome === 'sent' || unsettledEmailSend(id)) {
+        db.exec('ROLLBACK');
+        return null;
+      }
       const version = current.version + 1;
       const result = db.prepare(`UPDATE inbox_items SET version=?, state=?, outcome=?, snoozed_until=?, updated_at=?
         WHERE id=? AND version=?`).run(version, input.state, input.outcome, input.snoozedUntil, now, id, expectedVersion);
@@ -1334,7 +1516,7 @@ export function createRowStore(db: DatabaseSync) {
         outcome: 'created' | 'updated' | 'replayed';
         item: InboxItemRow;
         draft: DraftRevision | null;
-        draftOutcome: 'created' | 'updated' | 'unchanged' | 'kept_owner' | 'none';
+        draftOutcome: 'created' | 'updated' | 'unchanged' | 'kept_owner' | 'kept_approved' | 'none';
       }
     | { outcome: 'conflict'; reason: 'idempotency' | 'version' | 'source'; item: InboxItemRow | null }
     | { outcome: 'invalid_draft'; item: InboxItemRow | null };
@@ -1361,12 +1543,14 @@ export function createRowStore(db: DatabaseSync) {
         const details = jsonRecord(replay.details_json);
         const storedDraftOutcome = details?.draftOutcome;
         const draft = item.currentDraftId ? getDraft(item.currentDraftId) : null;
-        const draftOutcome = input.draft && draft?.author === 'owner'
-          ? 'kept_owner'
-          : storedDraftOutcome === 'created' || storedDraftOutcome === 'updated' || storedDraftOutcome === 'unchanged' ||
-              storedDraftOutcome === 'kept_owner'
-            ? storedDraftOutcome
-            : 'none';
+        const draftOutcome = input.draft && (item.outcome === 'sent' || unsettledEmailSend(item.id))
+          ? 'kept_approved'
+          : input.draft && draft?.author === 'owner'
+            ? 'kept_owner'
+            : storedDraftOutcome === 'created' || storedDraftOutcome === 'updated' || storedDraftOutcome === 'unchanged' ||
+                storedDraftOutcome === 'kept_owner' || storedDraftOutcome === 'kept_approved'
+              ? storedDraftOutcome
+              : 'none';
         db.exec('COMMIT');
         return {
           outcome: 'replayed',
@@ -1400,9 +1584,11 @@ export function createRowStore(db: DatabaseSync) {
       const id = current?.id ?? `inbox-${randomUUID()}`;
       const previousDraft = current?.currentDraftId ? getDraft(current.currentDraftId) : null;
       let draft: DraftRevision | null = previousDraft;
-      let draftOutcome: 'created' | 'updated' | 'unchanged' | 'kept_owner' | 'none' = 'none';
+      let draftOutcome: 'created' | 'updated' | 'unchanged' | 'kept_owner' | 'kept_approved' | 'none' = 'none';
       if (input.draft) {
-        if (previousDraft?.author === 'owner') {
+        if (current && (current.outcome === 'sent' || unsettledEmailSend(current.id))) {
+          draftOutcome = 'kept_approved';
+        } else if (previousDraft?.author === 'owner') {
           draftOutcome = 'kept_owner';
         } else if (previousDraft && canonicalJson(previousDraft.reply) === canonicalJson(input.draft)) {
           draftOutcome = 'unchanged';
@@ -1501,6 +1687,10 @@ export function createRowStore(db: DatabaseSync) {
         return { outcome: 'not_found', item: null };
       }
       if (current.version !== expectedVersion) {
+        db.exec('COMMIT');
+        return { outcome: 'conflict', item: current };
+      }
+      if (current.state === 'resolved' || unsettledEmailSend(inboxId)) {
         db.exec('COMMIT');
         return { outcome: 'conflict', item: current };
       }
@@ -2216,6 +2406,285 @@ export function createRowStore(db: DatabaseSync) {
     );
   }
 
+  function emailSendApprovalText(draft: DraftRevision, payloadHash: string): string {
+    const reply = draft.reply;
+    const list = (values: string[]) => values.length ? values.map(value => `  - ${value}`).join('\n') : '  - none';
+    return [
+      `Send approved email draft ${draft.id} (revision ${draft.revision}).`,
+      `Payload hash: ${payloadHash}`,
+      `Account: ${reply.accountId}`,
+      `Thread: ${reply.threadId}`,
+      `Reply-to message: ${reply.replyToMessageId}`,
+      `In-Reply-To: ${reply.inReplyTo}`,
+      'References:',
+      list(reply.references),
+      `From: ${reply.from}`,
+      'To:',
+      list(reply.to),
+      'Cc:',
+      list(reply.cc),
+      'Bcc:',
+      list(reply.bcc),
+      `Subject: ${reply.subject}`,
+      'Body:',
+      reply.bodyText,
+    ].join('\n');
+  }
+
+  function queueEmailSendAction(
+    inboxId: string,
+    expectedVersion: number,
+    draftId: string,
+    now: string,
+  ): EmailSendQueueResult {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const item = getInboxItem(inboxId);
+      if (!item) {
+        db.exec('COMMIT');
+        return { outcome: 'not_found', item: null };
+      }
+      const operationKey = `email-send:${draftId}`;
+      const replayRow = db.prepare('SELECT * FROM actions WHERE operation_key=?').get(operationKey) as
+        Record<string, unknown> | undefined;
+      const replay = replayRow ? actionFromSql(replayRow) : null;
+      if (replay?.payload.kind === 'email-send' && replay.payload.inboxId === inboxId && replay.payload.draftId === draftId) {
+        db.exec('COMMIT');
+        return { outcome: 'replayed', action: replay as EmailSendAction, item };
+      }
+      if (replay) {
+        db.exec('COMMIT');
+        return { outcome: 'unavailable', item };
+      }
+      if (item.version !== expectedVersion || item.state === 'resolved') {
+        db.exec('COMMIT');
+        return { outcome: 'conflict', item };
+      }
+      if (item.source.kind !== 'email') {
+        db.exec('COMMIT');
+        return { outcome: 'not_email', item };
+      }
+      const draft = item.currentDraftId === draftId ? getDraft(draftId) : null;
+      if (!draft || draft.inboxId !== item.id || !replyMatchesInboxSource(draft.reply, item.source) ||
+        draft.reply.to.length + draft.reply.cc.length + draft.reply.bcc.length === 0) {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_draft', item };
+      }
+      if (unsettledEmailSend(inboxId)) {
+        db.exec('COMMIT');
+        return { outcome: 'unavailable', item };
+      }
+      const payloadHash = emailSendPayloadHash({ inboxId, draftId, reply: draft.reply });
+      const payload: EmailSendPayload = { kind: 'email-send', inboxId, draftId, reply: draft.reply, payloadHash };
+      const action: EmailSendAction = {
+        id: randomUUID(),
+        version: 1,
+        payload,
+        operationKey,
+        requestHash: canonicalHash(payload),
+        approval: { actor: 'owner', at: now, previewText: emailSendApprovalText(draft, payloadHash) },
+        state: 'queued',
+        attemptCount: 0,
+        nextAttemptAt: null,
+        claimId: null,
+        leaseUntil: null,
+        receipt: null,
+        error: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      insertApprovedAction(action);
+      insertChange(db, {
+        actor: 'owner', mutationKey: `owner:action:${action.id}:1`, entityKind: 'action', entityId: action.id,
+        entityVersion: 1, operation: 'upsert', snapshot: actionSnapshot(action),
+        details: { inboxId, draftId, payloadHash, exactEnvelopeApproval: true }, at: now,
+      });
+      db.exec('COMMIT');
+      return { outcome: 'queued', action, item };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function markEmailSendUnknown(action: EmailSendAction, now: string): EmailSendAction {
+    const version = action.version + 1;
+    const result = db.prepare(`UPDATE actions SET version=?, state='unknown', next_attempt_at=NULL, claim_id=NULL,
+      lease_until=NULL, error=?, updated_at=? WHERE id=? AND version=? AND state='running'`).run(
+      version,
+      'The send lease expired after dispatch may have begun. Reconciliation is required and sending again is forbidden.',
+      now,
+      action.id,
+      action.version,
+    );
+    if (result.changes !== 1) throw new Error('Email send changed while its expired lease was being recovered');
+    const next = getAction(action.id);
+    if (!next || next.payload.kind !== 'email-send') throw new Error('Recovered email send disappeared');
+    insertChange(db, {
+      actor: 'system', mutationKey: `system:email-send-expired:${action.id}:${version}`, entityKind: 'action',
+      entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(next),
+      details: { before: 'running', after: 'unknown', recovery: 'expired-lease', resendAllowed: false }, at: now,
+    });
+    return next as EmailSendAction;
+  }
+
+  function recoverExpiredEmailSendActions(now: string): number {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = db.prepare(`SELECT * FROM actions WHERE kind='email-send' AND state='running'
+        AND lease_until IS NOT NULL AND lease_until<=?`).all(now) as Record<string, unknown>[];
+      let recovered = 0;
+      for (const row of rows) {
+        const action = actionFromSql(row);
+        if (!action || action.payload.kind !== 'email-send') continue;
+        markEmailSendUnknown(action as EmailSendAction, now);
+        recovered += 1;
+      }
+      db.exec('COMMIT');
+      return recovered;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function claimEmailSendAction(
+    id: string,
+    now: string,
+    leaseMilliseconds: number,
+    sendingEnabled: boolean,
+  ): EmailSendClaimResult {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = getAction(id);
+      if (!current || current.payload.kind !== 'email-send') {
+        db.exec('COMMIT');
+        return { outcome: 'not_found', action: null };
+      }
+      let action = current as EmailSendAction;
+      if (action.state === 'running' && action.leaseUntil !== null && action.leaseUntil <= now) {
+        action = markEmailSendUnknown(action, now);
+        db.exec('COMMIT');
+        return { outcome: 'unavailable', action };
+      }
+      if (action.state === 'queued' && !sendingEnabled) {
+        db.exec('COMMIT');
+        return { outcome: 'disabled', action };
+      }
+      if (action.state !== 'queued' && action.state !== 'unknown') {
+        db.exec('COMMIT');
+        return { outcome: 'unavailable', action };
+      }
+      const mode = action.state === 'unknown' ? 'reconcile' as const : 'send' as const;
+      const claimId = randomUUID();
+      const leaseUntil = new Date(Date.parse(now) + leaseMilliseconds).toISOString();
+      const version = action.version + 1;
+      const result = db.prepare(`UPDATE actions SET version=?, state='running', attempt_count=attempt_count+1,
+        next_attempt_at=NULL, claim_id=?, lease_until=?, error=NULL, updated_at=?
+        WHERE id=? AND version=? AND state=?`).run(
+        version, claimId, leaseUntil, now, action.id, action.version, action.state,
+      );
+      if (result.changes !== 1) throw new Error('Email send changed while Hermes was claiming it');
+      const claimed = getAction(action.id);
+      if (!claimed || claimed.payload.kind !== 'email-send') throw new Error('Claimed email send disappeared');
+      insertChange(db, {
+        actor: 'hermes', mutationKey: `hermes:email-send-claim:${action.id}:${claimId}`, entityKind: 'action',
+        entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(claimed),
+        details: { before: action.state, after: 'running', mode, attempt: claimed.attemptCount }, at: now,
+      });
+      db.exec('COMMIT');
+      return { outcome: 'claimed', action: claimed as EmailSendAction, mode, claimId };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function settleEmailSendAction(
+    id: string,
+    claimId: string,
+    input: EmailSendReceiptInput,
+    now: string,
+  ): EmailSendSettlementResult {
+    const resultHash = canonicalHash(input);
+    const mutationKey = `hermes:email-send-result:${id}:${claimId}`;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const replay = db.prepare('SELECT mutation_hash FROM changes WHERE mutation_key=?').get(mutationKey) as
+        Record<string, unknown> | undefined;
+      const current = getAction(id);
+      if (!current || current.payload.kind !== 'email-send') {
+        db.exec('COMMIT');
+        return { outcome: 'not_found', action: null };
+      }
+      let action = current as EmailSendAction;
+      if (replay) {
+        if (replay.mutation_hash !== resultHash) {
+          db.exec('COMMIT');
+          return { outcome: 'receipt_conflict', action };
+        }
+        const item = getInboxItem(action.payload.inboxId);
+        if (!item) throw new Error('Email receipt replay points to a missing Inbox item');
+        db.exec('COMMIT');
+        return { outcome: 'replayed', action, item };
+      }
+      if (action.state === 'running' && action.leaseUntil !== null && action.leaseUntil <= now) {
+        action = markEmailSendUnknown(action, now);
+        db.exec('COMMIT');
+        return { outcome: 'invalid_claim', action };
+      }
+      if (action.state !== 'running' || action.claimId !== claimId || action.leaseUntil === null) {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_claim', action };
+      }
+      if (input.payloadHash !== action.payload.payloadHash) {
+        db.exec('COMMIT');
+        return { outcome: 'hash_mismatch', action };
+      }
+      if (input.providerThreadId !== action.payload.reply.threadId ||
+        input.providerMessageId === action.payload.reply.replyToMessageId) {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_receipt', action };
+      }
+      const item = getInboxItem(action.payload.inboxId);
+      if (!item) throw new Error('Email send points to a missing Inbox item');
+      const actionVersion = action.version + 1;
+      const receipt = { ...input, receivedAt: now };
+      const actionResult = db.prepare(`UPDATE actions SET version=?, state='succeeded', next_attempt_at=NULL,
+        claim_id=NULL, lease_until=NULL, receipt_json=?, error=NULL, updated_at=?
+        WHERE id=? AND version=? AND state='running' AND claim_id=?`).run(
+        actionVersion, canonicalJson(receipt), now, action.id, action.version, claimId,
+      );
+      if (actionResult.changes !== 1) throw new Error('Email send changed while its receipt was being stored');
+      const settled = getAction(action.id);
+      if (!settled || settled.payload.kind !== 'email-send') throw new Error('Settled email send disappeared');
+      const inboxVersion = item.version + 1;
+      const inboxResult = db.prepare(`UPDATE inbox_items SET version=?, state='resolved', outcome='sent',
+        snoozed_until=NULL, updated_at=? WHERE id=? AND version=?`).run(inboxVersion, now, item.id, item.version);
+      if (inboxResult.changes !== 1) throw new Error('Inbox item changed while its email receipt was being stored');
+      const resolved = getInboxItem(item.id);
+      if (!resolved) throw new Error('Sent Inbox item disappeared');
+      insertChange(db, {
+        actor: 'hermes', mutationKey, mutationHash: resultHash, entityKind: 'action', entityId: action.id,
+        entityVersion: actionVersion, operation: 'transition', snapshot: actionSnapshot(settled),
+        details: {
+          before: 'running', after: 'succeeded', inboxId: item.id, inboxVersion,
+          payloadHash: action.payload.payloadHash, providerMessageId: input.providerMessageId,
+        }, at: now,
+      });
+      insertChange(db, {
+        actor: 'hermes', mutationKey: `hermes:inbox-sent:${action.id}:${inboxVersion}`, entityKind: 'inbox',
+        entityId: item.id, entityVersion: inboxVersion, operation: 'transition', snapshot: inboxSnapshot(resolved),
+        details: { before: item.state, after: 'resolved', outcome: 'sent', actionId: action.id }, at: now,
+      });
+      db.exec('COMMIT');
+      return { outcome: 'settled', action: settled as EmailSendAction, item: resolved };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
   function migrationActions(migrationId: string): ActionRow[] {
     const rows = db.prepare(`SELECT * FROM actions
       WHERE kind='task-migration' AND json_extract(payload_json, '$.migrationId')=?
@@ -2751,7 +3220,7 @@ export function createRowStore(db: DatabaseSync) {
           db.exec('COMMIT');
           return { outcome: 'inbox_not_found', inbox: null };
         }
-        if (inbox.version !== input.inbox.version || inbox.state === 'resolved') {
+        if (inbox.version !== input.inbox.version || inbox.state === 'resolved' || unsettledEmailSend(inbox.id)) {
           db.exec('COMMIT');
           return { outcome: 'inbox_conflict', inbox };
         }
@@ -3691,6 +4160,10 @@ export function createRowStore(db: DatabaseSync) {
     listChanges,
     readContext,
     insertApprovedAction,
+    queueEmailSendAction,
+    claimEmailSendAction,
+    settleEmailSendAction,
+    recoverExpiredEmailSendActions,
     migrationActions,
     listTaskMigrationRuns,
     isHermesTaskCoveredByMigration,

@@ -8,6 +8,8 @@ import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
 import { isDateKey } from '../src/calendar-time.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
 import {
+  isEmailSendApprovalInput,
+  isEmailSendReceiptInput,
   isHermesInboxUpsertInput,
   isInboxDecisionInput,
   isJobAnswerInput,
@@ -63,6 +65,7 @@ function providerFrom(value: string): 'google' | 'microsoft' | null {
 export type AppOptions = {
   pushPublicKey?: string;
   taskStatusToken?: string;
+  emailSendEnabled?: boolean;
   now?: () => Date;
   actionWorker?: { kick: () => void };
 };
@@ -100,6 +103,7 @@ export function createApp(
     throw new Error('Hermes task-status token must have at least 24 characters');
   }
   const now = options.now ?? (() => new Date());
+  const emailSendEnabled = options.emailSendEnabled === true;
   const app = new Hono();
   app.use('*', secureHeaders());
   const auth = basicAuth({ username: 'fox', password, realm: 'Fox Focus workspace' });
@@ -135,6 +139,7 @@ export function createApp(
   app.get('/app', (c) => c.redirect('/', 302));
   app.get('/api/v1/workspace', (c) => c.json(store.read()));
   app.get('/api/v1/rows', (c) => c.json({
+    capabilities: { emailSendEnabled },
     tasks: store.listTasks(),
     taskPlans: store.listTaskPlans(),
     inbox: store.listInboxItems(),
@@ -204,10 +209,36 @@ export function createApp(
   app.post('/api/v1/requests/:id/claim', (c) => {
     const id = c.req.param('id');
     if (!id || id.length > 200) return c.json({ error: 'Invalid request ID' }, 400);
-    const result = store.claimJob(id, now().toISOString(), 120_000);
+    const claimedAt = now().toISOString();
+    if (store.getJob(id)) {
+      const result = store.claimJob(id, claimedAt, 120_000);
+      if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
+      if (result.outcome === 'unavailable') {
+        return c.json({ error: 'Request is not available to claim', current: result.job }, 409);
+      }
+      return c.json({
+        kind: 'job',
+        job: result.job,
+        claimId: result.claimId,
+        leaseUntil: result.job.leaseUntil,
+      });
+    }
+    const result = store.claimEmailSendAction(id, claimedAt, 120_000, emailSendEnabled);
     if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
-    if (result.outcome === 'unavailable') return c.json({ error: 'Request is not available to claim', current: result.job }, 409);
-    return c.json({ job: result.job, claimId: result.claimId, leaseUntil: result.job.leaseUntil });
+    if (result.outcome === 'disabled') {
+      return c.json({ error: 'Email sending is disabled', current: result.action }, 503);
+    }
+    if (result.outcome === 'unavailable') {
+      return c.json({ error: 'Request is not available to claim', current: result.action }, 409);
+    }
+    if (!('mode' in result)) return c.json({ error: 'Request claim failed' }, 409);
+    return c.json({
+      kind: 'email-send',
+      action: result.action,
+      mode: result.mode,
+      claimId: result.claimId,
+      leaseUntil: result.action.leaseUntil,
+    });
   });
   app.post('/api/v1/requests/:id/result', async (c) => {
     const id = c.req.param('id');
@@ -218,13 +249,35 @@ export function createApp(
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
     let body: unknown;
     try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
-    if (!isJobResultInput(body)) return c.json({ error: 'Invalid job update' }, 400);
-    const result = store.postJobResult(id, claimId, body, now().toISOString(), 120_000);
+    if (isJobResultInput(body)) {
+      const result = store.postJobResult(id, claimId, body, now().toISOString(), 120_000);
+      if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
+      if (result.outcome === 'invalid_claim') {
+        return c.json({ error: 'Claim is invalid or expired', current: result.job }, 409);
+      }
+      if (result.outcome === 'invalid_state') {
+        return c.json({ error: 'Request is not working', current: result.job }, 409);
+      }
+      if (!('update' in result)) return c.json({ error: 'Request result failed' }, 409);
+      return c.json({ kind: 'job', outcome: result.outcome, job: result.job, update: result.update });
+    }
+    if (!isEmailSendReceiptInput(body)) return c.json({ error: 'Invalid request result' }, 400);
+    const result = store.settleEmailSendAction(id, claimId, body, now().toISOString());
     if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
-    if (result.outcome === 'invalid_claim') return c.json({ error: 'Claim is invalid or expired', current: result.job }, 409);
-    if (result.outcome === 'invalid_state') return c.json({ error: 'Request is not working', current: result.job }, 409);
-    if (!('update' in result)) return c.json({ error: 'Request result failed' }, 409);
-    return c.json({ outcome: result.outcome, job: result.job, update: result.update });
+    if (result.outcome === 'invalid_claim') {
+      return c.json({ error: 'Claim is invalid or expired', current: result.action }, 409);
+    }
+    if (result.outcome === 'hash_mismatch') {
+      return c.json({ error: 'Receipt payload hash does not match the approved envelope', current: result.action }, 409);
+    }
+    if (result.outcome === 'receipt_conflict') {
+      return c.json({ error: 'That claim already has a different receipt', current: result.action }, 409);
+    }
+    if (result.outcome === 'invalid_receipt') {
+      return c.json({ error: 'Receipt does not match the approved reply thread', current: result.action }, 409);
+    }
+    if (!('item' in result)) return c.json({ error: 'Request result failed' }, 409);
+    return c.json({ kind: 'email-send', outcome: result.outcome, action: result.action, item: result.item });
   });
   app.get('/api/v1/task-destinations', (c) => {
     if (!integrations) return c.json({ error: 'Google Tasks is not configured' }, 503);
@@ -465,6 +518,37 @@ export function createApp(
     if (result.outcome === 'not_email') return c.json({ error: 'Draft identity does not match the email', current: result.item }, 400);
     if (!('draft' in result)) return c.json({ error: 'Draft update failed' }, 409);
     return c.json({ item: result.item, draft: result.draft }, 201);
+  });
+  app.post('/api/v1/inbox-items/:inboxId/send', async (c) => {
+    if (!emailSendEnabled) return c.json({ error: 'Email sending is disabled' }, 503);
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) {
+      return c.json({ error: 'Expected application/json' }, 415);
+    }
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isEmailSendApprovalInput(body)) return c.json({ error: 'Invalid email send approval' }, 400);
+    const result = store.queueEmailSendAction(
+      c.req.param('inboxId'),
+      body.version,
+      body.draftId,
+      now().toISOString(),
+    );
+    if (result.outcome === 'not_found') return c.json({ error: 'Inbox item not found' }, 404);
+    if (result.outcome === 'conflict') {
+      return c.json({ error: 'Inbox item changed', current: result.item }, 409);
+    }
+    if (result.outcome === 'unavailable') {
+      return c.json({ error: 'Email send is already pending or unavailable', current: result.item }, 409);
+    }
+    if (result.outcome === 'not_email') {
+      return c.json({ error: 'Only email Inbox items can be sent', current: result.item }, 422);
+    }
+    if (result.outcome === 'invalid_draft') {
+      return c.json({ error: 'The current draft cannot be sent', current: result.item }, 422);
+    }
+    if (!('action' in result)) return c.json({ error: 'Email send approval failed' }, 409);
+    return c.json({ outcome: result.outcome, item: result.item, action: result.action },
+      result.outcome === 'queued' ? 202 : 200);
   });
   app.get('/api/v1/push/public-key', (c) => options.pushPublicKey
     ? c.json({ publicKey: options.pushPublicKey })

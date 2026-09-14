@@ -144,6 +144,18 @@ export type EmailSendPayload = {
   payloadHash: string;
 };
 
+export type EmailSendReceiptInput = {
+  kind: "email-send";
+  payloadHash: string;
+  providerMessageId: string;
+  providerThreadId: string;
+};
+
+export type EmailSendApprovalInput = {
+  version: number;
+  draftId: string;
+};
+
 export type TaskMigrationSource =
   | { kind: "fox"; taskId: string; version: number }
   | { kind: "hermes"; boardSlug: string; taskId: string; version: number };
@@ -402,6 +414,15 @@ function isOneLineText(value: unknown, maximum: number): value is string {
   return isShortText(value, maximum) && !/[\r\n]/.test(value);
 }
 
+function isMailHeaderText(value: unknown, maximum: number, allowEmpty = false): value is string {
+  return isShortText(value, maximum, allowEmpty) && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).length === keys.length && Object.keys(value).every(key => allowed.has(key));
+}
+
 export function isUtcInstant(value: unknown): value is Instant {
   return typeof value === "string" && value.endsWith("Z") && isIsoInstant(value);
 }
@@ -417,16 +438,34 @@ export function isNullableDateOnly(value: unknown): value is DateOnly | null {
 export function isReplyEnvelope(value: unknown): value is ReplyEnvelope {
   if (!isRecord(value)) return false;
   const addressList = (candidate: unknown) => Array.isArray(candidate) && candidate.length <= 100 &&
-    candidate.every(address => isShortText(address, 500));
-  return isShortText(value.accountId, 200) &&
-    isShortText(value.threadId, 500) &&
-    isShortText(value.replyToMessageId, 998) &&
-    isShortText(value.inReplyTo, 998) &&
+    candidate.every(address => isMailHeaderText(address, 500));
+  return hasExactKeys(value, [
+    "accountId", "threadId", "replyToMessageId", "inReplyTo", "references", "from",
+    "to", "cc", "bcc", "subject", "bodyText",
+  ]) && isMailHeaderText(value.accountId, 200) &&
+    isMailHeaderText(value.threadId, 500) &&
+    isMailHeaderText(value.replyToMessageId, 998) &&
+    isMailHeaderText(value.inReplyTo, 998) &&
     Array.isArray(value.references) && value.references.length <= 100 &&
-    value.references.every(reference => isShortText(reference, 998)) &&
-    isShortText(value.from, 500) &&
+    value.references.every(reference => isMailHeaderText(reference, 998)) &&
+    isMailHeaderText(value.from, 500) &&
     addressList(value.to) && addressList(value.cc) && addressList(value.bcc) &&
-    isShortText(value.subject, 998, true) && isShortText(value.bodyText, 200_000, true);
+    isMailHeaderText(value.subject, 998, true) && isShortText(value.bodyText, 200_000, true) &&
+    !value.bodyText.includes("\u0000");
+}
+
+export function isEmailSendReceiptInput(value: unknown): value is EmailSendReceiptInput {
+  return isRecord(value) && hasExactKeys(value, [
+    "kind", "payloadHash", "providerMessageId", "providerThreadId",
+  ]) && value.kind === "email-send" &&
+    typeof value.payloadHash === "string" && /^[A-Za-z0-9_-]{43}$/.test(value.payloadHash) &&
+    isMailHeaderText(value.providerMessageId, 998) && isMailHeaderText(value.providerThreadId, 998);
+}
+
+export function isEmailSendApprovalInput(value: unknown): value is EmailSendApprovalInput {
+  return isRecord(value) && hasExactKeys(value, ["version", "draftId"]) &&
+    typeof value.version === "number" && Number.isSafeInteger(value.version) && value.version >= 1 &&
+    isOneLineText(value.draftId, 200);
 }
 
 export function isTaskPlanInput(value: unknown): value is Omit<TaskPlanRow, "taskId" | "createdAt" | "updatedAt"> {

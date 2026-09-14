@@ -4,10 +4,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { isInboxDecisionInput, type HermesInboxUpsertInput, type InboxItemRow, type ReplyEnvelope } from '../src/row-model.ts';
+import {
+  isEmailSendReceiptInput,
+  isInboxDecisionInput,
+  isReplyEnvelope,
+  type ActionRow,
+  type HermesInboxUpsertInput,
+  type InboxItemRow,
+  type ReplyEnvelope,
+} from '../src/row-model.ts';
 import type { PrototypeData } from '../src/model.ts';
 import { createApp } from './app.ts';
-import { canonicalHash, ROW_SCHEMA_VERSION } from './row-store.ts';
+import { canonicalHash, emailSendPayloadHash, ROW_SCHEMA_VERSION } from './row-store.ts';
 import { openStore } from './store.ts';
 
 const fixturePath = new URL('./fixtures/workspace-v7.json', import.meta.url);
@@ -557,6 +565,266 @@ test('a lost Hermes upsert response replays the current owner draft honestly', (
     assert.equal(replay.draft?.author, 'owner');
     assert.equal(replay.draft?.reply.bodyText, 'Owner wording after the lost response');
   } finally { store.close(); }
+});
+
+test('email envelope guards reject injected headers, extra MIME, and malformed receipts', () => {
+  const reply = replyEnvelope('message-guard', 'thread-guard', 'First line\nSecond line');
+  assert.equal(isReplyEnvelope(reply), true);
+  assert.equal(isReplyEnvelope({ ...reply, subject: 'Hello\r\nBcc: attacker@example.test' }), false);
+  assert.equal(isReplyEnvelope({ ...reply, to: ['friend@example.test\nCc: attacker@example.test'] }), false);
+  assert.equal(isReplyEnvelope({ ...reply, mime: 'raw MIME must never be stored' }), false);
+  assert.equal(isEmailSendReceiptInput({
+    kind: 'email-send', payloadHash: 'A'.repeat(43),
+    providerMessageId: 'sent-message', providerThreadId: 'thread-guard',
+  }), true);
+  assert.equal(isEmailSendReceiptInput({
+    kind: 'email-send', payloadHash: 'A'.repeat(43),
+    providerMessageId: 'sent-message\r\nX-Injected: yes', providerThreadId: 'thread-guard',
+  }), false);
+  assert.equal(isEmailSendReceiptInput({
+    kind: 'email-send', payloadHash: 'A'.repeat(43),
+    providerMessageId: 'sent-message', providerThreadId: 'thread-guard', mime: 'forbidden',
+  }), false);
+});
+
+test('email send approval pins the exact envelope and settles only an exact replay-safe receipt', () => {
+  const store = openStore(':memory:', workspaceFixture());
+  try {
+    const input = emailInput('message-send', 'thread-send', 'Approved wording');
+    const initial = store.upsertHermesInbox(
+      'email-send-1', canonicalHash(input), input, '2026-09-14T10:00:00.000Z',
+    );
+    assert.equal(initial.outcome, 'created');
+    if (initial.outcome !== 'created' || !initial.draft) return;
+
+    assert.equal(emailSendPayloadHash({
+      inboxId: 'inbox-golden',
+      draftId: 'draft-golden',
+      reply: replyEnvelope('message-send', 'thread-1', 'Approved wording'),
+    }), 'odrnJF5zH-so1Uu51RZZ69M_FpVfVSEPNT1cPEWYi8Y');
+
+    const queued = store.queueEmailSendAction(
+      initial.item.id, initial.item.version, initial.draft.id, '2026-09-14T10:01:00.000Z',
+    );
+    assert.equal(queued.outcome, 'queued');
+    if (queued.outcome !== 'queued') return;
+    assert.deepEqual(queued.action.payload.reply, initial.draft.reply);
+    assert.deepEqual(Object.keys(queued.action.payload).sort(), ['draftId', 'inboxId', 'kind', 'payloadHash', 'reply']);
+    assert.deepEqual(Object.keys(queued.action.payload.reply).sort(), [
+      'accountId', 'bcc', 'bodyText', 'cc', 'from', 'inReplyTo', 'references',
+      'replyToMessageId', 'subject', 'threadId', 'to',
+    ]);
+    assert.equal(queued.action.payload.payloadHash, emailSendPayloadHash({
+      inboxId: initial.item.id, draftId: initial.draft.id, reply: initial.draft.reply,
+    }));
+    assert.match(queued.action.payload.payloadHash, /^[A-Za-z0-9_-]{43}$/);
+    assert.match(queued.action.approval.previewText, /Approved wording/);
+    assert.match(queued.action.approval.previewText, new RegExp(queued.action.payload.payloadHash));
+    assert.equal(JSON.stringify(queued.action).includes('"mime"'), false);
+
+    assert.equal(store.appendOwnerDraft(
+      initial.item.id,
+      initial.item.version,
+      replyEnvelope('message-send', 'thread-send', 'Changed after approval'),
+      '2026-09-14T10:01:01.000Z',
+    ).outcome, 'conflict');
+    assert.equal(store.updateInboxDecision(initial.item.id, initial.item.version, {
+      state: 'resolved', outcome: 'read', snoozedUntil: null,
+    }, '2026-09-14T10:01:02.000Z'), null);
+    publishFreshGoogleList(store);
+    assert.equal(queueGoogleCreate(store, {
+      nonce: 'queued_send_make_task',
+      inbox: { id: initial.item.id, version: initial.item.version },
+    }).outcome, 'inbox_conflict');
+
+    const replacement: HermesInboxUpsertInput = {
+      ...input,
+      expectedVersion: initial.item.version,
+      summary: 'Hermes refreshed the summary after approval.',
+      draft: replyEnvelope('message-send', 'thread-send', 'Hermes replacement'),
+    };
+    const refreshed = store.upsertHermesInbox(
+      'email-send-2', canonicalHash(replacement), replacement, '2026-09-14T10:01:03.000Z',
+    );
+    assert.equal(refreshed.outcome, 'updated');
+    if (refreshed.outcome !== 'updated') return;
+    assert.equal(refreshed.draftOutcome, 'kept_approved');
+    assert.equal(refreshed.item.currentDraftId, initial.draft.id);
+    assert.equal(store.listDrafts(initial.item.id).length, 1);
+
+    assert.equal(store.claimEmailSendAction(
+      queued.action.id, '2026-09-14T10:01:04.000Z', 120_000, false,
+    ).outcome, 'disabled');
+    const claim = store.claimEmailSendAction(
+      queued.action.id, '2026-09-14T10:01:05.000Z', 120_000, true,
+    );
+    assert.equal(claim.outcome, 'claimed');
+    if (claim.outcome !== 'claimed') return;
+    assert.equal(claim.mode, 'send');
+
+    const wrongHash = queued.action.payload.payloadHash.endsWith('A')
+      ? `${queued.action.payload.payloadHash.slice(0, -1)}B`
+      : `${queued.action.payload.payloadHash.slice(0, -1)}A`;
+    assert.equal(store.settleEmailSendAction(claim.action.id, claim.claimId, {
+      kind: 'email-send', payloadHash: wrongHash,
+      providerMessageId: 'sent-message-send', providerThreadId: 'thread-send',
+    }, '2026-09-14T10:01:06.000Z').outcome, 'hash_mismatch');
+    assert.equal(store.getAction(claim.action.id)?.state, 'running');
+    assert.equal(store.settleEmailSendAction(claim.action.id, claim.claimId, {
+      kind: 'email-send', payloadHash: queued.action.payload.payloadHash,
+      providerMessageId: 'sent-message-send', providerThreadId: 'different-thread',
+    }, '2026-09-14T10:01:07.000Z').outcome, 'invalid_receipt');
+    assert.equal(store.settleEmailSendAction(claim.action.id, claim.claimId, {
+      kind: 'email-send', payloadHash: queued.action.payload.payloadHash,
+      providerMessageId: 'message-send', providerThreadId: 'thread-send',
+    }, '2026-09-14T10:01:08.000Z').outcome, 'invalid_receipt');
+
+    const receipt = {
+      kind: 'email-send' as const,
+      payloadHash: queued.action.payload.payloadHash,
+      providerMessageId: 'sent-message-send',
+      providerThreadId: 'thread-send',
+    };
+    const settled = store.settleEmailSendAction(
+      claim.action.id, claim.claimId, receipt, '2026-09-14T10:01:09.000Z',
+    );
+    assert.equal(settled.outcome, 'settled');
+    if (settled.outcome !== 'settled') return;
+    assert.equal(settled.action.state, 'succeeded');
+    assert.equal(settled.item.state, 'resolved');
+    assert.equal(settled.item.outcome, 'sent');
+    assert.deepEqual(settled.action.receipt, { ...receipt, receivedAt: '2026-09-14T10:01:09.000Z' });
+    assert.equal(store.settleEmailSendAction(
+      claim.action.id, claim.claimId, receipt, '2026-09-14T10:01:10.000Z',
+    ).outcome, 'replayed');
+    assert.equal(store.settleEmailSendAction(claim.action.id, claim.claimId, {
+      ...receipt, providerMessageId: 'different-sent-message',
+    }, '2026-09-14T10:01:11.000Z').outcome, 'receipt_conflict');
+    assert.equal(store.updateInboxDecision(settled.item.id, settled.item.version, {
+      state: 'open', outcome: null, snoozedUntil: null,
+    }, '2026-09-14T10:01:12.000Z'), null);
+    assert.equal(store.queueEmailSendAction(
+      settled.item.id, settled.item.version, initial.draft.id, '2026-09-14T10:01:13.000Z',
+    ).outcome, 'replayed');
+  } finally { store.close(); }
+});
+
+test('an expired email send becomes unknown and can only be claimed for reconciliation', () => {
+  const store = openStore(':memory:', workspaceFixture());
+  try {
+    const input = emailInput('message-unknown', 'thread-unknown', 'Please confirm.');
+    const initial = store.upsertHermesInbox(
+      'email-unknown-1', canonicalHash(input), input, '2026-09-14T10:00:00.000Z',
+    );
+    assert.equal(initial.outcome, 'created');
+    if (initial.outcome !== 'created' || !initial.draft) return;
+    const queued = store.queueEmailSendAction(
+      initial.item.id, initial.item.version, initial.draft.id, '2026-09-14T10:00:01.000Z',
+    );
+    assert.equal(queued.outcome, 'queued');
+    if (queued.outcome !== 'queued') return;
+    const sentClaim = store.claimEmailSendAction(
+      queued.action.id, '2026-09-14T10:00:02.000Z', 1_000, true,
+    );
+    assert.equal(sentClaim.outcome, 'claimed');
+    if (sentClaim.outcome !== 'claimed') return;
+    assert.equal(sentClaim.mode, 'send');
+    assert.equal(store.recoverExpiredEmailSendActions('2026-09-14T10:00:02.500Z'), 0);
+    assert.equal(store.recoverExpiredEmailSendActions('2026-09-14T10:00:03.000Z'), 1);
+    const unknown = store.getAction(queued.action.id);
+    assert.equal(unknown?.state, 'unknown');
+    assert.equal(unknown?.claimId, null);
+    assert.equal(unknown?.leaseUntil, null);
+    assert.match(unknown?.error ?? '', /Reconciliation is required/);
+    assert.equal(store.appendOwnerDraft(
+      initial.item.id,
+      initial.item.version,
+      replyEnvelope('message-unknown', 'thread-unknown', 'Unsafe changed wording'),
+      '2026-09-14T10:00:04.000Z',
+    ).outcome, 'conflict');
+    assert.equal(store.updateInboxDecision(initial.item.id, initial.item.version, {
+      state: 'resolved', outcome: 'read', snoozedUntil: null,
+    }, '2026-09-14T10:00:04.000Z'), null);
+    publishFreshGoogleList(store);
+    assert.equal(queueGoogleCreate(store, {
+      nonce: 'unknown_send_make_task',
+      inbox: { id: initial.item.id, version: initial.item.version },
+    }).outcome, 'inbox_conflict');
+
+    const replacement: HermesInboxUpsertInput = {
+      ...input,
+      expectedVersion: initial.item.version,
+      draft: replyEnvelope('message-unknown', 'thread-unknown', 'Unsafe Hermes replacement'),
+    };
+    const upserted = store.upsertHermesInbox(
+      'email-unknown-2', canonicalHash(replacement), replacement, '2026-09-14T10:00:04.000Z',
+    );
+    assert.equal(upserted.outcome, 'updated');
+    if (upserted.outcome !== 'updated') return;
+    assert.equal(upserted.draftOutcome, 'kept_approved');
+    assert.equal(upserted.item.currentDraftId, initial.draft.id);
+
+    const reconciliation = store.claimEmailSendAction(
+      queued.action.id, '2026-09-14T10:00:05.000Z', 1_000, false,
+    );
+    assert.equal(reconciliation.outcome, 'claimed');
+    if (reconciliation.outcome !== 'claimed') return;
+    assert.equal(reconciliation.mode, 'reconcile');
+    assert.equal(reconciliation.action.attemptCount, 2);
+    const expiredReceipt = store.settleEmailSendAction(reconciliation.action.id, reconciliation.claimId, {
+      kind: 'email-send', payloadHash: queued.action.payload.payloadHash,
+      providerMessageId: 'sent-message-unknown', providerThreadId: 'thread-unknown',
+    }, '2026-09-14T10:00:06.000Z');
+    assert.equal(expiredReceipt.outcome, 'invalid_claim');
+    assert.equal(expiredReceipt.action.state, 'unknown');
+    const next = store.claimEmailSendAction(
+      queued.action.id, '2026-09-14T10:00:07.000Z', 1_000, false,
+    );
+    assert.equal(next.outcome, 'claimed');
+    if (next.outcome === 'claimed') assert.equal(next.mode, 'reconcile');
+  } finally { store.close(); }
+});
+
+test('the action decoder keeps Hermes version zero migration actions across restart', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fox-focus-action-decoder-'));
+  const path = join(dir, 'focus.sqlite');
+  let store = openStore(path, workspaceFixture());
+  try {
+    const source = { kind: 'hermes' as const, boardSlug: 'personal-tasks', taskId: 'hermes-zero', version: 0 };
+    const payload: Extract<ActionRow['payload'], { kind: 'task-migration' }> = {
+      kind: 'task-migration', migrationId: `migration-${'a'.repeat(32)}`, previewHash: 'preview-hash',
+      sourceKey: 'hermes:personal-tasks:hermes-zero', sourceSnapshot: { id: 'hermes-zero', version: 0 },
+      operation: 'bind', taskId: 'legacy-open', source, sourceAliases: [source],
+      destination: { accountId: 'google-account', listId: 'my-tasks' }, destinationName: 'My Tasks',
+      existingExternalId: 'google-existing', targetSnapshot: {
+        title: 'Migrated task', status: 'open', doOn: '2026-09-20', etag: 'etag-1',
+        observedAt: '2026-09-14T09:00:00.000Z',
+      },
+      nonce: null, title: 'Migrated task', notes: 'Preserved notes', doOn: '2026-09-20',
+      plan: {
+        priority: 'medium', waiting: false, deadlineOn: '2026-09-21', plannedOn: null,
+        plannedAt: '2026-09-20T09:00:00.000Z', estimateMinutes: 30,
+      },
+      reminder: null, preservedReminders: [], resumedFromActionId: null,
+    };
+    const action: ActionRow = {
+      id: 'migration-hermes-zero', version: 1, payload,
+      operationKey: 'task-migration:hermes-zero', requestHash: canonicalHash(payload),
+      approval: { actor: 'owner', at: '2026-09-14T10:00:00.000Z', previewText: 'Bind Hermes task.' },
+      state: 'queued', attemptCount: 0, nextAttemptAt: null, claimId: null, leaseUntil: null,
+      receipt: null, error: null, createdAt: '2026-09-14T10:00:00.000Z', updatedAt: '2026-09-14T10:00:00.000Z',
+    };
+    store.insertApprovedAction(action);
+    assert.equal(store.getAction(action.id)?.payload.kind, 'task-migration');
+    store.close();
+    store = openStore(path);
+    const reopened = store.getAction(action.id);
+    assert.equal(reopened?.payload.kind, 'task-migration');
+    assert.equal(reopened?.payload.kind === 'task-migration' ? reopened.payload.source.version : null, 0);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true });
+  }
 });
 
 test('jobs support claims, questions, answers, retry-safe results, send back, and settlement', () => {

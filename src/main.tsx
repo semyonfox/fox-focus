@@ -46,9 +46,12 @@ import { IntegrationCalendarContext, IntegrationsDrawer, providerLabel, useOverv
 import { areaForList } from './integration-model.ts';
 import {
   answerJob,
+  approveEmailSend,
   createGoogleTask,
   createJob,
   decideInboxItem,
+  emailSendBlocksInboxMutation,
+  emailSendUiState,
   isTaskCreateActionRow,
   loadTaskDestinations,
   loadWorkRows,
@@ -484,8 +487,11 @@ function jobStateLabel(job: Job): string {
   return job.outcome === "accepted" ? "Accepted" : "Dropped";
 }
 
-function inboxStateLabel(item: InboxItemRow, pendingSend: boolean): string {
-  if (pendingSend) return "Sending";
+function inboxStateLabel(item: InboxItemRow, sendState: ReturnType<typeof emailSendUiState>): string {
+  if (sendState === "sending") return "Sending";
+  if (sendState === "reconciling") return "Reconciling";
+  if (sendState === "unknown") return "Needs reconciliation";
+  if (sendState === "failed") return "Send failed";
   if (item.state === "waiting") return item.snoozedUntil && Date.parse(item.snoozedUntil) <= Date.now() ? "Ready" : "Snoozed";
   if (item.state === "resolved") {
     if (item.outcome === "task") return "Task made";
@@ -831,7 +837,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   const hasLiveWork = workRows?.jobs.some((job) => job.state === "queued" || job.state === "working") === true ||
     workRows?.actions.some((action) => (action.payload.kind === "task-create" || action.payload.kind === "email-send") &&
-      (action.state === "queued" || action.state === "running")) === true;
+      (action.state === "queued" || action.state === "running" ||
+        (action.payload.kind === "email-send" && action.state === "unknown"))) === true;
 
   useEffect(() => {
     if (!initial) return;
@@ -1203,21 +1210,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const inboxThreads = (workRows?.inbox ?? []).map<WorkThread>((item) => {
       const stillSnoozed = item.state === "waiting" &&
         (item.snoozedUntil === null || Date.parse(item.snoozedUntil) > Date.now());
+      const sendAction = latestSendActionByInbox.get(item.id);
       return {
         key: `inbox:${item.id}`,
         kind: "inbox",
         title: item.title,
         source: inboxSourceLabel(item),
-        updatedAt: item.updatedAt,
+        updatedAt: sendAction && sendAction.updatedAt > item.updatedAt ? sendAction.updatedAt : item.updatedAt,
         group: pendingSendInboxIds.has(item.id)
           ? "working"
-          : item.likelyNoise
-            ? "noise"
-            : item.state === "resolved"
-              ? "settled"
-              : stillSnoozed
-                ? "working"
-                : "needs_you",
+          : problemSendInboxIds.has(item.id)
+            ? "needs_you"
+            : item.likelyNoise
+              ? "noise"
+              : item.state === "resolved"
+                ? "settled"
+                : stillSnoozed
+                  ? "working"
+                  : "needs_you",
         item,
         job: null,
       };
@@ -1241,7 +1251,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     });
     return [...inboxThreads, ...jobThreads]
       .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt) || first.key.localeCompare(second.key));
-  }, [inboxRowById, pendingSendInboxIds, workRows?.inbox, workRows?.jobs]);
+  }, [inboxRowById, latestSendActionByInbox, pendingSendInboxIds, problemSendInboxIds, workRows?.inbox, workRows?.jobs]);
   const needsYouThreads = workThreads.filter((thread) => thread.group === "needs_you");
   const workingThreads = workThreads.filter((thread) => thread.group === "working");
   const settledThreads = workThreads.filter((thread) => thread.group === "settled");
@@ -2245,6 +2255,33 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
   }
 
+  function sendWorkItem(item: InboxItemRow) {
+    const draft = draftByInboxId.get(item.id);
+    const state = emailSendUiState(
+      item,
+      draft,
+      latestSendActionByInbox.get(item.id),
+      workRows?.capabilities.emailSendEnabled ?? false,
+    );
+    if (!draft || state !== "ready") {
+      setStatusMessage(state === "sending"
+        ? "This reply is already with Hermes."
+        : state === "reconciling"
+          ? "Hermes is reconciling this send."
+          : state === "unknown"
+            ? "Hermes must reconcile this send before anything else changes."
+            : state === "failed"
+              ? "This send failed and needs review."
+              : "Email sending is not available.");
+      return;
+    }
+    void runWorkMutation(
+      `inbox:${item.id}:send`,
+      () => approveEmailSend(item, draft),
+      "Approved reply handed to Hermes.",
+    );
+  }
+
   function chooseNextWorkThread(currentKey: string) {
     const next = [...needsYouThreads, ...workingThreads].find((thread) => thread.key !== currentKey);
     if (next) setSelectedWorkKey(next.key);
@@ -2272,7 +2309,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function canMutateInboxItem(item: InboxItemRow): boolean {
-    return item.state !== "resolved" && !pendingSendInboxIds.has(item.id) && workBusyKey === null;
+    return item.state !== "resolved" &&
+      !emailSendBlocksInboxMutation(latestSendActionByInbox.get(item.id)) && workBusyKey === null;
   }
 
   function openReplyEditor(item: InboxItemRow) {
@@ -2356,6 +2394,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         jobs: [job],
         jobUpdates: [],
         actions: [],
+        capabilities: current?.capabilities ?? { emailSendEnabled: false },
       }));
       setJobComposer(null);
       setStatusMessage("Handed to Hermes.");
@@ -2508,13 +2547,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const item = thread.kind === "inbox" ? thread.item : null;
       const job = thread.job;
       const canAct = item ? canMutateInboxItem(item) : false;
+      const canAskHermes = Boolean(item && item.state !== "resolved" && workBusyKey === null);
       if (event.key === "s" && item?.source.kind === "email") {
         event.preventDefault();
-        setStatusMessage("Email sending is off until the Hermes executor is verified.");
+        sendWorkItem(item);
       } else if (event.key === "d" && canAct && item?.source.kind === "email" && draftByInboxId.has(item.id)) {
         event.preventDefault();
         openReplyEditor(item);
-      } else if (event.key === "h" && canAct && item) {
+      } else if (event.key === "h" && canAskHermes && item) {
         event.preventDefault();
         openJobComposer({ title: item.title, inboxId: item.id });
       } else if (event.key === "t" && canAct && item && !item.taskId) {
@@ -2866,8 +2906,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function renderWorkInboxView() {
     function renderThread(thread: WorkThread) {
-      const pendingSend = thread.item ? pendingSendInboxIds.has(thread.item.id) : false;
-      const state = thread.job ? jobStateLabel(thread.job) : thread.item ? inboxStateLabel(thread.item, pendingSend) : "";
+      const sendState = thread.item
+        ? emailSendUiState(
+            thread.item,
+            draftByInboxId.get(thread.item.id),
+            latestSendActionByInbox.get(thread.item.id),
+            workRows?.capabilities.emailSendEnabled ?? false,
+          )
+        : "disabled";
+      const state = thread.job ? jobStateLabel(thread.job) : thread.item ? inboxStateLabel(thread.item, sendState) : "";
       return <button
         className={`work-thread${selectedWorkThread?.key === thread.key ? " work-thread--selected" : ""}`}
         type="button"
@@ -2899,15 +2946,32 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
 
     const actionItem = selectedWorkThread?.kind === "inbox" ? selectedWorkItem : null;
-    const pendingSend = actionItem ? pendingSendInboxIds.has(actionItem.id) : false;
     const problemSend = actionItem ? problemSendInboxIds.has(actionItem.id) : false;
+    const sendState = actionItem
+      ? emailSendUiState(
+          actionItem,
+          selectedWorkDraft,
+          latestSendActionByInbox.get(actionItem.id),
+          workRows?.capabilities.emailSendEnabled ?? false,
+        )
+      : "disabled";
     const detailState = selectedWorkJob
       ? jobStateLabel(selectedWorkJob)
       : selectedWorkItem
-        ? inboxStateLabel(selectedWorkItem, pendingSend)
+        ? inboxStateLabel(selectedWorkItem, sendState)
         : "";
     const itemCanAct = actionItem ? canMutateInboxItem(actionItem) : false;
     const jobBusy = workBusyKey !== null;
+    const itemCanAskHermes = Boolean(actionItem && actionItem.state !== "resolved" && !jobBusy);
+    const sendButtonLabel = sendState === "sending"
+      ? "Sending"
+      : sendState === "reconciling"
+        ? "Reconciling"
+        : sendState === "unknown"
+          ? "Needs reconciliation"
+          : sendState === "failed"
+            ? "Send failed"
+            : "Send";
     const linkedJobTaskUnavailable = selectedWorkJob ? !canAcceptJob(selectedWorkJob) : false;
 
     return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
@@ -2936,7 +3000,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             <p className="work-thread-summary">{selectedWorkJob?.instruction ?? selectedWorkItem?.summary}</p>
             {selectedWorkJob?.question ? <blockquote className="job-question"><span>Hermes asks</span>{selectedWorkJob.question}</blockquote> : null}
             {selectedWorkJob?.taskId ? <p className="work-link-note"><ListTodo size={12} /> Linked task</p> : null}
-            {problemSend ? <p className="work-warning"><RefreshCw size={12} /> Send outcome needs reconciliation.</p> : null}
+            {problemSend ? <p className="work-warning"><RefreshCw size={12} /> {sendState === "unknown" ? "Send outcome needs reconciliation." : "Send failed and needs review."}</p> : null}
             {selectedWorkDraft ? <section className="reply-preview">
               <header><span>Reply draft</span><em>{selectedWorkDraft.author} · r{selectedWorkDraft.revision}</em></header>
               <dl>
@@ -2965,12 +3029,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {selectedWorkJob?.state === "review" ? <div className="job-response"><label htmlFor="job-reply">Send-back note</label><div><input id="job-reply" maxLength={280} value={jobReply} onChange={(event) => setJobReply(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); sendBackSelectedJob(selectedWorkJob); } }} /><button className="secondary-action" type="button" disabled={jobBusy} onClick={() => sendBackSelectedJob(selectedWorkJob)}><CornerUpLeft size={12} /> Send back <kbd>b</kbd></button></div></div> : null}
             <footer className="work-thread-actions">
               {actionItem?.source.kind === "email" && actionItem.state !== "resolved" ? <>
-                <p className="send-disabled-copy" id="email-send-disabled-copy">Send is off until Hermes executor verification.</p>
-                <button className="page-primary-action" type="button" disabled aria-describedby="email-send-disabled-copy"><Send size={12} /> Send <kbd>s</kbd></button>
+                <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} title={sendState === "disabled" ? "Email sending is disabled on the server" : undefined} onClick={() => sendWorkItem(actionItem)}><Send size={12} /> {sendButtonLabel} <kbd>s</kbd></button>
                 <button className="secondary-action" type="button" disabled={!selectedWorkDraft || !itemCanAct} onClick={() => openReplyEditor(actionItem)}><Pencil size={12} /> Edit draft <kbd>d</kbd></button>
               </> : null}
               {actionItem && actionItem.state !== "resolved" ? <>
-                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => openJobComposer({ title: actionItem.title, inboxId: actionItem.id })}><MessageSquare size={12} /> Ask Hermes <kbd>h</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAskHermes} onClick={() => openJobComposer({ title: actionItem.title, inboxId: actionItem.id })}><MessageSquare size={12} /> Ask Hermes <kbd>h</kbd></button>
                 <button className="secondary-action" type="button" disabled={!itemCanAct || Boolean(actionItem.taskId)} onClick={() => openTaskComposer(undefined, undefined, actionItem)}><ListTodo size={12} /> Make task <kbd>t</kbd></button>
                 <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => snoozeWorkItem(actionItem)}><Clock3 size={12} /> Snooze <kbd>z</kbd></button>
                 <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "read")}><Check size={12} /> Done <kbd>e</kbd></button>
