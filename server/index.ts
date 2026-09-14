@@ -8,7 +8,14 @@ import { createIntegrationService, integrationConfigFromEnvironment } from './in
 import { openStore } from './store.ts';
 import { createHermesActionClient, createHermesMirrorService, type HermesActionClient } from './hermes.ts';
 import webPush from 'web-push';
-import { deliverDuePushNotifications, deliveryKey, subscriptionDeliveryKey } from './push.ts';
+import {
+  deliverDuePushNotifications,
+  deliveryKey,
+  formatPushReminderTime,
+  mergeReminderSources,
+  projectRowReminder,
+  subscriptionDeliveryKey,
+} from './push.ts';
 import { adoptedTaskIdForHermes } from './task-management.ts';
 import { createTaskStatusActionWorker } from './action-worker.ts';
 
@@ -36,7 +43,7 @@ const emailSendRequested = process.env.EMAIL_SEND_ENABLED === 'true';
 let taskStatusToken: string | undefined;
 if (taskStatusTokenPath) {
   taskStatusToken = readFileSync(taskStatusTokenPath, 'utf8').trim();
-  if (!taskStatusToken) throw new Error('Hermes task-status token file is empty');
+  if (!taskStatusToken) throw new Error('Hermes API token file is empty');
 }
 if (emailSendRequested && !taskStatusToken) throw new Error('EMAIL_SEND_ENABLED requires HERMES_STATUS_TOKEN_FILE');
 const emailSendEnabled = emailSendRequested;
@@ -119,10 +126,31 @@ async function sendDuePushNotifications(): Promise<void> {
       .filter(reminder => !belongsToAdoptedTask(reminder.targetId));
     const retainedHermesReminders = store.listHermesReminders(true)
       .filter(reminder => !belongsToAdoptedTask(reminder.targetId));
-    const notificationData = { ...snapshot.data, reminders: [...snapshot.data.reminders, ...hermesReminders] };
+    const rowReminders = store.listReminders().flatMap(reminder => {
+      let title = 'Reminder';
+      if (reminder.target.kind === 'task') {
+        const task = store.getTask(reminder.target.id);
+        const createAction = task?.binding.kind === 'pending' ? store.getAction(task.binding.createActionId) : null;
+        const legacyTitle = task?.binding.kind === 'legacy' ? task.binding.source.title : null;
+        title = task?.observed?.title ??
+          (createAction?.payload.kind === 'task-create' ? createAction.payload.title : null) ??
+          (typeof legacyTitle === 'string' ? legacyTitle : null) ??
+          'Task reminder';
+      } else {
+        title = snapshot.data.events.find(event => event.id === reminder.target.id)?.title ?? 'Calendar reminder';
+      }
+      const projected = projectRowReminder(reminder, title, formatPushReminderTime(reminder.fireAt));
+      return projected ? [projected] : [];
+    });
+    const notificationReminders = mergeReminderSources(snapshot.data.reminders, rowReminders, hermesReminders);
+    const notificationData = { reminders: notificationReminders };
     // Keep delivery keys for the last good Hermes mirror while polling is
     // stale or disabled, but never send reminders from that unverified view.
-    store.prunePushDeliveries([...snapshot.data.reminders, ...retainedHermesReminders].map(deliveryKey));
+    store.prunePushDeliveries(mergeReminderSources(
+      snapshot.data.reminders,
+      rowReminders,
+      retainedHermesReminders,
+    ).map(deliveryKey));
     const summary = await deliverDuePushNotifications({
       data: notificationData,
       now: new Date(),

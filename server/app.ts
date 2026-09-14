@@ -8,6 +8,7 @@ import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
 import { isDateKey } from '../src/calendar-time.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
 import {
+  isBriefingUpsertInput,
   isEmailSendApprovalInput,
   isEmailSendReceiptInput,
   isHermesInboxUpsertInput,
@@ -79,6 +80,7 @@ function tokenMatches(value: string, expected: string): boolean {
 function isHermesApiRequest(method: string, path: string): boolean {
   return (method === 'GET' && (path === '/api/v1/context' || path === '/api/v1/changes')) ||
     (method === 'PUT' && /^\/api\/v1\/inbox\/[^/]+$/.test(path)) ||
+    (method === 'PUT' && /^\/api\/v1\/briefings\/\d{4}-\d{2}-\d{2}$/.test(path)) ||
     (method === 'POST' && /^\/api\/v1\/requests\/[^/]+\/(?:claim|result)$/.test(path));
 }
 
@@ -100,7 +102,7 @@ export function createApp(
   // characters and the operator guidance requires at least 24.
   if (password.length < 8) throw new Error('Workspace password must have at least 8 characters');
   if (options.taskStatusToken !== undefined && options.taskStatusToken.length < 24) {
-    throw new Error('Hermes task-status token must have at least 24 characters');
+    throw new Error('Hermes API token must have at least 24 characters');
   }
   const now = options.now ?? (() => new Date());
   const emailSendEnabled = options.emailSendEnabled === true;
@@ -148,6 +150,7 @@ export function createApp(
     jobUpdates: store.listJobUpdates(),
     actions: store.listActions(),
     reminders: store.listReminders(),
+    briefings: store.listBriefings(),
     freshness: store.listSyncStates(),
   }));
   app.get('/api/v1/context', (c) => {
@@ -156,7 +159,7 @@ export function createApp(
     if (!from || !to || !isDateKey(from) || !isDateKey(to) || from > to) {
       return c.json({ error: 'A valid from and to date are required' }, 400);
     }
-    return c.json(store.readContext(from, to));
+    return c.json(store.readContext(from, to, now().toISOString()));
   });
   app.get('/api/v1/changes', (c) => {
     const afterText = c.req.query('after') ?? '0';
@@ -169,6 +172,22 @@ export function createApp(
     }
     const page = store.listChanges(after, limit);
     return page.resetRequired ? c.json({ error: 'Change cursor expired', resetRequired: true, cursor: page.cursor }, 410) : c.json(page);
+  });
+  app.put('/api/v1/briefings/:day', async (c) => {
+    const day = c.req.param('day');
+    if (!isDateKey(day)) return c.json({ error: 'Invalid briefing day' }, 400);
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isBriefingUpsertInput(body)) return c.json({ error: 'Invalid briefing' }, 400);
+    const result = store.upsertBriefing(day, body, now().toISOString());
+    if (result.outcome === 'conflict') {
+      return c.json({ error: 'Briefing changed', current: result.current }, 409);
+    }
+    if (result.outcome === 'expired') {
+      return c.json({ error: 'Briefing expiry must be in the future', current: result.current }, 400);
+    }
+    return c.json({ outcome: result.outcome, briefing: result.briefing }, result.outcome === 'created' ? 201 : 200);
   });
   app.put('/api/v1/inbox/:proposalKey', async (c) => {
     const proposalKey = c.req.param('proposalKey');
@@ -317,14 +336,16 @@ export function createApp(
       doOn: body.doOn,
       plan: body.plan,
       ...(body.inbox ? { inbox: body.inbox } : {}),
+      ...(body.reminder ? { reminder: body.reminder } : {}),
     }, now().toISOString());
     if (result.outcome === 'idempotency_conflict') {
       return c.json({ error: 'This task create nonce was already used for different content', current: result.action }, 409);
     }
     if (result.outcome === 'inbox_not_found') return c.json({ error: 'Inbox item not found' }, 404);
     if (result.outcome === 'inbox_conflict') return c.json({ error: 'Inbox item changed', current: result.inbox }, 409);
+    if (result.outcome === 'invalid_reminder') return c.json({ error: 'Reminder must be a future UTC instant' }, 400);
     options.actionWorker?.kick();
-    return c.json({ task: result.task, plan: result.plan, action: result.action, inbox: result.inbox },
+    return c.json({ task: result.task, plan: result.plan, action: result.action, inbox: result.inbox, reminder: result.reminder },
       result.outcome === 'queued' ? 202 : 200);
   });
   app.get('/api/v1/task-migrations', (c) => {

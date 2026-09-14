@@ -165,6 +165,7 @@ function publishFreshGoogleList(store: ReturnType<typeof openStore>, fetchedAt =
 function queueGoogleCreate(store: ReturnType<typeof openStore>, extras: {
   nonce?: string;
   inbox?: { id: string; version: number };
+  reminder?: { fireAt: string };
 } = {}) {
   const nonce = extras.nonce ?? 'nonce_create_1';
   return store.queueTaskCreateAction({
@@ -176,6 +177,7 @@ function queueGoogleCreate(store: ReturnType<typeof openStore>, extras: {
       plannedAt: '2026-09-18T08:00:00.000Z', estimateMinutes: 30,
     },
     ...(extras.inbox ? { inbox: extras.inbox } : {}),
+    ...(extras.reminder ? { reminder: extras.reminder } : {}),
   }, '2026-09-14T10:01:00.000Z');
 }
 
@@ -212,7 +214,7 @@ test('user_version migration moves workspace rows without losing IDs, completion
         .map(row => [row.name, row.strict]));
       for (const table of [
         'tasks', 'task_plans', 'inbox_items', 'reply_drafts', 'actions', 'jobs',
-        'job_updates', 'reminders', 'changes', 'sync_state',
+        'job_updates', 'reminders', 'briefings', 'changes', 'sync_state',
       ]) assert.equal(strict.get(table), 1, `${table} must be STRICT`);
     } finally { db.close(); }
   } finally {
@@ -324,6 +326,70 @@ test('row updates use expected versions and old change snapshots stay immutable'
     }, '2026-09-14T10:01:00.000Z'), null);
     assert.equal(originalChange?.snapshot?.priority, 'high');
     assert.equal(store.listChanges(0, 100).changes.find(change => change.seq === originalChange?.seq)?.snapshot?.priority, 'high');
+  } finally { store.close(); }
+});
+
+test('briefing upserts are versioned, retry-safe, active by date range, and retained after expiry', () => {
+  const store = openStore(':memory:', workspaceFixture());
+  const workspaceRevision = store.read().revision;
+  const firstInput = {
+    expectedVersion: null,
+    entries: [{
+      kind: 'event' as const,
+      title: 'Dublin systems meetup',
+      summary: 'An event spanning the autumn clock change.',
+      url: 'https://events.example.test/dublin-systems',
+      startsAt: '2026-10-25T01:30:00.000Z',
+    }, {
+      kind: 'news' as const,
+      title: 'Release notes',
+      summary: 'A short update.',
+      url: null,
+      startsAt: null,
+    }],
+    expiresAt: '2026-10-25T12:00:00.000Z',
+  };
+  try {
+    const created = store.upsertBriefing('2026-10-25', firstInput, '2026-10-25T00:00:00.000Z');
+    assert.equal(created.outcome, 'created');
+    if (created.outcome !== 'created') return;
+    assert.equal(created.briefing.version, 1);
+    assert.equal(store.read().revision, workspaceRevision);
+
+    const replay = store.upsertBriefing('2026-10-25', firstInput, '2026-10-25T00:01:00.000Z');
+    assert.equal(replay.outcome, 'replayed');
+    assert.equal(replay.outcome === 'replayed' ? replay.briefing.version : null, 1);
+
+    const conflict = store.upsertBriefing('2026-10-25', {
+      ...firstInput,
+      entries: [{ ...firstInput.entries[0], title: 'Changed without a version' }],
+    }, '2026-10-25T00:02:00.000Z');
+    assert.equal(conflict.outcome, 'conflict');
+    assert.equal(conflict.outcome === 'conflict' ? conflict.current?.version : null, 1);
+
+    const updated = store.upsertBriefing('2026-10-25', {
+      ...firstInput,
+      expectedVersion: 1,
+      entries: [{ ...firstInput.entries[0], title: 'Updated Dublin systems meetup' }],
+    }, '2026-10-25T00:03:00.000Z');
+    assert.equal(updated.outcome, 'updated');
+    assert.equal(updated.outcome === 'updated' ? updated.briefing.version : null, 2);
+    assert.equal(store.readContext(
+      '2026-10-25', '2026-10-25', '2026-10-25T11:59:59.000Z',
+    ).briefings.length, 1);
+    assert.equal(store.readContext(
+      '2026-10-24', '2026-10-24', '2026-10-24T10:00:00.000Z',
+    ).briefings.length, 0);
+    assert.equal(store.readContext(
+      '2026-10-25', '2026-10-25', '2026-10-25T12:00:00.000Z',
+    ).briefings.length, 0);
+    assert.equal(store.listBriefings().length, 1, 'expiry hides the card without deleting its current row');
+
+    const history = store.listChanges(0, 500).changes.filter(change => change.entityKind === 'briefing');
+    assert.deepEqual(history.map(change => change.entityVersion), [1, 2]);
+    assert.equal(history[0]?.snapshot?.version, 1);
+    assert.equal((history[0]?.snapshot?.entries as Array<{ title: string }>)[0]?.title, 'Dublin systems meetup');
+    assert.equal(store.read().revision, workspaceRevision);
   } finally { store.close(); }
 });
 
@@ -1119,6 +1185,58 @@ test('task creation atomically stores approval, planning, and the Inbox outcome'
       },
     }, '2026-09-14T10:02:00.000Z');
     assert.equal(conflict.outcome, 'idempotency_conflict');
+  } finally { store.close(); }
+});
+
+test('task creation stores one local reminder atomically and includes it in replay identity', () => {
+  const store = openStore(':memory:', workspaceFixture());
+  try {
+    publishFreshGoogleList(store);
+    const queued = queueGoogleCreate(store, {
+      nonce: 'nonce_create_reminder',
+      reminder: { fireAt: '2026-10-25T01:30:00.000Z' },
+    });
+    assert.equal(queued.outcome, 'queued');
+    if (queued.outcome !== 'queued') return;
+    assert.ok(queued.reminder);
+    assert.match(queued.reminder.id, /^reminder-task-create-[a-f0-9]{32}$/);
+    assert.deepEqual({ ...queued.reminder, id: 'stable-reminder-id' }, {
+      id: 'stable-reminder-id',
+      version: 1,
+      target: { kind: 'task', id: queued.task.id },
+      fireAt: '2026-10-25T01:30:00.000Z',
+      state: 'scheduled',
+      createdAt: '2026-09-14T10:01:00.000Z',
+      updatedAt: '2026-09-14T10:01:00.000Z',
+    });
+    assert.match(queued.action.approval.previewText, /Reminder: 2026-10-25T01:30:00.000Z/);
+    assert.equal(store.listReminders().filter(reminder => reminder.target.id === queued.task.id).length, 1);
+    assert.ok(store.listChanges(0, 500).changes.some(change =>
+      change.entityKind === 'reminder' && change.entityId === queued.reminder?.id));
+
+    const replay = queueGoogleCreate(store, {
+      nonce: 'nonce_create_reminder',
+      reminder: { fireAt: '2026-10-25T01:30:00.000Z' },
+    });
+    assert.equal(replay.outcome, 'replayed');
+    assert.equal(replay.outcome === 'replayed' ? replay.reminder?.id : null, queued.reminder?.id);
+    assert.equal(store.listReminders().filter(reminder => reminder.target.id === queued.task.id).length, 1);
+
+    const changedReminder = queueGoogleCreate(store, {
+      nonce: 'nonce_create_reminder',
+      reminder: { fireAt: '2026-10-25T02:30:00.000Z' },
+    });
+    assert.equal(changedReminder.outcome, 'idempotency_conflict');
+
+    const taskCount = store.listTasks().length;
+    const actionCount = store.listActions().length;
+    const invalid = queueGoogleCreate(store, {
+      nonce: 'nonce_create_past_reminder',
+      reminder: { fireAt: '2026-09-14T10:00:59.000Z' },
+    });
+    assert.equal(invalid.outcome, 'invalid_reminder');
+    assert.equal(store.listTasks().length, taskCount);
+    assert.equal(store.listActions().length, actionCount);
   } finally { store.close(); }
 });
 

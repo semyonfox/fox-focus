@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  briefingReminderSuggestion,
+  dublinInstantLocalValue,
+  dublinLocalReminderInstant,
   emailSendBlocksInboxMutation,
   emailSendUiState,
   preferredTaskDestination,
   type TaskDestination,
 } from '../src/inbox-client.ts';
-import type { ActionRow, DraftRevision, InboxItemRow, ReplyEnvelope } from '../src/row-model.ts';
+import type { ActionRow, BriefingEntry, DraftRevision, InboxItemRow, ReplyEnvelope } from '../src/row-model.ts';
 
 const NOW = '2026-09-14T10:00:00.000Z';
 
@@ -71,6 +74,61 @@ test('task creation defaults only to a unique explicit area mapping or My Tasks'
     destination('university-two', 'University', { explicitMapping: true }),
     fallback,
   ], 'University')?.listId, 'my-tasks');
+});
+
+test('Dublin reminder inputs resolve only unambiguous wall times across DST boundaries', () => {
+  assert.equal(dublinLocalReminderInstant('2026-03-29T00:30'), '2026-03-29T00:30:00.000Z');
+  assert.equal(dublinLocalReminderInstant('2026-03-29T02:30'), '2026-03-29T01:30:00.000Z');
+  assert.equal(dublinLocalReminderInstant('2026-03-29T01:30'), null);
+  assert.equal(dublinLocalReminderInstant('2026-10-25T01:30'), null);
+  assert.equal(dublinLocalReminderInstant('2026-10-25T02:30'), '2026-10-25T02:30:00.000Z');
+  assert.equal(dublinLocalReminderInstant('2026-02-30T10:00'), null);
+});
+
+test('exact source instants retain their fold when Dublin repeats a wall time', () => {
+  assert.deepEqual(dublinInstantLocalValue('2026-10-25T00:30:00.000Z'), {
+    localValue: '2026-10-25T01:30',
+    instant: '2026-10-25T00:30:00.000Z',
+  });
+  assert.deepEqual(dublinInstantLocalValue('2026-10-25T01:30:00.000Z'), {
+    localValue: '2026-10-25T01:30',
+    instant: '2026-10-25T01:30:00.000Z',
+  });
+  assert.equal(dublinInstantLocalValue('2026-10-25T01:30:00+01:00'), null);
+});
+
+test('briefing actions suggest one hour before an event and reject a too-late default', () => {
+  const now = new Date('2026-09-14T10:00:00.000Z');
+  const entry = (startsAt: string | null): BriefingEntry => ({
+    kind: startsAt ? 'event' : 'news',
+    title: 'Briefing item',
+    summary: '',
+    url: null,
+    startsAt,
+  });
+
+  assert.deepEqual(briefingReminderSuggestion(entry('2026-09-14T14:00:00.000Z'), now), {
+    localValue: '2026-09-14T14:00',
+    fireAt: '2026-09-14T13:00:00.000Z',
+  });
+  assert.equal(briefingReminderSuggestion(entry('2026-09-14T10:03:00.000Z'), now), null);
+  assert.deepEqual(briefingReminderSuggestion(entry(null), now), {
+    localValue: '2026-09-14T12:00',
+    fireAt: '2026-09-14T11:00:00.000Z',
+  });
+});
+
+test('briefing reminders preserve the exact instant through the repeated Dublin hour', () => {
+  const suggestion = briefingReminderSuggestion({
+    kind: 'event', title: 'Clock-change event', summary: '', url: null,
+    startsAt: '2026-10-25T01:30:00.000Z',
+  }, new Date('2026-10-24T12:00:00.000Z'));
+
+  assert.deepEqual(suggestion, {
+    localValue: '2026-10-25T01:30',
+    fireAt: '2026-10-25T00:30:00.000Z',
+  });
+  assert.equal(dublinLocalReminderInstant(suggestion.localValue), null);
 });
 
 test('email send controls distinguish disabled, sending, unknown, failed, and sent states', () => {

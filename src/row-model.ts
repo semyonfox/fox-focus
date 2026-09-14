@@ -123,6 +123,7 @@ export type TaskCreateInput = {
     estimateMinutes: number | null;
   };
   inbox?: { id: string; version: number };
+  reminder?: { fireAt: Instant };
 };
 
 export type TaskStatusPayload = {
@@ -340,6 +341,29 @@ export type ReminderRow = {
   updatedAt: Instant;
 };
 
+export type BriefingEntry = {
+  kind: "news" | "event";
+  title: string;
+  summary: string;
+  url: string | null;
+  startsAt: Instant | null;
+};
+
+export type BriefingRow = {
+  day: DateOnly;
+  version: number;
+  entries: BriefingEntry[];
+  expiresAt: Instant;
+  createdAt: Instant;
+  updatedAt: Instant;
+};
+
+export type BriefingUpsertInput = {
+  expectedVersion: number | null;
+  entries: BriefingEntry[];
+  expiresAt: Instant;
+};
+
 export type ChangeRow = {
   seq: number;
   actor: "owner" | "hermes" | "provider" | "system";
@@ -435,6 +459,41 @@ export function isNullableDateOnly(value: unknown): value is DateOnly | null {
   return value === null || isDateKey(value);
 }
 
+function isSafeHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2_000 || /[\u0000-\u0020\u007f]/.test(value)) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && parsed.hostname.length > 0 &&
+      parsed.username.length === 0 && parsed.password.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+export function isBriefingEntry(value: unknown): value is BriefingEntry {
+  return isRecord(value) && hasExactKeys(value, ["kind", "title", "summary", "url", "startsAt"]) &&
+    (value.kind === "news" || value.kind === "event") && isOneLineText(value.title, 500) &&
+    isShortText(value.summary, 5_000, true) && (value.url === null || isSafeHttpsUrl(value.url)) &&
+    isNullableUtcInstant(value.startsAt);
+}
+
+export function isBriefingRow(value: unknown): value is BriefingRow {
+  return isRecord(value) && hasExactKeys(value, [
+    "day", "version", "entries", "expiresAt", "createdAt", "updatedAt",
+  ]) && isDateKey(value.day) && typeof value.version === "number" && Number.isSafeInteger(value.version) &&
+    value.version >= 1 && Array.isArray(value.entries) && value.entries.length <= 50 &&
+    value.entries.every(isBriefingEntry) && isUtcInstant(value.expiresAt) &&
+    isUtcInstant(value.createdAt) && isUtcInstant(value.updatedAt);
+}
+
+export function isBriefingUpsertInput(value: unknown): value is BriefingUpsertInput {
+  return isRecord(value) && hasExactKeys(value, ["expectedVersion", "entries", "expiresAt"]) &&
+    (value.expectedVersion === null || (typeof value.expectedVersion === "number" &&
+      Number.isSafeInteger(value.expectedVersion) && value.expectedVersion >= 1)) &&
+    Array.isArray(value.entries) && value.entries.length <= 50 && value.entries.every(isBriefingEntry) &&
+    isUtcInstant(value.expiresAt);
+}
+
 export function isReplyEnvelope(value: unknown): value is ReplyEnvelope {
   if (!isRecord(value)) return false;
   const addressList = (candidate: unknown) => Array.isArray(candidate) && candidate.length <= 100 &&
@@ -495,6 +554,7 @@ export function isTaskCreateInput(value: unknown): value is TaskCreateInput {
   if (!isRecord(value) || !isRecord(value.destination) || !isRecord(value.plan)) return false;
   const estimate = value.plan.estimateMinutes;
   const inbox = value.inbox;
+  const reminder = value.reminder;
   return isShortText(value.destination.accountId, 200) && isShortText(value.destination.listId, 500) &&
     typeof value.nonce === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value.nonce) &&
     isOneLineText(value.title, 1_024) && isShortText(value.notes, 8_192, true) &&
@@ -506,7 +566,9 @@ export function isTaskCreateInput(value: unknown): value is TaskCreateInput {
     !(value.plan.plannedOn !== null && value.plan.plannedAt !== null) &&
     taskCreateNotes(value.notes, value.nonce).length <= 8_192 &&
     (inbox === undefined || (isRecord(inbox) && isShortText(inbox.id, 200) &&
-      typeof inbox.version === "number" && Number.isSafeInteger(inbox.version) && inbox.version >= 1));
+      typeof inbox.version === "number" && Number.isSafeInteger(inbox.version) && inbox.version >= 1)) &&
+    (reminder === undefined || (isRecord(reminder) && hasExactKeys(reminder, ["fireAt"]) &&
+      isUtcInstant(reminder.fireAt)));
 }
 
 export function isTaskMigrationApprovalInput(value: unknown): value is {

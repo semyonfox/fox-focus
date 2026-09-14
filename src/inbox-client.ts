@@ -1,9 +1,12 @@
-import { isDateKey } from "./calendar-time.ts";
+import { dublinDateKey, dublinDateTimeToInstant, dublinTimeValue, isDateKey } from "./calendar-time.ts";
 import { areas, isOneOf, isRecord, priorities, type Area } from "./model.ts";
 import {
+  isBriefingRow,
   isReplyEnvelope,
   isUtcInstant,
   type ActionRow,
+  type BriefingEntry,
+  type BriefingRow,
   type DraftRevision,
   type InboxItemRow,
   type InboxOutcome,
@@ -11,6 +14,7 @@ import {
   type JobOutcome,
   type JobUpdate,
   type ReplyEnvelope,
+  type ReminderRow,
   type TaskCreateInput,
   type TaskCreatePayload,
 } from "./row-model.ts";
@@ -41,6 +45,8 @@ export type WorkRowsSnapshot = {
   jobs: Job[];
   jobUpdates: JobUpdate[];
   actions: ActionRow[];
+  reminders: ReminderRow[];
+  briefings: BriefingRow[];
   capabilities: { emailSendEnabled: boolean };
 };
 
@@ -159,6 +165,14 @@ function isActionRow(value: unknown): value is ActionRow {
     isNullableString(value.error) && isUtcInstant(value.createdAt) && isUtcInstant(value.updatedAt);
 }
 
+function isReminderRow(value: unknown): value is ReminderRow {
+  return isRecord(value) && typeof value.id === "string" && isPositiveVersion(value.version) &&
+    isRecord(value.target) && (value.target.kind === "task" || value.target.kind === "local-event") &&
+    typeof value.target.id === "string" && isUtcInstant(value.fireAt) &&
+    (value.state === "scheduled" || value.state === "fired" || value.state === "cancelled") &&
+    isUtcInstant(value.createdAt) && isUtcInstant(value.updatedAt);
+}
+
 export function isTaskCreateActionRow(action: ActionRow): action is TaskCreateActionRow {
   const payload = action.payload;
   return payload.kind === "task-create" && typeof payload.taskId === "string" &&
@@ -217,8 +231,44 @@ export function mergeWorkRows(current: WorkRowsSnapshot | null, incoming: WorkRo
     jobUpdates: [...updates.values()].sort((first, second) => first.seq - second.seq),
     actions: mergeVersioned(current.actions, incoming.actions, (action) => action.id)
       .sort((first, second) => first.createdAt.localeCompare(second.createdAt) || first.id.localeCompare(second.id)),
+    reminders: mergeVersioned(current.reminders, incoming.reminders, (reminder) => reminder.id)
+      .sort((first, second) => first.fireAt.localeCompare(second.fireAt) || first.id.localeCompare(second.id)),
+    briefings: mergeVersioned(current.briefings, incoming.briefings, (briefing) => briefing.day)
+      .sort((first, second) => second.day.localeCompare(first.day)),
     capabilities: incoming.capabilities,
   };
+}
+
+export function dublinLocalReminderInstant(value: string): string | null {
+  const match = /^(\d{4}-\d{2}-\d{2})T((?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  return match ? dublinDateTimeToInstant(match[1], match[2]) : null;
+}
+
+export function dublinInstantLocalValue(value: string): { localValue: string; instant: string } | null {
+  if (!isUtcInstant(value)) return null;
+  const instant = new Date(value);
+  return {
+    localValue: `${dublinDateKey(instant)}T${dublinTimeValue(instant)}`,
+    instant: instant.toISOString(),
+  };
+}
+
+export function briefingReminderSuggestion(entry: BriefingEntry, now: Date): {
+  localValue: string;
+  fireAt: string;
+} | null {
+  const nowTime = now.getTime();
+  let reminderTime = nowTime + 60 * 60_000;
+  if (entry.startsAt) {
+    const startsAt = Date.parse(entry.startsAt);
+    if (Number.isFinite(startsAt) && startsAt > nowTime) {
+      const earliestUsefulReminder = nowTime + 5 * 60_000;
+      if (startsAt <= earliestUsefulReminder) return null;
+      reminderTime = Math.max(earliestUsefulReminder, startsAt - 60 * 60_000);
+    }
+  }
+  const reminder = dublinInstantLocalValue(new Date(reminderTime).toISOString());
+  return reminder ? { localValue: reminder.localValue, fireAt: reminder.instant } : null;
 }
 
 export function emailSendUiState(
@@ -249,7 +299,9 @@ export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapsh
   if (!response.ok || !isRecord(value) || !Array.isArray(value.inbox) || !value.inbox.every(isInboxItemRow) ||
     !Array.isArray(value.drafts) || !value.drafts.every(isDraftRevision) || !Array.isArray(value.actions) ||
     !value.actions.every(isActionRow) || !Array.isArray(value.jobs) || !value.jobs.every(isJob) ||
-    !Array.isArray(value.jobUpdates) || !value.jobUpdates.every(isJobUpdate) || !isRecord(value.capabilities) ||
+    !Array.isArray(value.jobUpdates) || !value.jobUpdates.every(isJobUpdate) ||
+    !Array.isArray(value.reminders) || !value.reminders.every(isReminderRow) ||
+    !Array.isArray(value.briefings) || !value.briefings.every(isBriefingRow) || !isRecord(value.capabilities) ||
     typeof value.capabilities.emailSendEnabled !== "boolean") {
     throw new Error("Could not load Inbox rows");
   }
@@ -259,6 +311,8 @@ export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapsh
     jobs: value.jobs,
     jobUpdates: value.jobUpdates,
     actions: value.actions,
+    reminders: value.reminders,
+    briefings: value.briefings,
     capabilities: { emailSendEnabled: value.capabilities.emailSendEnabled },
   };
 }

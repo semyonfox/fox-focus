@@ -18,6 +18,7 @@ import {
   Mail,
   MessageSquare,
   Moon,
+  Newspaper,
   Pencil,
   Plus,
   RefreshCw,
@@ -47,11 +48,14 @@ import { areaForList } from './integration-model.ts';
 import {
   answerJob,
   approveEmailSend,
+  briefingReminderSuggestion,
   createGoogleTask,
   createJob,
   decideInboxItem,
   emailSendBlocksInboxMutation,
   emailSendUiState,
+  dublinInstantLocalValue,
+  dublinLocalReminderInstant,
   isTaskCreateActionRow,
   loadTaskDestinations,
   loadWorkRows,
@@ -75,7 +79,7 @@ import {
   type TaskRowsSnapshot,
   type TaskStatusActionRow,
 } from "./row-client.ts";
-import type { ActionRow, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow } from "./row-model.ts";
+import type { ActionRow, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow } from "./row-model.ts";
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
@@ -165,6 +169,12 @@ function formatDublinInstant(value: string | null): string {
     minute: "2-digit",
     timeZone: "Europe/Dublin",
   }).format(instant);
+}
+
+function reminderTimingLabel(reminder: DisplayReminder, now = Date.now()): string {
+  if (reminder.firedAt) return "fired";
+  if (!reminder.fireAt) return "needs a planned time";
+  return Date.parse(reminder.fireAt) <= now ? "past" : "scheduled";
 }
 
 function legacyDeadlineDate(due: string, today: string): string {
@@ -446,6 +456,18 @@ function DialogFrame({
 
 type ServerSnapshot = { revision: number; data: PrototypeData };
 type CompletionUndo = { taskId: string; state: ActiveTaskState; reminder?: Reminder };
+
+type DisplayReminder = {
+  id: string;
+  targetId: string;
+  targetType: "task" | "event";
+  title: string;
+  when: string;
+  state: ReminderState;
+  fireAt?: string;
+  firedAt?: string;
+  source: "workspace" | "row" | "hermes";
+};
 type ReviewUndo = { itemId: string; status: InboxStatus };
 type WorkThread = {
   key: string;
@@ -703,6 +725,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [selectedDate, setSelectedDate] = useState(() => dublinDateKey(new Date()));
   const [calendarAnchor, setCalendarAnchor] = useState(() => dublinDateKey(new Date()));
   const [showTaskDetails, setShowTaskDetails] = useState(false);
+  const [briefingOpen, setBriefingOpen] = useState(false);
   const [showReminderTray, setShowReminderTray] = useState(false);
   const [activeReminderId, setActiveReminderId] = useState<string | null>(null);
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(() =>
@@ -733,6 +756,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [taskDestinationError, setTaskDestinationError] = useState("");
   const [taskNotes, setTaskNotes] = useState("");
   const [taskGoogleDue, setTaskGoogleDue] = useState("");
+  const [taskReminderLocal, setTaskReminderLocal] = useState("");
+  const [taskReminderInstant, setTaskReminderInstant] = useState<{ localValue: string; instant: string } | null>(null);
+  const [taskReminderRequired, setTaskReminderRequired] = useState(false);
+  const [taskPlannedInstant, setTaskPlannedInstant] = useState<{ localValue: string; instant: string } | null>(null);
   const [taskCreateNonce, setTaskCreateNonce] = useState("");
   const [taskInboxVersion, setTaskInboxVersion] = useState<number | null>(null);
   const [taskPlanVersion, setTaskPlanVersion] = useState<number | null>(null);
@@ -752,13 +779,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [modalError, setModalError] = useState("");
   const focusBeforeOverlay = useRef<HTMLElement | null>(null);
   const calendarTabRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const firedHermesReminderIds = useRef(new Set<string>());
+  const firedTransientReminderIds = useRef(new Set<string>());
   const hermesBoard = hermes.feed && hermes.feed.state !== "unavailable" ? hermes.feed.board : null;
   const adoptedHermesIds = new Set(data.tasks.flatMap((task) => task.externalLinks ?? [])
     .filter((link) => link.provider === "hermes")
     .map((link) => link.externalId));
   const hermesTasks = (hermesBoard?.tasks ?? []).filter((task) => !adoptedHermesIds.has(task.id));
-  const hermesReminders = useMemo<Reminder[]>(() =>
+  const hermesReminders = useMemo<DisplayReminder[]>(() =>
     (hermes.feed?.state === "connected" ? hermesTasks : []).flatMap(task =>
     task.status !== "done" && task.reminderMode !== "none"
       ? [{
@@ -769,10 +796,52 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           mode: task.reminderMode,
           when: task.reminderMode === "one-hour" ? "1 hour before" : "09:00 on the day",
           state: "scheduled" as const,
+          source: "hermes" as const,
           ...(task.reminderFireAt ? { fireAt: task.reminderFireAt } : {}),
         }]
       : []), [hermes.feed?.state, hermesTasks]);
-  const allReminders = useMemo(() => [...data.reminders, ...hermesReminders], [data.reminders, hermesReminders]);
+  const rowReminders = useMemo<DisplayReminder[]>(() => (workRows?.reminders ?? []).flatMap((reminder) => {
+    if (reminder.state === "cancelled") return [];
+    let title = "Reminder";
+    if (reminder.target.kind === "task") {
+      const task = taskRows?.tasks.find((candidate) => candidate.id === reminder.target.id);
+      const createActionId = task?.binding.kind === "pending" ? task.binding.createActionId : null;
+      const action = createActionId
+        ? workRows?.actions.find((candidate) => candidate.id === createActionId)
+        : null;
+      const legacyTitle = task?.binding.kind === "legacy" ? task.binding.source.title : null;
+      title = task?.observed?.title ??
+        (action?.payload.kind === "task-create" ? action.payload.title : null) ??
+        (typeof legacyTitle === "string" ? legacyTitle : null) ??
+        "Task reminder";
+    } else {
+      title = data.events.find((event) => event.id === reminder.target.id)?.title ?? "Calendar reminder";
+    }
+    return [{
+      id: reminder.id,
+      targetId: `row:${reminder.target.kind}:${reminder.target.id}`,
+      targetType: reminder.target.kind === "task" ? "task" as const : "event" as const,
+      title,
+      when: formatDublinInstant(reminder.fireAt),
+      state: "scheduled" as const,
+      source: "row" as const,
+      fireAt: reminder.fireAt,
+      ...(reminder.state === "fired" ? { firedAt: reminder.updatedAt } : {}),
+    }];
+  }), [data.events, taskRows?.tasks, workRows?.actions, workRows?.reminders]);
+  const allReminders = useMemo<DisplayReminder[]>(() => {
+    const reminders = new Map<string, DisplayReminder>();
+    for (const reminder of data.reminders) reminders.set(reminder.id, { ...reminder, source: "workspace" });
+    for (const reminder of [...rowReminders, ...hermesReminders]) {
+      if (!reminders.has(reminder.id)) reminders.set(reminder.id, reminder);
+    }
+    return [...reminders.values()];
+  }, [data.reminders, hermesReminders, rowReminders]);
+  const activeReminders = useMemo(() => {
+    const now = Date.now();
+    return allReminders.filter((reminder) => reminder.state === "scheduled" && !reminder.firedAt &&
+      (!reminder.fireAt || Date.parse(reminder.fireAt) > now));
+  }, [allReminders]);
 
   useEffect(() => {
     if (initial) {
@@ -980,7 +1049,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const now = Date.now();
       const nextReminder = [...allReminders]
         .filter((reminder) => reminder.state === "scheduled" && reminder.fireAt && !reminder.firedAt &&
-          !firedHermesReminderIds.current.has(`${reminder.id}\u0000${reminder.fireAt}`) && Date.parse(reminder.fireAt) > now)
+          !firedTransientReminderIds.current.has(`${reminder.id}\u0000${reminder.fireAt}`) && Date.parse(reminder.fireAt) > now)
         .sort((first, second) => Date.parse(first.fireAt ?? "") - Date.parse(second.fireAt ?? ""))[0];
       if (!nextReminder?.fireAt) return;
 
@@ -991,8 +1060,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           return;
         }
         setActiveReminderId(nextReminder.id);
-        if (nextReminder.targetId.startsWith("hermes:")) {
-          firedHermesReminderIds.current.add(`${nextReminder.id}\u0000${nextReminder.fireAt}`);
+        if (nextReminder.source !== "workspace") {
+          firedTransientReminderIds.current.add(`${nextReminder.id}\u0000${nextReminder.fireAt}`);
         }
         let showedNotification = false;
         if (!pushSubscribed && "Notification" in window && Notification.permission === "granted") {
@@ -1005,7 +1074,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         }
         if (showedNotification) {
           const firedAt = new Date().toISOString();
-          if (!nextReminder.targetId.startsWith("hermes:")) setData((current) => ({
+          if (nextReminder.source === "workspace") setData((current) => ({
             ...current,
             reminders: current.reminders.map((reminder) => reminder.id === nextReminder.id && !reminder.firedAt
               ? { ...reminder, firedAt }
@@ -1402,7 +1471,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ? visibleImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
       : [];
 
-  const reminderCount = allReminders.length;
+  const reminderCount = activeReminders.length;
   const reviewCount = initial ? needsYouThreads.length : data.inboxItems.filter((item) => item.status !== "handled").length;
   const plannedTaskCount = activeTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate ||
     (task.linkedEventId && eventById.has(task.linkedEventId)))).length +
@@ -1423,6 +1492,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   };
   const activeTaskFilterCount = Number(taskFilter !== "all") + Number(taskSource !== allTaskSources) + Number(taskSort !== "due");
   const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
+  const todayBriefing = (workRows?.briefings ?? []).find((briefing) =>
+    briefing.day === todayDate && Date.parse(briefing.expiresAt) > Date.now()) ?? null;
+  const briefingNewsCount = todayBriefing?.entries.filter((entry) => entry.kind === "news").length ?? 0;
+  const briefingEventCount = todayBriefing?.entries.filter((entry) => entry.kind === "event").length ?? 0;
   const todayEvents = sortedEvents.filter((event) => eventDateKey(event, todayDate) === todayDate);
   const currentTime = timeValueToMinutes(dublinTimeValue(new Date()));
   const currentEvent = todayEvents.find((event) => {
@@ -1675,6 +1748,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const linkedEvent = task?.linkedEventId
       ? data.events.find((event) => event.id === task.linkedEventId)
       : undefined;
+    const plannedInstant = plan?.plannedAt ?? linkedEvent?.startsAt ?? null;
+    setTaskPlannedInstant(plannedInstant ? dublinInstantLocalValue(plannedInstant) : null);
+    setTaskReminderInstant(null);
+    setTaskReminderRequired(false);
     const startingArea = task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal");
     const mappedDestination = preferredTaskDestination(taskDestinations, startingArea);
     setTaskDraft({
@@ -1697,11 +1774,37 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setTaskCreateNonce(globalThis.crypto?.randomUUID?.() ?? makeId("task"));
       setTaskNotes("");
       setTaskGoogleDue("");
+      setTaskReminderLocal("");
       setTaskDestinationKey(mappedDestination ? destinationKey(mappedDestination) : "");
     }
     setModalError("");
     setShowTaskDetails(Boolean(task || inboxItem || inboxRow));
     setModal({ kind: "task", taskId: task?.id, inboxId: inboxItem?.id ?? inboxRow?.id });
+  }
+
+  function openBriefingTask(entry: BriefingEntry, withReminder: boolean) {
+    openTaskComposer();
+    const futureStart = entry.startsAt && Date.parse(entry.startsAt) > Date.now() ? entry.startsAt : null;
+    const exactPlan = futureStart ? dublinInstantLocalValue(futureStart) : null;
+    const reminder = withReminder ? briefingReminderSuggestion(entry, new Date()) : null;
+    setTaskDraft((current) => ({
+      ...current,
+      title: entry.title,
+      state: futureStart ? "scheduled" : "up-next",
+      scheduledDate: futureStart ? dublinDateKey(new Date(futureStart)) : "",
+      scheduledTime: futureStart ? dublinTimeValue(futureStart) : "",
+    }));
+    setTaskPlannedInstant(exactPlan);
+    setTaskNotes([entry.summary.trim(), entry.url ? `Source: ${entry.url}` : ""].filter(Boolean).join("\n\n"));
+    setTaskReminderLocal(reminder?.localValue ?? "");
+    setTaskReminderInstant(reminder
+      ? { localValue: reminder.localValue, instant: reminder.fireAt }
+      : null);
+    setTaskReminderRequired(withReminder);
+    if (withReminder && !reminder) {
+      setModalError("This event starts too soon for the default reminder. Choose another future time.");
+    }
+    setShowTaskDetails(true);
   }
 
   function openEventComposer(event?: TimelineEvent, inboxItem?: InboxItem) {
@@ -1902,8 +2005,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       return;
     }
     const scheduledDate = taskDraft.scheduledDate || selectedDate;
-    const plannedStartAt = taskDraft.scheduledTime
-      ? dublinDateTimeToInstant(scheduledDate, taskDraft.scheduledTime)
+    const plannedLocalValue = taskDraft.scheduledTime ? `${scheduledDate}T${taskDraft.scheduledTime}` : null;
+    const plannedStartAt = plannedLocalValue
+      ? taskPlannedInstant?.localValue === plannedLocalValue
+        ? taskPlannedInstant.instant
+        : dublinDateTimeToInstant(scheduledDate, taskDraft.scheduledTime)
       : null;
     if (taskDraft.scheduledTime && (!isDateKey(scheduledDate) || !plannedStartAt)) {
       setModalError("Choose a valid Dublin date and time. Times skipped or repeated at a clock change need another time.");
@@ -1985,6 +2091,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         setModalError("Choose a valid Google due date or leave it blank.");
         return;
       }
+      if (taskReminderRequired && !taskReminderLocal) {
+        setModalError("Choose a future reminder time.");
+        return;
+      }
+      const reminderAt = taskReminderLocal
+        ? taskReminderInstant?.localValue === taskReminderLocal
+          ? taskReminderInstant.instant
+          : dublinLocalReminderInstant(taskReminderLocal)
+        : null;
+      if (taskReminderLocal && (!reminderAt || Date.parse(reminderAt) <= Date.now())) {
+        setModalError("Choose a future reminder time that occurs once in Dublin time.");
+        return;
+      }
       if (/^\s*Fox-Focus-ID\s*:/im.test(taskNotes)) {
         setModalError("Remove the Fox-Focus-ID line from notes. Fox Focus adds it.");
         return;
@@ -2013,6 +2132,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           ...(modal.inboxId && taskInboxVersion !== null
             ? { inbox: { id: modal.inboxId, version: taskInboxVersion } }
             : {}),
+          ...(reminderAt ? { reminder: { fireAt: reminderAt } } : {}),
         });
         await refreshRowSnapshots();
         setStatusMessage(`Creating "${title}" in ${destination.listName}.`);
@@ -2394,6 +2514,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         jobs: [job],
         jobUpdates: [],
         actions: [],
+        reminders: [],
+        briefings: [],
         capabilities: current?.capabilities ?? { emailSendEnabled: false },
       }));
       setJobComposer(null);
@@ -2585,9 +2707,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   });
 
   function testReminder() {
-    const reminder = allReminders.find((candidate) => candidate.state === "scheduled") ?? allReminders[0];
+    const reminder = activeReminders[0];
     if (!reminder) {
-      setStatusMessage("Add a reminder to a task or local calendar block first.");
+      setStatusMessage("There are no upcoming reminders to preview.");
       return;
     }
     setShowReminderTray(false);
@@ -2596,9 +2718,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function snoozeReminder() {
     if (!activeReminder) return;
-    if (activeReminder.targetId.startsWith("hermes:")) {
+    if (activeReminder.source !== "workspace") {
       setActiveReminderId(null);
-      setStatusMessage("Edit the Hermes task plan to change this reminder.");
+      setStatusMessage(activeReminder.source === "hermes"
+        ? "Edit the Hermes task plan to change this reminder."
+        : "This task reminder is already fixed to its approved time.");
       return;
     }
     setData((current) => ({
@@ -2773,6 +2897,32 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       </header>
 
       {initial && hermes.failed ? <p className="workspace-alert"><Bot size={14} /> Hermes could not refresh. Your Fox Focus tasks are still available.</p> : null}
+
+      {todayBriefing ? <article className={`pane today-briefing${briefingOpen ? " today-briefing--open" : ""}`}>
+        <button className="today-briefing-toggle" type="button" aria-expanded={briefingOpen} onClick={() => setBriefingOpen((open) => !open)}>
+          <span className="today-briefing-title"><Newspaper size={14} /><strong>Briefing</strong><small>{relativeTime(todayBriefing.updatedAt)}</small></span>
+          <span className="today-briefing-counts">{[
+            briefingNewsCount ? `${briefingNewsCount} news` : "",
+            briefingEventCount ? `${briefingEventCount} event${briefingEventCount === 1 ? "" : "s"}` : "",
+          ].filter(Boolean).join(" · ")}</span>
+          <ChevronDown size={14} />
+        </button>
+        {briefingOpen ? <div className="today-briefing-entries">
+          {todayBriefing.entries.map((entry, index) => <article className="today-briefing-entry" key={`${entry.kind}:${entry.title}:${index}`}>
+            <i className={`inbox-thread-dot inbox-thread-dot--${entry.kind === "event" ? "working" : "settled"}`} />
+            <div className="today-briefing-copy">
+              <header><span>{entry.kind}</span>{entry.startsAt ? <time dateTime={entry.startsAt}>{formatDublinInstant(entry.startsAt)}</time> : null}</header>
+              <strong>{entry.url ? <a href={entry.url} target="_blank" rel="noreferrer">{entry.title}</a> : entry.title}</strong>
+              {entry.summary ? <p>{entry.summary}</p> : null}
+            </div>
+            <div className="today-briefing-actions">
+              <button type="button" onClick={() => openBriefingTask(entry, false)}><ListTodo size={12} /> Save as task</button>
+              <button type="button" onClick={() => openBriefingTask(entry, true)}><Bell size={12} /> Remind me</button>
+            </div>
+          </article>)}
+          {!todayBriefing.entries.length ? <p className="empty-line">No briefing items.</p> : null}
+        </div> : null}
+      </article> : null}
 
       <div className="today-grid">
         <article className="pane today-card today-card--schedule">
@@ -3188,16 +3338,16 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               {modalPendingGoogle ? <label className="field field--full"><span>Google due · pending</span><input type="date" readOnly value={modalCreateAction?.payload.doOn ?? ""} /></label> : null}
               <label className="field field--full"><span>{modalGoogleOwned ? "Local deadline" : "Deadline"}</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
-            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div></dl><pre>{outgoingTaskNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
+            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div><div><dt>Local reminder</dt><dd>{taskReminderLocal ? `${taskReminderLocal.replace("T", " ")} Dublin${taskReminderInstant?.localValue === taskReminderLocal ? ` · ${taskReminderInstant.instant}` : ""}` : "None"}</dd></div></dl><pre>{outgoingTaskNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
             {showTaskDetails ? <div className="editor-grid editor-grid--task-details" id="task-more-options">
               <label className="field"><span>{modalGoogleOwned || modalPendingGoogle || modalCreatingGoogle ? "Area · from list" : modalRowOwned ? "Area · from source" : "Area"}</span><select disabled={modalRowOwned || modalCreatingGoogle} value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
               <label className="field"><span>Priority</span><select value={taskDraft.priority} onChange={(event) => { const value = event.target.value; if (isOneOf(value, priorities)) setTaskDraft((current) => ({ ...current, priority: value })); }}><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
               <label className="field"><span>Duration</span><select value={taskDraft.duration} onChange={(event) => setTaskDraft((current) => ({ ...current, duration: event.target.value }))}><option value="5 min">5 min</option><option value="10 min">10 min</option><option value="20 min">20 min</option><option value="30 min">30 min</option><option value="40 min">40 min</option><option value="45 min">45 min</option><option value="60 min">60 min</option></select></label>
               <label className="field"><span>Task state</span><select value={taskDraft.state} onChange={(event) => { const value = event.target.value; if (isOneOf(value, activeTaskStates)) setTaskDraft((current) => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="scheduled">Scheduled</option><option value="waiting">Waiting</option></select></label>
-              <label className="field"><span>Planned day</span><input type="date" value={taskDraft.scheduledDate} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledDate: event.target.value }))} /></label>
-              <label className="field"><span>Planned time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
-              {modalRowOwned || modalCreatingGoogle ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
+              <label className="field"><span>Planned day</span><input type="date" value={taskDraft.scheduledDate} onChange={(event) => { setTaskPlannedInstant(null); setTaskDraft((current) => ({ ...current, scheduledDate: event.target.value })); }} /></label>
+              <label className="field"><span>Planned time{taskPlannedInstant ? " · exact source" : ""}</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => { setTaskPlannedInstant(null); setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value })); }} /></label>
+              {modalCreatingGoogle ? <label className="field field--full"><span>Local reminder · Dublin</span><input type="datetime-local" value={taskReminderLocal} onChange={(event) => { setTaskReminderInstant(null); setTaskReminderLocal(event.target.value); }} /></label> : modalRowOwned ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
             </div> : null}
             <div className="editor-footer"><span>{modalCreatingGoogle ? selectedTaskDestination ? `${selectedTaskDestination.accountId} · ${selectedTaskDestination.listName}` : "Choose a destination." : modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{initial && modalTask && (modalGoogleOwned || modalPendingGoogle) ? <button className="secondary-action" type="button" disabled={modalPendingGoogle} title={modalPendingGoogle ? "Wait for Google creation confirmation" : undefined} onClick={() => openJobComposer({ title: modalTask.title, taskId: modalTask.id })}><MessageSquare size={13} /> Hand to Hermes</button> : null}{modalCreateAction?.state === "conflict" && taskCreateConflictCandidates(modalCreateAction).length ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setTaskCreateConflictActionId(modalCreateAction.id); }}><RefreshCw size={13} /> Review matches</button> : modalTaskAction?.state === "conflict" || modalCreateAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy || (modalCreatingGoogle && !selectedTaskDestination)}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalCreatingGoogle ? "Create in Google" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
           </form>
@@ -3288,7 +3438,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <DialogFrame title="Reminders" onClose={() => setShowReminderTray(false)} className="editor-dialog--tray">
           <div className="editor-heading"><div className="composer-icon"><Bell size={17} /></div><div><p className="eyebrow">On this device</p><h2>Reminders</h2></div><button className="close-composer" type="button" onClick={() => setShowReminderTray(false)} aria-label="Close reminders"><X size={17} /></button></div>
           <div className="reminder-list">
-            {allReminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.targetId.startsWith("hermes:") ? "Hermes task · " : ""}{reminder.firedAt ? "fired" : reminder.fireAt ? "scheduled" : "needs a planned time"}</small></span></div>)}
+            {allReminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.source === "hermes" ? "Hermes task · " : reminder.source === "row" ? "Fox Focus task · " : ""}{reminderTimingLabel(reminder)}</small></span></div>)}
             {!allReminders.length ? <p className="empty-line">No local reminders yet.</p> : null}
           </div>
           <div className="editor-footer"><span>{pushSubscribed ? "Notifications can arrive when Fox Focus is closed." : "In-tab reminders still work while Fox Focus is open."}</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}{pushSubscribed ? <button className="mini-action" type="button" onClick={() => void turnOffDeviceNotifications()}>Turn off</button> : <button className="secondary-action" type="button" disabled={notificationPermission === "denied" || notificationPermission === "unsupported"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button>}<button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
@@ -3301,7 +3451,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <p className="eyebrow">Reminder</p>
           <h2>{activeReminder.title}</h2>
           <p>{activeReminder.when}.</p>
-          <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setActiveReminderId(null)}>Dismiss</button>{activeReminder.targetId.startsWith("hermes:") ? null : <button className="submit-button" type="button" onClick={snoozeReminder}>Snooze 30 min</button>}</div>
+          <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setActiveReminderId(null)}>Dismiss</button>{activeReminder.source === "workspace" ? <button className="submit-button" type="button" onClick={snoozeReminder}>Snooze 30 min</button> : null}</div>
         </DialogFrame>
       ) : null}
 

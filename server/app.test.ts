@@ -44,7 +44,7 @@ test('an existing legacy workspace password remains valid', async () => {
     assert.throws(() => createApp(store, 'shorter'), /at least 8 characters/);
     assert.throws(
       () => createApp(store, legacyPassword, undefined, undefined, { taskStatusToken: 'shorter' }),
-      /Hermes task-status token must have at least 24 characters/,
+      /Hermes API token must have at least 24 characters/,
     );
   } finally { store.close(); }
 });
@@ -355,7 +355,7 @@ test('SQLite migrates the global delivery ledger without dropping its table', ()
     } finally { db.close(); }
   } finally { store.close(); rmSync(dir, { recursive: true }); }
 });
-test('Hermes can upsert email Inbox rows and run a claim-bound job through the five-route API', async () => {
+test('Hermes can upsert email Inbox rows and run a claim-bound job through the scoped API', async () => {
   const store = openStore(':memory:', testData());
   const token = 'hermes-test-token-at-least-24-characters';
   const bearer = `Bearer ${token}`;
@@ -459,6 +459,107 @@ test('Hermes can upsert email Inbox rows and run a claim-bound job through the f
     const contextBody = await context.json() as { jobs: unknown[]; jobUpdates: unknown[] };
     assert.equal(contextBody.jobs.length, 1);
     assert.equal(contextBody.jobUpdates.length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test('Hermes briefing PUT is retry-safe while context hides expired rows and owner rows retain them', async () => {
+  const store = openStore(':memory:', testData());
+  const token = 'hermes-briefing-token-at-least-24-characters';
+  const bearer = `Bearer ${token}`;
+  let current = new Date('2026-10-25T00:00:00.000Z');
+  const workspaceRevision = store.read().revision;
+  try {
+    const app = createApp(store, password, undefined, undefined, {
+      taskStatusToken: token,
+      now: () => current,
+    });
+    const body = {
+      expectedVersion: null,
+      entries: [{
+        kind: 'event',
+        title: 'Dublin systems meetup',
+        summary: 'Clock-change morning event.',
+        url: 'https://events.example.test/dublin-systems',
+        startsAt: '2026-10-25T01:30:00.000Z',
+      }, {
+        kind: 'news',
+        title: 'Release notes',
+        summary: 'A short update.',
+        url: null,
+        startsAt: null,
+      }],
+      expiresAt: '2026-10-25T12:00:00.000Z',
+    };
+    const put = (day: string, value: unknown, requestAuthorization = bearer) =>
+      app.request(`/api/v1/briefings/${day}`, {
+        method: 'PUT',
+        headers: { authorization: requestAuthorization, 'Content-Type': 'application/json' },
+        body: JSON.stringify(value),
+      });
+
+    const created = await put('2026-10-25', body);
+    assert.equal(created.status, 201);
+    const createdBody = await created.json() as { outcome: string; briefing: { version: number } };
+    assert.equal(createdBody.outcome, 'created');
+    assert.equal(createdBody.briefing.version, 1);
+
+    const replay = await put('2026-10-25', body);
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json() as { outcome: string }).outcome, 'replayed');
+
+    const conflict = await put('2026-10-25', {
+      ...body,
+      entries: [{ ...body.entries[0], title: 'Changed without expected version' }],
+    });
+    assert.equal(conflict.status, 409);
+    assert.equal((await conflict.json() as { current: { version: number } }).current.version, 1);
+
+    current = new Date('2026-10-25T00:03:00.000Z');
+    const updated = await put('2026-10-25', {
+      ...body,
+      expectedVersion: 1,
+      entries: [{ ...body.entries[0], title: 'Updated Dublin systems meetup' }],
+    });
+    assert.equal(updated.status, 200);
+    assert.equal((await updated.json() as { outcome: string }).outcome, 'updated');
+
+    const active = await app.request('/api/v1/context?from=2026-10-25&to=2026-10-25', {
+      headers: { authorization: bearer },
+    });
+    assert.equal(active.status, 200);
+    assert.equal((await active.json() as { briefings: unknown[] }).briefings.length, 1);
+
+    assert.equal((await put('2026-02-30', body)).status, 400);
+    assert.equal((await put('2026-10-26', {
+      ...body,
+      entries: [{ ...body.entries[0], url: 'http://events.example.test/unsafe' }],
+    })).status, 400);
+    assert.equal((await put('2026-10-26', {
+      ...body,
+      entries: [{ ...body.entries[0], startsAt: '2026-10-25T01:30:00+01:00' }],
+    })).status, 400);
+
+    current = new Date('2026-10-25T12:00:00.000Z');
+    const expired = await app.request('/api/v1/context?from=2026-10-25&to=2026-10-25', {
+      headers: { authorization: bearer },
+    });
+    assert.equal((await expired.json() as { briefings: unknown[] }).briefings.length, 0);
+    const rows = await app.request('/api/v1/rows', { headers: { authorization } });
+    const rowBody = await rows.json() as { briefings: Array<{ day: string; version: number }> };
+    assert.deepEqual(rowBody.briefings, [{
+      day: '2026-10-25',
+      version: 2,
+      entries: [{
+        kind: 'event', title: 'Updated Dublin systems meetup', summary: 'Clock-change morning event.',
+        url: 'https://events.example.test/dublin-systems', startsAt: '2026-10-25T01:30:00.000Z',
+      }],
+      expiresAt: '2026-10-25T12:00:00.000Z',
+      createdAt: '2026-10-25T00:00:00.000Z',
+      updatedAt: '2026-10-25T00:03:00.000Z',
+    }]);
+    assert.equal(store.read().revision, workspaceRevision);
   } finally {
     store.close();
   }
@@ -627,7 +728,7 @@ test('email sending is default-off and Hermes settles only the owner-approved en
   }
 });
 
-test('the Hermes bearer is accepted only on the five exact Hermes routes', async () => {
+test('the Hermes bearer is accepted only on the exact Hermes routes', async () => {
   const store = openStore(':memory:', linkedTaskData());
   const token = 'hermes-route-scope-token-at-least-24-characters';
   const bearer = `Bearer ${token}`;
@@ -664,6 +765,9 @@ test('the Hermes bearer is accepted only on the five exact Hermes routes', async
       { path: '/api/v1/task-migrations/migration-00000000000000000000000000000000' },
       { path: '/api/v1/tasks/linked-task/plan', method: 'PUT', body: {} },
       { path: '/api/v1/tasks/linked-task/status', method: 'POST', body: { version: 1, state: 'completed' } },
+      { path: '/api/v1/briefings/2026-09-14' },
+      { path: '/api/v1/briefings/today', method: 'PUT', body: {} },
+      { path: '/api/v1/briefings/2026-09-14/extra', method: 'PUT', body: {} },
       { path: '/api/v1/jobs', method: 'POST', body: { title: 'No', instruction: 'No', taskId: null, inboxId: null } },
       { path: '/api/v1/jobs/not-a-job/answer', method: 'POST', body: {} },
       { path: '/api/v1/jobs/not-a-job/send-back', method: 'POST', body: {} },
@@ -1057,14 +1161,22 @@ test('task creation exposes fresh destinations and durably queues the approved G
         priority: 'medium', waiting: false, deadlineOn: null, plannedOn: '2026-09-19',
         plannedAt: null, estimateMinutes: 20,
       },
+      reminder: { fireAt: '2026-10-25T01:30:00.000Z' },
     };
     const created = await app.request('/api/v1/tasks', {
       method: 'POST', headers: { authorization, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
     assert.equal(created.status, 202);
-    const value = await created.json() as { task: { id: string }; action: { state: string; payload: { notes: string } } };
+    const value = await created.json() as {
+      task: { id: string };
+      action: { state: string; payload: { notes: string }; approval: { previewText: string } };
+      reminder: { id: string; target: { kind: string; id: string }; fireAt: string };
+    };
     assert.equal(value.action.state, 'queued');
     assert.equal(value.action.payload.notes, 'Exact owner notes\n\nFox-Focus-ID: nonce_api_create');
+    assert.match(value.action.approval.previewText, /Reminder: 2026-10-25T01:30:00.000Z/);
+    assert.deepEqual(value.reminder.target, { kind: 'task', id: value.task.id });
+    assert.equal(value.reminder.fireAt, '2026-10-25T01:30:00.000Z');
     assert.equal(store.getTask(value.task.id)?.binding.kind, 'pending');
     assert.equal(providerCreates, 0, 'the request only persists and wakes the worker');
     assert.equal(kicks, 1);
@@ -1075,6 +1187,31 @@ test('task creation exposes fresh destinations and durably queues the approved G
     assert.equal(replay.status, 200);
     assert.equal(kicks, 2);
     assert.equal(store.listActions().filter(action => action.payload.kind === 'task-create').length, 1);
+    assert.equal(store.listReminders().filter(reminder => reminder.target.id === value.task.id).length, 1);
+
+    const changedReminder = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, reminder: { fireAt: '2026-10-25T02:30:00.000Z' } }),
+    });
+    assert.equal(changedReminder.status, 409);
+    const offsetReminder = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...body,
+        nonce: 'nonce_offset_reminder',
+        reminder: { fireAt: '2026-10-25T01:30:00+01:00' },
+      }),
+    });
+    assert.equal(offsetReminder.status, 400);
+    const pastReminder = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...body,
+        nonce: 'nonce_past_reminder',
+        reminder: { fireAt: '2026-09-14T09:59:59.000Z' },
+      }),
+    });
+    assert.equal(pastReminder.status, 400);
 
     destinationAvailable = false;
     const stale = await app.request('/api/v1/tasks', {

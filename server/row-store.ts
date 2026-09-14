@@ -15,11 +15,14 @@ import {
   type Task,
 } from '../src/model.ts';
 import {
+  isBriefingRow,
   isEmailSendReceiptInput,
   isReplyEnvelope,
   isUtcInstant,
   taskCreateNotes,
   type ActionRow,
+  type BriefingRow,
+  type BriefingUpsertInput,
   type ChangeRow,
   type DraftRevision,
   type EmailSendPayload,
@@ -45,7 +48,7 @@ import {
 import { filterCalendarContextByDateRange } from '../src/integration-model.ts';
 import type { ImportedRecord, Provider } from './store.ts';
 
-export const ROW_SCHEMA_VERSION = 10;
+export const ROW_SCHEMA_VERSION = 11;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -181,6 +184,10 @@ function inboxSnapshot(row: InboxItemRow): Record<string, unknown> {
 }
 
 function reminderSnapshot(row: ReminderRow): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(row)) as Record<string, unknown>;
+}
+
+function briefingSnapshot(row: BriefingRow): Record<string, unknown> {
   return JSON.parse(JSON.stringify(row)) as Record<string, unknown>;
 }
 
@@ -565,6 +572,21 @@ function reminderFromSql(row: Record<string, unknown>): ReminderRow | null {
   };
 }
 
+function briefingFromSql(row: Record<string, unknown>): BriefingRow | null {
+  if (typeof row.entries_json !== 'string') return null;
+  let entries: unknown;
+  try { entries = JSON.parse(row.entries_json); } catch { return null; }
+  const briefing = {
+    day: row.day,
+    version: row.version,
+    entries,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  return isBriefingRow(briefing) ? briefing : null;
+}
+
 function syncStateFromSql(row: Record<string, unknown>): SyncStateRow | null {
   if (
     typeof row.scope_key !== 'string' || (row.provider !== 'google' && row.provider !== 'microsoft') ||
@@ -784,6 +806,15 @@ function ensureSchema(db: DatabaseSync): void {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS reminders_due ON reminders(state, fire_at);
 
+    CREATE TABLE IF NOT EXISTS briefings (
+      day TEXT PRIMARY KEY CHECK(length(day)=10 AND substr(day,5,1)='-' AND substr(day,8,1)='-' AND date(day)=day),
+      version INTEGER NOT NULL CHECK(version >= 1),
+      entries_json TEXT NOT NULL CHECK(json_valid(entries_json) AND json_type(entries_json)='array'),
+      expires_at TEXT NOT NULL CHECK(substr(expires_at,-1)='Z'),
+      created_at TEXT NOT NULL CHECK(substr(created_at,-1)='Z'),
+      updated_at TEXT NOT NULL CHECK(substr(updated_at,-1)='Z')
+    ) STRICT;
+
     CREATE TABLE IF NOT EXISTS changes (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
       actor TEXT NOT NULL CHECK(actor IN ('owner', 'hermes', 'provider', 'system')),
@@ -834,6 +865,11 @@ function ensureSchema(db: DatabaseSync): void {
       OLD.operation_key<>NEW.operation_key OR OLD.request_hash<>NEW.request_hash OR
       OLD.payload_json<>NEW.payload_json OR OLD.approval_json<>NEW.approval_json
     BEGIN SELECT RAISE(ABORT, 'action payloads are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS briefings_versioned_update BEFORE UPDATE ON briefings
+    WHEN NEW.day<>OLD.day OR NEW.version<>OLD.version+1 OR NEW.created_at<>OLD.created_at
+    BEGIN SELECT RAISE(ABORT, 'briefings require a new version'); END;
+    CREATE TRIGGER IF NOT EXISTS briefings_history_retained BEFORE DELETE ON briefings
+    BEGIN SELECT RAISE(ABORT, 'briefing history is retained'); END;
   `);
 }
 
@@ -913,6 +949,21 @@ function insertPlan(db: DatabaseSync, plan: TaskPlanRow): void {
     plan.estimateMinutes,
     plan.createdAt,
     plan.updatedAt,
+  );
+}
+
+function insertReminder(db: DatabaseSync, reminder: ReminderRow): void {
+  db.prepare(`INSERT INTO reminders (
+    id, version, target_kind, target_id, fire_at, state, legacy_json, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`).run(
+    reminder.id,
+    reminder.version,
+    reminder.target.kind,
+    reminder.target.id,
+    reminder.fireAt,
+    reminder.state,
+    reminder.createdAt,
+    reminder.updatedAt,
   );
 }
 
@@ -1232,10 +1283,23 @@ export type TaskCreateClaim = {
 export type TaskCreateQueueInput = TaskCreateInput & { destinationName: string; finalNotes: string };
 
 export type TaskCreateQueueResult =
-  | { outcome: 'queued' | 'replayed'; task: TaskRow; plan: TaskPlanRow; action: ActionRow; inbox: InboxItemRow | null }
+  | {
+      outcome: 'queued' | 'replayed';
+      task: TaskRow;
+      plan: TaskPlanRow;
+      action: ActionRow;
+      inbox: InboxItemRow | null;
+      reminder: ReminderRow | null;
+    }
   | { outcome: 'idempotency_conflict'; action: ActionRow }
   | { outcome: 'inbox_not_found'; inbox: null }
-  | { outcome: 'inbox_conflict'; inbox: InboxItemRow };
+  | { outcome: 'inbox_conflict'; inbox: InboxItemRow }
+  | { outcome: 'invalid_reminder'; reminder: null };
+
+export type BriefingUpsertResult =
+  | { outcome: 'created' | 'updated' | 'replayed'; briefing: BriefingRow }
+  | { outcome: 'conflict'; current: BriefingRow | null }
+  | { outcome: 'expired'; current: BriefingRow | null };
 
 export type TaskMigrationApprovalResult =
   | { outcome: 'queued' | 'replayed'; migrationId: string; actions: ActionRow[] }
@@ -1403,6 +1467,76 @@ export function createRowStore(db: DatabaseSync) {
         const reminder = reminderFromSql(row);
         return reminder ? [reminder] : [];
       });
+  }
+
+  function getReminder(id: string): ReminderRow | null {
+    const row = db.prepare('SELECT * FROM reminders WHERE id=? AND fire_at IS NOT NULL')
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? reminderFromSql(row) : null;
+  }
+
+  function getBriefing(day: string): BriefingRow | null {
+    const row = db.prepare('SELECT * FROM briefings WHERE day=?').get(day) as Record<string, unknown> | undefined;
+    return row ? briefingFromSql(row) : null;
+  }
+
+  function listBriefings(): BriefingRow[] {
+    return (db.prepare('SELECT * FROM briefings ORDER BY day DESC').all() as Record<string, unknown>[])
+      .flatMap(row => {
+        const briefing = briefingFromSql(row);
+        return briefing ? [briefing] : [];
+      });
+  }
+
+  function upsertBriefing(
+    day: string,
+    input: BriefingUpsertInput,
+    now: string,
+  ): BriefingUpsertResult {
+    if (!isDateKey(day) || !isUtcInstant(input.expiresAt) || !isUtcInstant(now)) {
+      throw new Error('Invalid briefing date');
+    }
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = getBriefing(day);
+      const content = { entries: input.entries, expiresAt: input.expiresAt };
+      if (current && canonicalHash({ entries: current.entries, expiresAt: current.expiresAt }) === canonicalHash(content)) {
+        db.exec('COMMIT');
+        return { outcome: 'replayed', briefing: current };
+      }
+      if (Date.parse(input.expiresAt) <= Date.parse(now)) {
+        db.exec('COMMIT');
+        return { outcome: 'expired', current };
+      }
+      if ((!current && input.expectedVersion !== null) ||
+        (current && current.version !== input.expectedVersion)) {
+        db.exec('COMMIT');
+        return { outcome: 'conflict', current };
+      }
+      const version = (current?.version ?? 0) + 1;
+      if (current) {
+        const result = db.prepare(`UPDATE briefings SET version=?, entries_json=?, expires_at=?, updated_at=?
+          WHERE day=? AND version=?`).run(
+          version, canonicalJson(input.entries), input.expiresAt, now, day, current.version,
+        );
+        if (result.changes !== 1) throw new Error('Briefing changed during update');
+      } else {
+        db.prepare(`INSERT INTO briefings (day, version, entries_json, expires_at, created_at, updated_at)
+          VALUES (?, 1, ?, ?, ?, ?)`).run(day, canonicalJson(input.entries), input.expiresAt, now, now);
+      }
+      const briefing = getBriefing(day);
+      if (!briefing) throw new Error('Briefing disappeared after upsert');
+      insertChange(db, {
+        actor: 'hermes', mutationKey: `hermes:briefing:${day}:${version}`, entityKind: 'briefing', entityId: day,
+        entityVersion: version, operation: 'upsert', snapshot: briefingSnapshot(briefing),
+        details: { expectedVersion: input.expectedVersion }, at: now,
+      });
+      db.exec('COMMIT');
+      return { outcome: current ? 'updated' : 'created', briefing };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
   }
 
   function listSyncStates(): SyncStateRow[] {
@@ -2294,7 +2428,7 @@ export function createRowStore(db: DatabaseSync) {
     return { changes, cursor: changes.at(-1)?.seq ?? after, resetRequired: false };
   }
 
-  function readContext(from: string, to: string): {
+  function readContext(from: string, to: string, activeAt = new Date().toISOString()): {
     cursor: number;
     tasks: TaskWithPlan[];
     calendar: Array<Record<string, unknown>>;
@@ -2302,6 +2436,7 @@ export function createRowStore(db: DatabaseSync) {
     jobs: Job[];
     jobUpdates: JobUpdate[];
     actions: ActionRow[];
+    briefings: BriefingRow[];
     freshness: SyncStateRow[];
   } {
     db.exec('BEGIN');
@@ -2371,9 +2506,11 @@ export function createRowStore(db: DatabaseSync) {
       const jobUpdates = listJobUpdates().filter(update => jobIds.has(update.jobId));
       const cursorRow = db.prepare('SELECT COALESCE(MAX(seq), 0) AS cursor FROM changes').get() as Record<string, unknown>;
       const cursor = typeof cursorRow.cursor === 'number' ? cursorRow.cursor : 0;
+      const briefings = listBriefings().filter(briefing =>
+        briefing.day >= from && briefing.day <= to && Date.parse(briefing.expiresAt) > Date.parse(activeAt));
       const freshness = listSyncStates();
       db.exec('COMMIT');
-      return { cursor, tasks, calendar, inbox, jobs, jobUpdates, actions, freshness };
+      return { cursor, tasks, calendar, inbox, jobs, jobUpdates, actions, briefings, freshness };
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
       throw error;
@@ -3179,11 +3316,14 @@ export function createRowStore(db: DatabaseSync) {
   }
 
   function queueTaskCreateAction(input: TaskCreateQueueInput, now: string): TaskCreateQueueResult {
+    if (!isUtcInstant(now)) throw new Error('Task creation requires a UTC instant');
     if (input.finalNotes !== taskCreateNotes(input.notes, input.nonce) || input.finalNotes.length > 8_192) {
       throw new Error('Invalid task create notes');
     }
+    if (input.reminder && !isUtcInstant(input.reminder.fireAt)) throw new Error('Task reminder must be a UTC instant');
     const operationKey = `task-create:${input.nonce}`;
     const taskId = `task-create-${createHash('sha256').update(input.nonce).digest('hex').slice(0, 32)}`;
+    const reminderId = `reminder-task-create-${createHash('sha256').update(input.nonce).digest('hex').slice(0, 32)}`;
     const actionId = randomUUID();
     const payload: Extract<ActionRow['payload'], { kind: 'task-create' }> = {
       kind: 'task-create',
@@ -3194,14 +3334,23 @@ export function createRowStore(db: DatabaseSync) {
       notes: input.finalNotes,
       doOn: input.doOn,
     };
-    const requestHash = canonicalHash({ payload, plan: input.plan, inbox: input.inbox ?? null });
+    const requestHash = canonicalHash({
+      payload,
+      plan: input.plan,
+      inbox: input.inbox ?? null,
+      reminder: input.reminder ?? null,
+    });
+    const legacyRequestHash = input.reminder
+      ? null
+      : canonicalHash({ payload, plan: input.plan, inbox: input.inbox ?? null });
 
     db.exec('BEGIN IMMEDIATE');
     try {
       const existingRow = db.prepare('SELECT * FROM actions WHERE operation_key=?').get(operationKey) as Record<string, unknown> | undefined;
       const existing = existingRow ? actionFromSql(existingRow) : null;
       if (existing) {
-        if (existing.requestHash !== requestHash || existing.payload.kind !== 'task-create') {
+        if ((existing.requestHash !== requestHash && existing.requestHash !== legacyRequestHash) ||
+          existing.payload.kind !== 'task-create') {
           db.exec('COMMIT');
           return { outcome: 'idempotency_conflict', action: existing };
         }
@@ -3209,8 +3358,15 @@ export function createRowStore(db: DatabaseSync) {
         const plan = task ? getTaskPlan(task.id) : null;
         if (!task || !plan) throw new Error('Task create replay points to missing rows');
         const inbox = task.originInboxId ? getInboxItem(task.originInboxId) : null;
+        const reminder = input.reminder ? getReminder(reminderId) : null;
+        if (input.reminder && !reminder) throw new Error('Task create replay points to a missing reminder');
         db.exec('COMMIT');
-        return { outcome: 'replayed', task, plan, action: existing, inbox };
+        return { outcome: 'replayed', task, plan, action: existing, inbox, reminder };
+      }
+
+      if (input.reminder && Date.parse(input.reminder.fireAt) <= Date.parse(now)) {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_reminder', reminder: null };
       }
 
       let inbox: InboxItemRow | null = null;
@@ -3244,11 +3400,21 @@ export function createRowStore(db: DatabaseSync) {
         createdAt: now,
         updatedAt: now,
       };
+      const reminder: ReminderRow | null = input.reminder ? {
+        id: reminderId,
+        version: 1,
+        target: { kind: 'task', id: taskId },
+        fireAt: input.reminder.fireAt,
+        state: 'scheduled',
+        createdAt: now,
+        updatedAt: now,
+      } : null;
       const previewLines = [
         `Create Google task in account ${input.destination.accountId}, list "${input.destinationName}" (${input.destination.listId}).`,
         `Title: ${payload.title}`,
         `Notes: ${payload.notes}`,
         `Due: ${payload.doOn ?? 'none'}`,
+        `Reminder: ${reminder?.fireAt ?? 'none'}`,
       ];
       const action: ActionRow = {
         id: actionId,
@@ -3269,6 +3435,7 @@ export function createRowStore(db: DatabaseSync) {
       };
       insertTask(db, task);
       insertPlan(db, plan);
+      if (reminder) insertReminder(db, reminder);
       insertApprovedAction(action);
       insertChange(db, {
         actor: 'owner', mutationKey: `owner:task-create:${task.id}:1`, entityKind: 'task', entityId: task.id,
@@ -3285,6 +3452,13 @@ export function createRowStore(db: DatabaseSync) {
         entityVersion: 1, operation: 'upsert', snapshot: actionSnapshot(action),
         details: { destinationName: input.destinationName, clickApproval: true }, at: now,
       });
+      if (reminder) {
+        insertChange(db, {
+          actor: 'owner', mutationKey: `owner:task-create-reminder:${reminder.id}:1`, entityKind: 'reminder',
+          entityId: reminder.id, entityVersion: 1, operation: 'upsert', snapshot: reminderSnapshot(reminder),
+          details: { actionId: action.id, taskId: task.id }, at: now,
+        });
+      }
 
       if (inbox) {
         const version = inbox.version + 1;
@@ -3301,7 +3475,7 @@ export function createRowStore(db: DatabaseSync) {
       }
 
       db.exec('COMMIT');
-      return { outcome: 'queued', task, plan, action, inbox };
+      return { outcome: 'queued', task, plan, action, inbox, reminder };
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
       throw error;
@@ -4147,6 +4321,9 @@ export function createRowStore(db: DatabaseSync) {
     getJob,
     listJobUpdates,
     listReminders,
+    getBriefing,
+    listBriefings,
+    upsertBriefing,
     listSyncStates,
     updateTaskPlan,
     updateInboxDecision,
