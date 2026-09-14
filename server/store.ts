@@ -29,6 +29,7 @@ export type ProviderSyncState = 'idle' | 'syncing' | 'failed';
 
 export type ConnectionSummary = {
   provider: Provider;
+  accountId: string;
   connectionId: string;
   state: ProviderConnectionState;
   scopes: string[];
@@ -41,6 +42,8 @@ export type ConnectionSummary = {
 export type StoredConnection = ConnectionSummary & {
   tokenEnvelope: string | null;
 };
+
+type StoredConnectionInput = StoredConnection | (Omit<StoredConnection, 'accountId'> & { accountId?: undefined });
 
 export type OAuthAttempt = {
   provider: Provider;
@@ -67,6 +70,10 @@ export type ImportedRecord = {
   completedAt: string | null;
   sourceUpdatedAt: string | null;
   sourceVersion?: string | null;
+  accountId?: string | null;
+  connectionGeneration?: string | null;
+  // Kept for the legacy integration UI and workspace-link shape. It is the
+  // stable account identity, not an OAuth connection generation.
   connectionId?: string | null;
   completionWritable?: boolean;
   notes?: string | null;
@@ -80,7 +87,9 @@ export type StoredRecord = ImportedRecord & {
   id: number;
   importedAt: string;
   sourceVersion: string | null;
-  connectionId: string | null;
+  accountId: string;
+  connectionGeneration: string;
+  connectionId: string;
   completionWritable: boolean;
 };
 
@@ -198,13 +207,15 @@ function stringList(value: unknown): string[] {
 
 function rowToConnection(row: Record<string, unknown> | undefined): StoredConnection | null {
   if (
-    !row || !isProvider(row.provider) || typeof row.connection_id !== 'string' ||
+    !row || !isProvider(row.provider) || typeof row.account_id !== 'string' ||
+    typeof row.connection_id !== 'string' ||
     !connectionStates.has(row.state as ProviderConnectionState) ||
     typeof row.connected_at !== 'string' || typeof row.updated_at !== 'string'
   ) return null;
 
   return {
     provider: row.provider,
+    accountId: row.account_id,
     connectionId: row.connection_id,
     state: row.state as ProviderConnectionState,
     scopes: stringList(row.scopes),
@@ -220,6 +231,7 @@ function rowToRecord(row: Record<string, unknown>): StoredRecord | null {
   if (
     !isProvider(row.provider) || !isRecordKind(row.kind) ||
     typeof row.id !== 'number' || typeof row.container_id !== 'string' ||
+    typeof row.account_id !== 'string' || typeof row.connection_id !== 'string' ||
     typeof row.container_name !== 'string' || typeof row.external_id !== 'string' ||
     typeof row.title !== 'string' || typeof row.imported_at !== 'string'
   ) return null;
@@ -242,7 +254,9 @@ function rowToRecord(row: Record<string, unknown>): StoredRecord | null {
     completedAt: stringOrNull(row.completed_at),
     sourceUpdatedAt: stringOrNull(row.source_updated_at),
     sourceVersion: stringOrNull(row.source_version),
-    connectionId: stringOrNull(row.connection_id),
+    accountId: row.account_id,
+    connectionGeneration: row.connection_id,
+    connectionId: row.account_id,
     completionWritable: booleanFromInteger(row.completion_writable),
     notes: stringOrNull(row.notes),
     parentId: stringOrNull(row.parent_id),
@@ -393,40 +407,29 @@ function rowToHermesTask(row: Record<string, unknown>): HermesTask | null {
   };
 }
 
-// The workspace document is the native task store. Provider records live in
-// normal tables, so an import cannot be edited through the workspace PUT route.
-export function openStore(path: string, initialData: PrototypeData = createInitialData()) {
-  const db = new DatabaseSync(path);
-  const versionRow = db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined;
-  const previousSchemaVersion = typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
-  db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
-    CREATE TABLE IF NOT EXISTS workspace (
-      id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL,
-      data TEXT NOT NULL CHECK(json_valid(data)), updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS provider_connections (
-      provider TEXT PRIMARY KEY CHECK(provider IN ('google', 'microsoft')),
-      connection_id TEXT NOT NULL,
-      state TEXT NOT NULL CHECK(state IN ('connected', 'needs_reconnect')),
-      scopes TEXT NOT NULL CHECK(json_valid(scopes)),
-      token_envelope TEXT,
-      connected_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      last_synced_at TEXT,
-      last_error TEXT
-    );
-    CREATE TABLE IF NOT EXISTS provider_oauth_attempts (
-      state_hash TEXT PRIMARY KEY,
-      provider TEXT NOT NULL CHECK(provider IN ('google', 'microsoft')),
-      verifier_envelope TEXT NOT NULL,
-      nonce TEXT,
-      expires_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS provider_oauth_attempts_expiry ON provider_oauth_attempts(expires_at);
-    CREATE TABLE IF NOT EXISTS provider_records (
+const providerRecordIdentity = ['provider', 'kind', 'account_id', 'container_id', 'external_id'];
+
+function hasProviderRecordIdentity(db: DatabaseSync): boolean {
+  const indexes = db.prepare(`SELECT name FROM pragma_index_list('provider_records') WHERE "unique"=1`)
+    .all() as Record<string, unknown>[];
+  return indexes.some(index => {
+    if (typeof index.name !== 'string') return false;
+    const columns = db.prepare('SELECT name FROM pragma_index_info(?) ORDER BY seqno')
+      .all(index.name) as Record<string, unknown>[];
+    return columns.length === providerRecordIdentity.length && columns.every((column, position) =>
+      column.name === providerRecordIdentity[position]);
+  });
+}
+
+function migrateProviderRecordIdentity(db: DatabaseSync): void {
+  if (hasProviderRecordIdentity(db)) return;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(`CREATE TABLE provider_records_by_connection (
       id INTEGER PRIMARY KEY,
       provider TEXT NOT NULL CHECK(provider IN ('google', 'microsoft')),
-      connection_id TEXT,
+      account_id TEXT NOT NULL,
+      connection_id TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('calendar_event', 'task')),
       container_id TEXT NOT NULL,
       container_name TEXT NOT NULL,
@@ -451,7 +454,106 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       imported_at TEXT NOT NULL,
       sync_marker TEXT NOT NULL,
       deleted_at TEXT,
-      UNIQUE(provider, kind, container_id, external_id)
+      UNIQUE(provider, kind, account_id, container_id, external_id)
+    );
+    INSERT INTO provider_records_by_connection (
+      id, provider, account_id, connection_id, kind, container_id, container_name, external_id, title, status,
+      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at,
+      source_version, completion_writable, source_url, source_time_zone, notes, parent_id, position,
+      imported_at, sync_marker, deleted_at
+    ) SELECT
+      records.id, records.provider,
+      COALESCE(
+        records.account_id,
+        records.connection_id,
+        (SELECT connections.account_id FROM provider_connections AS connections
+          WHERE connections.provider=records.provider),
+        'legacy:' || records.provider
+      ),
+      COALESCE(
+        records.connection_id,
+        records.account_id,
+        (SELECT connections.connection_id FROM provider_connections AS connections
+          WHERE connections.provider=records.provider),
+        'legacy:' || records.provider
+      ),
+      kind, container_id, container_name, external_id, title, status,
+      starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at,
+      source_version, completion_writable, source_url, source_time_zone, notes, parent_id, position,
+      imported_at, sync_marker, deleted_at
+    FROM provider_records AS records;
+    DROP TABLE provider_records;
+    ALTER TABLE provider_records_by_connection RENAME TO provider_records;
+    CREATE INDEX provider_records_visible
+      ON provider_records(provider, kind, deleted_at, starts_at, due_on);
+    COMMIT;`);
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+    throw error;
+  }
+}
+
+// The workspace document is the native task store. Provider records live in
+// normal tables, so an import cannot be edited through the workspace PUT route.
+export function openStore(path: string, initialData: PrototypeData = createInitialData()) {
+  const db = new DatabaseSync(path);
+  const versionRow = db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined;
+  const previousSchemaVersion = typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
+  db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;
+    CREATE TABLE IF NOT EXISTS workspace (
+      id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL,
+      data TEXT NOT NULL CHECK(json_valid(data)), updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS provider_connections (
+      provider TEXT PRIMARY KEY CHECK(provider IN ('google', 'microsoft')),
+      account_id TEXT NOT NULL,
+      connection_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('connected', 'needs_reconnect')),
+      scopes TEXT NOT NULL CHECK(json_valid(scopes)),
+      token_envelope TEXT,
+      connected_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_synced_at TEXT,
+      last_error TEXT
+    );
+    CREATE TABLE IF NOT EXISTS provider_oauth_attempts (
+      state_hash TEXT PRIMARY KEY,
+      provider TEXT NOT NULL CHECK(provider IN ('google', 'microsoft')),
+      verifier_envelope TEXT NOT NULL,
+      nonce TEXT,
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS provider_oauth_attempts_expiry ON provider_oauth_attempts(expires_at);
+    CREATE TABLE IF NOT EXISTS provider_records (
+      id INTEGER PRIMARY KEY,
+      provider TEXT NOT NULL CHECK(provider IN ('google', 'microsoft')),
+      account_id TEXT NOT NULL,
+      connection_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('calendar_event', 'task')),
+      container_id TEXT NOT NULL,
+      container_name TEXT NOT NULL,
+      external_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT,
+      starts_at TEXT,
+      ends_at TEXT,
+      starts_on TEXT,
+      ends_on TEXT,
+      all_day INTEGER NOT NULL CHECK(all_day IN (0, 1)),
+      due_on TEXT,
+      completed_at TEXT,
+      source_updated_at TEXT,
+      source_version TEXT,
+      completion_writable INTEGER NOT NULL DEFAULT 0 CHECK(completion_writable IN (0, 1)),
+      source_url TEXT,
+      source_time_zone TEXT,
+      notes TEXT,
+      parent_id TEXT,
+      position TEXT,
+      imported_at TEXT NOT NULL,
+      sync_marker TEXT NOT NULL,
+      deleted_at TEXT,
+      UNIQUE(provider, kind, account_id, container_id, external_id)
     );
     CREATE INDEX IF NOT EXISTS provider_records_visible ON provider_records(provider, kind, deleted_at, starts_at, due_on);
     CREATE TABLE IF NOT EXISTS provider_sync_state (
@@ -599,12 +701,6 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       throw error;
     }
   }
-  if (!recordColumns.has('source_version')) db.exec('ALTER TABLE provider_records ADD COLUMN source_version TEXT');
-  if (!recordColumns.has('connection_id')) db.exec('ALTER TABLE provider_records ADD COLUMN connection_id TEXT');
-  if (!recordColumns.has('completion_writable')) db.exec('ALTER TABLE provider_records ADD COLUMN completion_writable INTEGER NOT NULL DEFAULT 0');
-  if (!recordColumns.has('notes')) db.exec('ALTER TABLE provider_records ADD COLUMN notes TEXT');
-  if (!recordColumns.has('parent_id')) db.exec('ALTER TABLE provider_records ADD COLUMN parent_id TEXT');
-  if (!recordColumns.has('position')) db.exec('ALTER TABLE provider_records ADD COLUMN position TEXT');
   const connectionColumns = new Set((db.prepare('PRAGMA table_info(provider_connections)').all() as Record<string, unknown>[])
     .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
   if (!connectionColumns.has('connection_id')) db.exec('ALTER TABLE provider_connections ADD COLUMN connection_id TEXT');
@@ -613,6 +709,16 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   for (const row of connectionsWithoutGeneration) {
     if (isProvider(row.provider)) db.prepare('UPDATE provider_connections SET connection_id=? WHERE provider=?').run(randomUUID(), row.provider);
   }
+  if (!connectionColumns.has('account_id')) db.exec('ALTER TABLE provider_connections ADD COLUMN account_id TEXT');
+  db.prepare('UPDATE provider_connections SET account_id=connection_id WHERE account_id IS NULL OR account_id=?').run('');
+  if (!recordColumns.has('source_version')) db.exec('ALTER TABLE provider_records ADD COLUMN source_version TEXT');
+  if (!recordColumns.has('connection_id')) db.exec('ALTER TABLE provider_records ADD COLUMN connection_id TEXT');
+  if (!recordColumns.has('account_id')) db.exec('ALTER TABLE provider_records ADD COLUMN account_id TEXT');
+  if (!recordColumns.has('completion_writable')) db.exec('ALTER TABLE provider_records ADD COLUMN completion_writable INTEGER NOT NULL DEFAULT 0');
+  if (!recordColumns.has('notes')) db.exec('ALTER TABLE provider_records ADD COLUMN notes TEXT');
+  if (!recordColumns.has('parent_id')) db.exec('ALTER TABLE provider_records ADD COLUMN parent_id TEXT');
+  if (!recordColumns.has('position')) db.exec('ALTER TABLE provider_records ADD COLUMN position TEXT');
+  migrateProviderRecordIdentity(db);
   const actionColumns = new Set((db.prepare('PRAGMA table_info(task_action_requests)').all() as Record<string, unknown>[])
     .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
   if (!actionColumns.has('connection_id')) db.exec("ALTER TABLE task_action_requests ADD COLUMN connection_id TEXT NOT NULL DEFAULT 'legacy'");
@@ -665,16 +771,19 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     });
   }
 
-  function saveConnection(connection: StoredConnection): void {
+  function saveConnection(connection: StoredConnectionInput): void {
     const now = new Date().toISOString();
+    const accountId = connection.accountId ?? getConnection(connection.provider)?.accountId ?? connection.connectionId;
     db.prepare(`INSERT INTO provider_connections (
-      provider, connection_id, state, scopes, token_envelope, connected_at, updated_at, last_synced_at, last_error
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      provider, account_id, connection_id, state, scopes, token_envelope, connected_at, updated_at, last_synced_at, last_error
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(provider) DO UPDATE SET
-      connection_id=excluded.connection_id, state=excluded.state, scopes=excluded.scopes, token_envelope=excluded.token_envelope,
+      account_id=excluded.account_id, connection_id=excluded.connection_id, state=excluded.state,
+      scopes=excluded.scopes, token_envelope=excluded.token_envelope,
       updated_at=excluded.updated_at, last_synced_at=excluded.last_synced_at, last_error=excluded.last_error`)
       .run(
         connection.provider,
+        accountId,
         connection.connectionId,
         connection.state,
         JSON.stringify([...new Set(connection.scopes)].sort()),
@@ -756,17 +865,36 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     );
   }
 
+  function retireProviderScope(input: {
+    provider: Provider;
+    resourceKind: 'task-list' | 'calendar';
+    accountId: string;
+    connectionGeneration: string;
+    containerId: string;
+  }): boolean {
+    const result = db.prepare(`DELETE FROM sync_state
+      WHERE provider=? AND resource_kind=? AND account_id=? AND connection_generation=? AND container_id=?`).run(
+      input.provider,
+      input.resourceKind,
+      input.accountId,
+      input.connectionGeneration,
+      input.containerId,
+    );
+    return result.changes === 1;
+  }
+
   function replaceProviderRecords(provider: Provider, records: ImportedRecord[]): number {
     const marker = randomUUID();
     const now = new Date().toISOString();
     const upsert = db.prepare(`INSERT INTO provider_records (
-      provider, connection_id, kind, container_id, container_name, external_id, title, status,
+      provider, account_id, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
       completion_writable, source_url, source_time_zone, imported_at, sync_marker, deleted_at,
       notes, parent_id, position
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-    ON CONFLICT(provider, kind, container_id, external_id) DO UPDATE SET
-      connection_id=excluded.connection_id, container_name=excluded.container_name, title=excluded.title, status=excluded.status,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+    ON CONFLICT(provider, kind, account_id, container_id, external_id) DO UPDATE SET
+      connection_id=excluded.connection_id, container_name=excluded.container_name,
+      title=excluded.title, status=excluded.status,
       starts_at=excluded.starts_at, ends_at=excluded.ends_at,
       starts_on=excluded.starts_on, ends_on=excluded.ends_on, all_day=excluded.all_day,
       due_on=excluded.due_on, completed_at=excluded.completed_at,
@@ -778,8 +906,10 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const record of records) {
+        const accountId = record.accountId ?? record.connectionId ?? `legacy:${provider}`;
+        const connectionGeneration = record.connectionGeneration ?? record.connectionId ?? accountId;
         upsert.run(
-          record.provider, record.connectionId ?? null, record.kind, record.containerId, record.containerName,
+          record.provider, accountId, connectionGeneration, record.kind, record.containerId, record.containerName,
           record.externalId, record.title, record.status, record.startsAt, record.endsAt,
           record.startsOn, record.endsOn, record.allDay ? 1 : 0, record.dueOn,
           record.completedAt, record.sourceUpdatedAt, record.sourceVersion ?? null,
@@ -826,7 +956,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
 
   function listProviderRecords(limit = 1000, kind?: ProviderRecordKind): StoredRecord[] {
     const safeLimit = Math.max(1, Math.min(limit, 5_000));
-    const query = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
+    const query = db.prepare(`SELECT id, provider, account_id, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
       completion_writable, source_url, source_time_zone, imported_at
       FROM provider_records WHERE deleted_at IS NULL AND kind=?
@@ -1159,7 +1289,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   }
 
   function getProviderRecord(id: number): StoredRecord | null {
-    const row = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
+    const row = db.prepare(`SELECT id, provider, account_id, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
       completion_writable, notes, parent_id, position,
       source_url, source_time_zone, imported_at
@@ -1170,15 +1300,15 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   function findProviderRecord(
     provider: Provider,
     kind: ProviderRecordKind,
-    connectionId: string,
+    accountId: string,
     containerId: string,
     externalId: string,
   ): StoredRecord | null {
-    const row = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
+    const row = db.prepare(`SELECT id, provider, account_id, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
       completion_writable, notes, parent_id, position, source_url, source_time_zone, imported_at
-      FROM provider_records WHERE deleted_at IS NULL AND provider=? AND kind=? AND connection_id=? AND container_id=? AND external_id=?`)
-      .get(provider, kind, connectionId, containerId, externalId) as Record<string, unknown> | undefined;
+      FROM provider_records WHERE deleted_at IS NULL AND provider=? AND kind=? AND account_id=? AND container_id=? AND external_id=?`)
+      .get(provider, kind, accountId, containerId, externalId) as Record<string, unknown> | undefined;
     return row ? rowToRecord(row) : null;
   }
 
@@ -1293,7 +1423,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
         candidate.connectionId === current.connectionId && candidate.containerId === current.containerId &&
         candidate.externalId === current.externalId);
       const providerRecord = db.prepare(`SELECT id, source_version FROM provider_records
-        WHERE provider='google' AND kind='task' AND deleted_at IS NULL AND connection_id=? AND container_id=?
+        WHERE provider='google' AND kind='task' AND deleted_at IS NULL AND account_id=? AND container_id=?
           AND external_id=? AND completion_writable=1`).get(
         current.connectionId, current.containerId, current.externalId,
       ) as Record<string, unknown> | undefined;
@@ -1388,7 +1518,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       db.prepare('UPDATE workspace SET revision=revision+1, data=?, updated_at=? WHERE id=1')
         .run(JSON.stringify(data), input.now);
       db.prepare(`UPDATE provider_records SET status=?, completed_at=?, source_updated_at=?, source_version=?, imported_at=?
-        WHERE provider='google' AND kind='task' AND connection_id=? AND container_id=? AND external_id=?`).run(
+        WHERE provider='google' AND kind='task' AND account_id=? AND container_id=? AND external_id=?`).run(
         input.sourceStatus,
         input.completedAt,
         input.sourceUpdatedAt,
@@ -1525,6 +1655,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     consumeOAuthAttempt,
     getSyncSummary,
     setSyncState,
+    retireProviderScope,
     replaceProviderRecords,
     clearProviderRecords,
     listProviderRecords,

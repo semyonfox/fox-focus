@@ -7,11 +7,25 @@ import { HTTPException } from 'hono/http-exception';
 import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
 import { isDateKey } from '../src/calendar-time.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
-import { isInboxDecisionInput, isTaskPlanInput, isTaskStatusInput } from '../src/row-model.ts';
+import {
+  isHermesInboxUpsertInput,
+  isInboxDecisionInput,
+  isJobAnswerInput,
+  isJobInstruction,
+  isJobResultInput,
+  isJobSendBackInput,
+  isJobSettleInput,
+  isReplyEnvelope,
+  isTaskPlanInput,
+  isTaskCreateInput,
+  isTaskStatusInput,
+  taskCreateNotes,
+} from '../src/row-model.ts';
 import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
 import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
+import { canonicalHash } from './row-store.ts';
 import {
   TaskManagementError,
   adoptionSourceStillMatches,
@@ -54,8 +68,9 @@ function tokenMatches(value: string, expected: string): boolean {
 }
 
 function isHermesApiRequest(method: string, path: string): boolean {
-  return (method === 'GET' && (path === '/api/v1/context' || path === '/api/v1/changes' || path === '/api/v1/task-status')) ||
-    (method === 'POST' && path === '/api/v1/task-proposals');
+  return (method === 'GET' && (path === '/api/v1/context' || path === '/api/v1/changes')) ||
+    (method === 'PUT' && /^\/api\/v1\/inbox\/[^/]+$/.test(path)) ||
+    (method === 'POST' && /^\/api\/v1\/requests\/[^/]+\/(?:claim|result)$/.test(path));
 }
 
 function taskManagementStatus(error: TaskManagementError): 404 | 409 | 422 {
@@ -118,6 +133,8 @@ export function createApp(
     taskPlans: store.listTaskPlans(),
     inbox: store.listInboxItems(),
     drafts: store.listDrafts(),
+    jobs: store.listJobs(),
+    jobUpdates: store.listJobUpdates(),
     actions: store.listActions(),
     reminders: store.listReminders(),
     freshness: store.listSyncStates(),
@@ -141,6 +158,115 @@ export function createApp(
     }
     const page = store.listChanges(after, limit);
     return page.resetRequired ? c.json({ error: 'Change cursor expired', resetRequired: true, cursor: page.cursor }, 410) : c.json(page);
+  });
+  app.put('/api/v1/inbox/:proposalKey', async (c) => {
+    const proposalKey = c.req.param('proposalKey');
+    if (!proposalKey || proposalKey.length > 200 || /[\r\n]/.test(proposalKey)) {
+      return c.json({ error: 'Invalid proposal key' }, 400);
+    }
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isHermesInboxUpsertInput(body)) return c.json({ error: 'Invalid Inbox upsert' }, 400);
+    const input = {
+      expectedVersion: body.expectedVersion,
+      source: body.source,
+      title: body.title.trim(),
+      summary: body.summary,
+      likelyNoise: body.likelyNoise,
+      ...(body.draft === undefined ? {} : { draft: body.draft }),
+    };
+    const result = store.upsertHermesInbox(proposalKey, canonicalHash(input), input, now().toISOString());
+    if (result.outcome === 'invalid_draft') {
+      return c.json({ error: 'Draft identity does not match the Inbox source', current: result.item }, 400);
+    }
+    if (result.outcome === 'conflict') {
+      const error = result.reason === 'idempotency'
+        ? 'That proposal key was used for different content'
+        : result.reason === 'source'
+          ? 'The email thread identity changed'
+          : 'Inbox item changed';
+      return c.json({ error, reason: result.reason, current: result.item }, 409);
+    }
+    return c.json({
+      outcome: result.outcome,
+      item: result.item,
+      draft: result.draft,
+      draftOutcome: result.draftOutcome,
+    }, result.outcome === 'created' ? 201 : 200);
+  });
+  app.post('/api/v1/requests/:id/claim', (c) => {
+    const id = c.req.param('id');
+    if (!id || id.length > 200) return c.json({ error: 'Invalid request ID' }, 400);
+    const result = store.claimJob(id, now().toISOString(), 120_000);
+    if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
+    if (result.outcome === 'unavailable') return c.json({ error: 'Request is not available to claim', current: result.job }, 409);
+    return c.json({ job: result.job, claimId: result.claimId, leaseUntil: result.job.leaseUntil });
+  });
+  app.post('/api/v1/requests/:id/result', async (c) => {
+    const id = c.req.param('id');
+    const claimId = c.req.header('X-Claim-Id') ?? '';
+    if (!id || id.length > 200 || !claimId || claimId.length > 200) {
+      return c.json({ error: 'A valid request and claim ID are required' }, 400);
+    }
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isJobResultInput(body)) return c.json({ error: 'Invalid job update' }, 400);
+    const result = store.postJobResult(id, claimId, body, now().toISOString(), 120_000);
+    if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
+    if (result.outcome === 'invalid_claim') return c.json({ error: 'Claim is invalid or expired', current: result.job }, 409);
+    if (result.outcome === 'invalid_state') return c.json({ error: 'Request is not working', current: result.job }, 409);
+    if (!('update' in result)) return c.json({ error: 'Request result failed' }, 409);
+    return c.json({ outcome: result.outcome, job: result.job, update: result.update });
+  });
+  app.get('/api/v1/task-destinations', (c) => {
+    if (!integrations) return c.json({ error: 'Google Tasks is not configured' }, 503);
+    const catalogue = integrations.listGoogleTaskDestinations();
+    const destinations = catalogue.destinations.filter(destination => destination.fresh).map(destination => ({
+      accountId: destination.accountId,
+      listId: destination.listId,
+      listName: destination.name,
+      area: destination.area,
+      isFallback: destination.fallback,
+      explicitMapping: destination.explicitMapping,
+    }));
+    const fallback = destinations.find(destination => destination.listId === catalogue.fallbackListId) ?? null;
+    return c.json({ destinations, fallback });
+  });
+  app.post('/api/v1/tasks', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isTaskCreateInput(body)) return c.json({ error: 'Invalid task create request' }, 400);
+    if (!integrations) return c.json({ error: 'Google Tasks is not configured' }, 503);
+    const catalogue = integrations.listGoogleTaskDestinations();
+    const destination = catalogue.destinations.find(candidate => candidate.fresh &&
+      candidate.accountId === body.destination.accountId && candidate.listId === body.destination.listId);
+    if (!destination || catalogue.accountId !== body.destination.accountId) {
+      return c.json({ error: 'The Google task destination changed. Refresh the list and try again.' }, 409);
+    }
+    const finalNotes = taskCreateNotes(body.notes, body.nonce);
+    if (finalNotes.length > 8_192) return c.json({ error: 'Task notes are too long' }, 400);
+    const result = store.queueTaskCreateAction({
+      destination: body.destination,
+      destinationName: destination.name,
+      nonce: body.nonce,
+      title: body.title.trim(),
+      notes: body.notes,
+      finalNotes,
+      doOn: body.doOn,
+      plan: body.plan,
+      ...(body.inbox ? { inbox: body.inbox } : {}),
+    }, now().toISOString());
+    if (result.outcome === 'idempotency_conflict') {
+      return c.json({ error: 'This task create nonce was already used for different content', current: result.action }, 409);
+    }
+    if (result.outcome === 'inbox_not_found') return c.json({ error: 'Inbox item not found' }, 404);
+    if (result.outcome === 'inbox_conflict') return c.json({ error: 'Inbox item changed', current: result.inbox }, 409);
+    options.actionWorker?.kick();
+    return c.json({ task: result.task, plan: result.plan, action: result.action, inbox: result.inbox },
+      result.outcome === 'queued' ? 202 : 200);
   });
   app.put('/api/v1/tasks/:taskId/plan', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
@@ -172,20 +298,101 @@ export function createApp(
     options.actionWorker?.kick();
     return c.json({ action: result.action, task: result.task }, 202);
   });
+  app.post('/api/v1/jobs', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isJobInstruction(body)) return c.json({ error: 'Invalid job' }, 400);
+    const result = store.createJob({
+      title: body.title.trim(),
+      instruction: body.instruction.trim(),
+      taskId: body.taskId ?? null,
+      inboxId: body.inboxId ?? null,
+    }, now().toISOString(), body.idempotencyKey);
+    if (result.outcome === 'missing_task') return c.json({ error: 'Linked task not found' }, 404);
+    if (result.outcome === 'missing_inbox') return c.json({ error: 'Linked Inbox item not found' }, 404);
+    if (result.outcome === 'idempotency_conflict') {
+      return c.json({ error: 'This job key was already used for a different instruction', current: result.job }, 409);
+    }
+    return c.json({ job: result.job }, result.outcome === 'created' ? 201 : 200);
+  });
+  app.post('/api/v1/jobs/:id/answer', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isJobAnswerInput(body)) return c.json({ error: 'Invalid answer' }, 400);
+    const result = store.answerJob(c.req.param('id'), body.version, body.text, now().toISOString());
+    if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
+    if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
+    if (result.outcome === 'invalid_state') return c.json({ error: 'Job does not need an answer', current: result.job }, 409);
+    if (!('update' in result)) return c.json({ error: 'Answer failed' }, 409);
+    return c.json({ job: result.job, update: result.update });
+  });
+  app.post('/api/v1/jobs/:id/send-back', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isJobSendBackInput(body)) return c.json({ error: 'Invalid send-back note' }, 400);
+    const result = store.sendBackJob(c.req.param('id'), body.version, body.text, now().toISOString());
+    if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
+    if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
+    if (result.outcome === 'invalid_state') return c.json({ error: 'Job is not ready for review', current: result.job }, 409);
+    if (!('update' in result)) return c.json({ error: 'Send back failed' }, 409);
+    return c.json({ job: result.job, update: result.update });
+  });
+  app.post('/api/v1/jobs/:id/settle', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isJobSettleInput(body)) return c.json({ error: 'Invalid settlement' }, 400);
+    const result = store.settleJob(c.req.param('id'), body.version, body.outcome, now().toISOString(), body.taskVersion);
+    if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
+    if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
+    if (result.outcome === 'invalid_state') return c.json({ error: 'Job cannot be settled from its current state', current: result.job }, 409);
+    if (result.outcome === 'task_not_found') return c.json({ error: 'Linked task not found', current: result.job }, 409);
+    if (result.outcome === 'task_version_required') {
+      return c.json({ error: 'The displayed linked task version is required', current: result.task }, 409);
+    }
+    if (result.outcome === 'task_conflict') return c.json({ error: 'Linked task changed', current: result.task }, 409);
+    if (result.outcome === 'task_read_only') return c.json({ error: 'Linked task cannot be completed', current: result.task }, 422);
+    if (!('action' in result)) return c.json({ error: 'Settlement failed' }, 409);
+    if (result.action) options.actionWorker?.kick();
+    return c.json({ job: result.job, update: result.update, action: result.action });
+  });
   app.put('/api/v1/inbox-items/:inboxId', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
     let body: unknown;
     try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
     if (!isInboxDecisionInput(body)) return c.json({ error: 'Invalid Inbox decision' }, 400);
+    const decisionAt = now().toISOString();
+    if (body.state === 'waiting' && (body.snoozedUntil === null || Date.parse(body.snoozedUntil) <= Date.parse(decisionAt))) {
+      return c.json({ error: 'Snooze time must be in the future' }, 400);
+    }
+    if (body.outcome === 'sent' || body.outcome === 'task') {
+      return c.json({ error: 'Sent and task outcomes require their approval routes' }, 400);
+    }
     const current = store.getInboxItem(c.req.param('inboxId'));
     const updated = store.updateInboxDecision(c.req.param('inboxId'), body.version, {
       state: body.state,
       outcome: body.outcome,
       snoozedUntil: body.snoozedUntil,
-    }, now().toISOString());
+    }, decisionAt);
     return updated ? c.json({ item: updated }) : current
       ? c.json({ error: 'Inbox item changed', current }, 409)
       : c.json({ error: 'Inbox item not found' }, 404);
+  });
+  app.post('/api/v1/inbox-items/:inboxId/drafts', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isRecord(body) || !Number.isSafeInteger(body.version) || typeof body.version !== 'number' || body.version < 1 ||
+      !isReplyEnvelope(body.reply)) return c.json({ error: 'Invalid draft revision' }, 400);
+    const result = store.appendOwnerDraft(c.req.param('inboxId'), body.version, body.reply, now().toISOString());
+    if (result.outcome === 'not_found') return c.json({ error: 'Inbox item not found' }, 404);
+    if (result.outcome === 'conflict') return c.json({ error: 'Inbox item changed', current: result.item }, 409);
+    if (result.outcome === 'not_email') return c.json({ error: 'Draft identity does not match the email', current: result.item }, 400);
+    if (!('draft' in result)) return c.json({ error: 'Draft update failed' }, 409);
+    return c.json({ item: result.item, draft: result.draft }, 201);
   });
   app.get('/api/v1/push/public-key', (c) => options.pushPublicKey
     ? c.json({ publicKey: options.pushPublicKey })
@@ -412,7 +619,7 @@ export function createApp(
       return { status: 503 as const, body: { action, snapshot: store.read() } };
     }
     const result = await integrations.updateGoogleTaskCompletion({
-      connectionId: started.action.connectionId,
+      accountId: started.action.connectionId,
       containerId: started.action.containerId,
       externalId: started.action.externalId,
       desiredState: started.action.desiredState,

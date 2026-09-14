@@ -11,14 +11,18 @@ import {
   ChevronRight,
   Circle,
   Clock3,
+  CornerUpLeft,
   Inbox,
   Link2,
   ListTodo,
+  Mail,
+  MessageSquare,
   Moon,
   Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
+  Send,
   SlidersHorizontal,
   Sun,
   Trash2,
@@ -41,6 +45,24 @@ import { deduplicatedProviderIdentity, type HermesTask, type HermesTaskAnnotatio
 import { IntegrationCalendarContext, IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord, type OverviewState } from './integrations.tsx';
 import { areaForList } from './integration-model.ts';
 import {
+  answerJob,
+  createGoogleTask,
+  createJob,
+  decideInboxItem,
+  isTaskCreateActionRow,
+  loadTaskDestinations,
+  loadWorkRows,
+  mergeWorkRows,
+  preferredTaskDestination,
+  saveOwnerDraft,
+  sendBackJob,
+  settleJob,
+  taskCreateConflictCandidates,
+  type TaskCreateActionRow,
+  type TaskDestination,
+  type WorkRowsSnapshot,
+} from "./inbox-client.ts";
+import {
   isTaskPlanRow,
   isTaskRow as isRowTask,
   isTaskStatusActionRow,
@@ -50,7 +72,7 @@ import {
   type TaskRowsSnapshot,
   type TaskStatusActionRow,
 } from "./row-client.ts";
-import type { TaskPlanRow, TaskRow } from "./row-model.ts";
+import type { ActionRow, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow } from "./row-model.ts";
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
@@ -284,7 +306,7 @@ function isServerSnapshot(value: unknown): value is ServerSnapshot {
     value.revision >= 0 && isPrototypeData(value.data);
 }
 
-function actionStateLabel(action: TaskStatusActionRow | undefined): string | null {
+function actionStateLabel(action: Pick<ActionRow, "state"> | undefined): string | null {
   if (!action) return null;
   if (action.state === "queued" || action.state === "running") return "Google pending";
   if (action.state === "succeeded") return "Google confirmed";
@@ -422,6 +444,68 @@ function DialogFrame({
 type ServerSnapshot = { revision: number; data: PrototypeData };
 type CompletionUndo = { taskId: string; state: ActiveTaskState; reminder?: Reminder };
 type ReviewUndo = { itemId: string; status: InboxStatus };
+type WorkThread = {
+  key: string;
+  kind: "inbox" | "job";
+  title: string;
+  source: string;
+  updatedAt: string;
+  group: "needs_you" | "working" | "settled" | "noise";
+  item: InboxItemRow | null;
+  job: Job | null;
+};
+
+function inboxSourceLabel(item: InboxItemRow): string {
+  if (item.source.kind === "email") return `Email · ${item.source.accountId}`;
+  if (item.source.kind === "hermes") return "Hermes";
+  return "Capture";
+}
+
+function relativeTime(value: string): string {
+  const difference = Date.now() - Date.parse(value);
+  if (!Number.isFinite(difference)) return "";
+  const future = difference < 0;
+  const minutes = Math.max(0, Math.round(Math.abs(difference) / 60_000));
+  const label = minutes < 1
+    ? "now"
+    : minutes < 60
+      ? `${minutes}m`
+      : minutes < 24 * 60
+        ? `${Math.round(minutes / 60)}h`
+        : `${Math.round(minutes / (24 * 60))}d`;
+  return future && label !== "now" ? `in ${label}` : label;
+}
+
+function jobStateLabel(job: Job): string {
+  if (job.state === "needs_you") return "Needs you";
+  if (job.state === "review") return "Review";
+  if (job.state === "working") return "Working";
+  if (job.state === "queued") return "Queued";
+  return job.outcome === "accepted" ? "Accepted" : "Dropped";
+}
+
+function inboxStateLabel(item: InboxItemRow, pendingSend: boolean): string {
+  if (pendingSend) return "Sending";
+  if (item.state === "waiting") return item.snoozedUntil && Date.parse(item.snoozedUntil) <= Date.now() ? "Ready" : "Snoozed";
+  if (item.state === "resolved") {
+    if (item.outcome === "task") return "Task made";
+    if (item.outcome === "noise") return "Noise";
+    if (item.outcome === "dismissed") return "Not interested";
+    if (item.outcome === "sent") return "Sent";
+    return "Done";
+  }
+  return item.currentDraftId ? "Draft ready" : "New";
+}
+
+function destinationKey(destination: Pick<TaskDestination, "accountId" | "listId">): string {
+  return `${destination.accountId}\u0000${destination.listId}`;
+}
+
+function outgoingTaskNotes(notes: string, nonce: string): string {
+  const trimmed = notes.trim();
+  const marker = `Fox-Focus-ID: ${nonce}`;
+  return trimmed ? `${trimmed}\n\n${marker}` : marker;
+}
 
 function urlBase64ToArrayBuffer(value: string): ArrayBuffer {
   const padding = "=".repeat((4 - value.length % 4) % 4);
@@ -505,6 +589,7 @@ function rowTaskProjection(
   legacyTask: Task | undefined,
   area: Area,
   today: string,
+  createAction?: TaskCreateActionRow,
 ): Task | null {
   if (row.binding.kind === "legacy") {
     const sourceTask = isTask(row.binding.source) ? row.binding.source : legacyTask;
@@ -524,6 +609,28 @@ function rowTaskProjection(
       scheduledDate,
       deadlineDate: plan?.deadlineOn ?? undefined,
       linkedEventId: undefined,
+    };
+  }
+  if (!row.observed && row.binding.kind === "pending" && createAction) {
+    const plannedInstant = plan?.plannedAt ? new Date(plan.plannedAt) : null;
+    const plannedAtIsValid = plannedInstant !== null && !Number.isNaN(plannedInstant.getTime());
+    const scheduledDate = plannedAtIsValid ? dublinDateKey(plannedInstant) : plan?.plannedOn ?? undefined;
+    const scheduledTime = plannedAtIsValid && plan?.plannedAt ? dublinTimeValue(plan.plannedAt) : null;
+    return {
+      id: row.id,
+      title: createAction.payload.title,
+      area,
+      state: plan?.waiting ? "waiting" : scheduledDate ? "scheduled" : "up-next",
+      duration: plan?.estimateMinutes ? `${plan.estimateMinutes} min` : "30 min",
+      due: createAction.payload.doOn ? deadlineDateLabel(createAction.payload.doOn, today) : "No deadline",
+      priority: plan?.priority ?? "medium",
+      completed: false,
+      scheduledTime,
+      ...(scheduledDate ? { scheduledDate } : {}),
+      origin: row.originInboxId ? "inbox" : "manual",
+      source: "Google Tasks · pending",
+      createdAt: row.createdAt,
+      ...(plan?.deadlineOn ? { deadlineDate: plan.deadlineOn } : {}),
     };
   }
   if (!row.observed) return legacyTask ?? null;
@@ -605,10 +712,30 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [hermesCompletionPending, setHermesCompletionPending] = useState<string | null>(null);
   const [taskRows, setTaskRows] = useState<TaskRowsSnapshot | null>(null);
   const [taskRowsError, setTaskRowsError] = useState(false);
+  const [workRows, setWorkRows] = useState<WorkRowsSnapshot | null>(null);
+  const [workRowsError, setWorkRowsError] = useState(false);
+  const [selectedWorkKey, setSelectedWorkKey] = useState<string | null>(null);
+  const [settledOpen, setSettledOpen] = useState(false);
+  const [noiseOpen, setNoiseOpen] = useState(false);
+  const [workBusyKey, setWorkBusyKey] = useState<string | null>(null);
+  const [jobComposer, setJobComposer] = useState<{ idempotencyKey: string; title: string; taskId?: string; inboxId?: string } | null>(null);
+  const [jobInstruction, setJobInstruction] = useState("");
+  const [jobReply, setJobReply] = useState("");
+  const [editingReply, setEditingReply] = useState<{ inboxId: string; inboxVersion: number; reply: ReplyEnvelope } | null>(null);
+  const [taskDestinations, setTaskDestinations] = useState<TaskDestination[]>([]);
+  const [taskDestinationKey, setTaskDestinationKey] = useState("");
+  const [taskDestinationError, setTaskDestinationError] = useState("");
+  const [taskNotes, setTaskNotes] = useState("");
+  const [taskGoogleDue, setTaskGoogleDue] = useState("");
+  const [taskCreateNonce, setTaskCreateNonce] = useState("");
+  const [taskInboxVersion, setTaskInboxVersion] = useState<number | null>(null);
+  const [taskPlanVersion, setTaskPlanVersion] = useState<number | null>(null);
   const [busyTaskIds, setBusyTaskIds] = useState<Set<string>>(() => new Set());
   const [taskPlanBusy, setTaskPlanBusy] = useState(false);
   const [taskConflictActionId, setTaskConflictActionId] = useState<string | null>(null);
+  const [taskCreateConflictActionId, setTaskCreateConflictActionId] = useState<string | null>(null);
   const taskRowsRefresh = useRef<Promise<void> | null>(null);
+  const workRowsRefresh = useRef<Promise<void> | null>(null);
   const [hermesAdoption, setHermesAdoption] = useState<HermesAdoptionPreview | null>(null);
   const [adoptingHermesId, setAdoptingHermesId] = useState<string | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
@@ -702,6 +829,59 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     };
   }, [hasUnsettledTaskAction, initial]);
 
+  const hasLiveWork = workRows?.jobs.some((job) => job.state === "queued" || job.state === "working") === true ||
+    workRows?.actions.some((action) => (action.payload.kind === "task-create" || action.payload.kind === "email-send") &&
+      (action.state === "queued" || action.state === "running")) === true;
+
+  useEffect(() => {
+    if (!initial) return;
+    const controller = new AbortController();
+    let active = true;
+    const refresh = () => {
+      if (workRowsRefresh.current) return workRowsRefresh.current;
+      const request = loadWorkRows(controller.signal).then((rows) => {
+        if (!active) return;
+        setWorkRows((current) => mergeWorkRows(current, rows));
+        setWorkRowsError(false);
+      }).catch((error: unknown) => {
+        if (!active || (error instanceof DOMException && error.name === "AbortError")) return;
+        setWorkRowsError(true);
+      }).finally(() => {
+        if (workRowsRefresh.current === request) workRowsRefresh.current = null;
+      });
+      workRowsRefresh.current = request;
+      return request;
+    };
+    void refresh();
+    const interval = window.setInterval(refresh, hasLiveWork ? 800 : 15_000);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [hasLiveWork, initial]);
+
+  useEffect(() => {
+    if (!initial) return;
+    const controller = new AbortController();
+    void loadTaskDestinations(controller.signal).then(({ destinations, fallback }) => {
+      setTaskDestinations(destinations);
+      setTaskDestinationKey((current) => current || (fallback ? destinationKey(fallback) : ""));
+      setTaskDestinationError("");
+    }).catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      setTaskDestinationError(error instanceof Error ? error.message : "Google task lists are unavailable");
+    });
+    return () => controller.abort();
+  }, [initial]);
+
+  useEffect(() => {
+    if (!initial || modal?.kind !== "task" || modal.taskId) return;
+    const destination = taskDestinations.find((candidate) => destinationKey(candidate) === taskDestinationKey);
+    if (!destination || taskDraft.area === destination.area) return;
+    setTaskDraft((current) => ({ ...current, area: destination.area }));
+  }, [initial, modal, taskDestinationKey, taskDestinations, taskDraft.area]);
+
   useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
     const syncSystemTheme = () => setSystemTheme(mediaQuery.matches ? "black" : "light");
@@ -710,7 +890,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || hermesAdoption || taskConflictActionId);
+  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || hermesAdoption || taskConflictActionId || taskCreateConflictActionId || jobComposer || editingReply);
 
   useEffect(() => {
     if (!isOverlayOpen) {
@@ -862,6 +1042,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setActiveReminderId(null);
       setShowIntegrations(false);
       setTaskConflictActionId(null);
+      setJobComposer(null);
+      setEditingReply(null);
       if (!adoptingHermesId) setHermesAdoption(null);
     };
 
@@ -914,6 +1096,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     () => new Map((taskRows?.taskPlans ?? []).map((plan) => [plan.taskId, plan])),
     [taskRows?.taskPlans],
   );
+  const createActionByTask = useMemo(() => {
+    const actions = new Map<string, TaskCreateActionRow>();
+    for (const action of workRows?.actions ?? []) {
+      if (!isTaskCreateActionRow(action)) continue;
+      const current = actions.get(action.payload.taskId);
+      if (!current || action.version >= current.version) actions.set(action.payload.taskId, action);
+    }
+    return actions;
+  }, [workRows?.actions]);
   const displayTasks = useMemo(() => {
     if (!initial || !taskRows) return data.tasks;
     const legacyById = new Map(data.tasks.map((task) => [task.id, task]));
@@ -928,10 +1119,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const area = row.binding.kind === "legacy"
         ? "Personal"
         : areaForList(data.listAreas, "google", listId, listName);
-      const projected = rowTaskProjection(row, taskPlanById.get(row.id), legacyById.get(row.id), area, todayDate);
+      const projected = rowTaskProjection(row, taskPlanById.get(row.id), legacyById.get(row.id), area, todayDate, createActionByTask.get(row.id));
       return projected ? [projected] : [];
     });
-  }, [data.listAreas, data.tasks, initial, providerTaskRecords, taskPlanById, taskRows, todayDate]);
+  }, [createActionByTask, data.listAreas, data.tasks, initial, providerTaskRecords, taskPlanById, taskRows, todayDate]);
   const googleTaskIds = useMemo(() => new Set((taskRows?.tasks ?? [])
     .filter((task) => task.binding.kind === "google" || task.binding.kind === "pending")
     .map((task) => task.id)), [taskRows?.tasks]);
@@ -980,6 +1171,103 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   );
   const selectedInbox = reviewItems.find((item) => item.id === selectedInboxId) ?? reviewItems[0] ?? null;
   const selectedInboxIndex = selectedInbox ? reviewItems.findIndex((item) => item.id === selectedInbox.id) : -1;
+  const inboxRowById = useMemo(
+    () => new Map((workRows?.inbox ?? []).map((item) => [item.id, item])),
+    [workRows?.inbox],
+  );
+  const draftByInboxId = useMemo(() => {
+    const byId = new Map((workRows?.drafts ?? []).map((draft) => [draft.id, draft]));
+    const drafts = new Map<string, DraftRevision>();
+    for (const item of workRows?.inbox ?? []) {
+      if (!item.currentDraftId) continue;
+      const current = byId.get(item.currentDraftId);
+      if (current) drafts.set(item.id, current);
+    }
+    return drafts;
+  }, [workRows?.drafts, workRows?.inbox]);
+  const latestSendActionByInbox = useMemo(() => {
+    const actions = new Map<string, ActionRow>();
+    for (const action of workRows?.actions ?? []) {
+      if (action.payload.kind !== "email-send") continue;
+      const current = actions.get(action.payload.inboxId);
+      if (!current || action.createdAt > current.createdAt ||
+        (action.createdAt === current.createdAt && action.version >= current.version)) actions.set(action.payload.inboxId, action);
+    }
+    return actions;
+  }, [workRows?.actions]);
+  const pendingSendInboxIds = useMemo(() => new Set([...latestSendActionByInbox]
+    .flatMap(([inboxId, action]) => action.state === "queued" || action.state === "running" ? [inboxId] : [])), [latestSendActionByInbox]);
+  const problemSendInboxIds = useMemo(() => new Set([...latestSendActionByInbox]
+    .flatMap(([inboxId, action]) => action.state === "failed" || action.state === "conflict" || action.state === "unknown" ? [inboxId] : [])), [latestSendActionByInbox]);
+  const workThreads = useMemo<WorkThread[]>(() => {
+    const inboxThreads = (workRows?.inbox ?? []).map<WorkThread>((item) => {
+      const stillSnoozed = item.state === "waiting" &&
+        (item.snoozedUntil === null || Date.parse(item.snoozedUntil) > Date.now());
+      return {
+        key: `inbox:${item.id}`,
+        kind: "inbox",
+        title: item.title,
+        source: inboxSourceLabel(item),
+        updatedAt: item.updatedAt,
+        group: pendingSendInboxIds.has(item.id)
+          ? "working"
+          : item.likelyNoise
+            ? "noise"
+            : item.state === "resolved"
+              ? "settled"
+              : stillSnoozed
+                ? "working"
+                : "needs_you",
+        item,
+        job: null,
+      };
+    });
+    const jobThreads = (workRows?.jobs ?? []).map<WorkThread>((job) => {
+      const item = job.inboxId ? inboxRowById.get(job.inboxId) ?? null : null;
+      return {
+        key: `job:${job.id}`,
+        kind: "job",
+        title: job.title,
+        source: item ? `${inboxSourceLabel(item)} · Hermes` : "Hermes",
+        updatedAt: job.updatedAt,
+        group: job.state === "settled"
+          ? "settled"
+          : job.state === "queued" || job.state === "working"
+            ? "working"
+            : "needs_you",
+        item,
+        job,
+      };
+    });
+    return [...inboxThreads, ...jobThreads]
+      .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt) || first.key.localeCompare(second.key));
+  }, [inboxRowById, pendingSendInboxIds, workRows?.inbox, workRows?.jobs]);
+  const needsYouThreads = workThreads.filter((thread) => thread.group === "needs_you");
+  const workingThreads = workThreads.filter((thread) => thread.group === "working");
+  const settledThreads = workThreads.filter((thread) => thread.group === "settled");
+  const noiseThreads = workThreads.filter((thread) => thread.group === "noise");
+  const selectedWorkThread = workThreads.find((thread) => thread.key === selectedWorkKey) ??
+    needsYouThreads[0] ?? workingThreads[0] ?? (noiseOpen ? noiseThreads[0] : null) ??
+    (settledOpen ? settledThreads[0] : null) ?? null;
+  const visibleWorkThreads = [
+    ...needsYouThreads,
+    ...workingThreads,
+    ...(noiseOpen ? noiseThreads : []),
+    ...(settledOpen ? settledThreads : []),
+  ];
+  const selectedWorkIndex = selectedWorkThread
+    ? visibleWorkThreads.findIndex((thread) => thread.key === selectedWorkThread.key)
+    : -1;
+  const selectedWorkItem = selectedWorkThread?.item ?? null;
+  const selectedWorkJob = selectedWorkThread?.job ?? null;
+  const selectedWorkDraft = selectedWorkItem ? draftByInboxId.get(selectedWorkItem.id) ?? null : null;
+  const selectedWorkUpdates = selectedWorkJob
+    ? (workRows?.jobUpdates ?? []).filter((update) => update.jobId === selectedWorkJob.id)
+    : selectedWorkItem
+      ? (workRows?.jobs ?? []).filter((job) => job.inboxId === selectedWorkItem.id)
+        .flatMap((job) => (workRows?.jobUpdates ?? []).filter((update) => update.jobId === job.id))
+        .sort((first, second) => first.at.localeCompare(second.at) || first.seq - second.seq)
+      : [];
   const activeTasks = displayTasks.filter((task) => !task.completed);
   const activeBlock = visibleCalendarEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
   const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
@@ -1105,7 +1393,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : [];
 
   const reminderCount = allReminders.length;
-  const reviewCount = data.inboxItems.filter((item) => item.status !== "handled").length;
+  const reviewCount = initial ? needsYouThreads.length : data.inboxItems.filter((item) => item.status !== "handled").length;
   const plannedTaskCount = activeTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate ||
     (task.linkedEventId && eventById.has(task.linkedEventId)))).length +
     hermesTasks.filter(task => task.status !== "done" && Boolean(task.scheduledAt)).length;
@@ -1369,15 +1657,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
   }
 
-  function openTaskComposer(task?: Task, inboxItem?: InboxItem) {
+  function openTaskComposer(task?: Task, inboxItem?: InboxItem, inboxRow?: InboxItemRow) {
     const row = task ? taskRowById.get(task.id) : undefined;
     const plan = task ? taskPlanById.get(task.id) : undefined;
+    setTaskPlanVersion(plan?.version ?? null);
+    setTaskInboxVersion(inboxRow?.version ?? null);
     const linkedEvent = task?.linkedEventId
       ? data.events.find((event) => event.id === task.linkedEventId)
       : undefined;
+    const startingArea = task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal");
+    const mappedDestination = preferredTaskDestination(taskDestinations, startingArea);
     setTaskDraft({
-      title: task?.title ?? inboxItem?.title ?? "",
-      area: task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal"),
+      title: task?.title ?? inboxItem?.title ?? inboxRow?.title ?? "",
+      area: mappedDestination && isOneOf(mappedDestination.area, areas) ? mappedDestination.area : startingArea,
       priority: plan?.priority ?? task?.priority ?? "medium",
       due: task?.due ?? "No deadline",
       deadlineDate: plan?.deadlineOn ?? task?.deadlineDate ?? (task ? legacyDeadlineDate(task.due, todayDate) : ""),
@@ -1391,9 +1683,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         : linkedEvent ? eventTimeValue(linkedEvent) : task?.scheduledTime ?? "",
       reminderMode: row?.binding.kind === "google" ? "none" : task ? reminderModeFor(data.reminders, task.id) : "none",
     });
+    if (!task) {
+      setTaskCreateNonce(globalThis.crypto?.randomUUID?.() ?? makeId("task"));
+      setTaskNotes("");
+      setTaskGoogleDue("");
+      setTaskDestinationKey(mappedDestination ? destinationKey(mappedDestination) : "");
+    }
     setModalError("");
-    setShowTaskDetails(Boolean(task || inboxItem));
-    setModal({ kind: "task", taskId: task?.id, inboxId: inboxItem?.id });
+    setShowTaskDetails(Boolean(task || inboxItem || inboxRow));
+    setModal({ kind: "task", taskId: task?.id, inboxId: inboxItem?.id ?? inboxRow?.id });
   }
 
   function openEventComposer(event?: TimelineEvent, inboxItem?: InboxItem) {
@@ -1572,6 +1870,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     openWorkspaceView("agenda");
   }
 
+  async function refreshRowSnapshots(): Promise<void> {
+    const [tasks, work] = await Promise.all([loadTaskRows(), loadWorkRows()]);
+    setTaskRows((current) => mergeTaskRows(current, tasks));
+    setWorkRows((current) => mergeWorkRows(current, work));
+    setTaskRowsError(false);
+    setWorkRowsError(false);
+  }
+
   async function saveTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!modal || modal.kind !== "task") return;
@@ -1603,8 +1909,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const row = modal.taskId ? taskRowById.get(modal.taskId) : undefined;
     const plan = modal.taskId ? taskPlanById.get(modal.taskId) : undefined;
     if (displayTask && row) {
-      if (!plan) {
+      if (!plan || taskPlanVersion === null) {
         setModalError("The local task plan is unavailable. Reload before saving.");
+        return;
+      }
+      if (plan.version !== taskPlanVersion) {
+        setModalError("The task plan changed while this editor was open. Close it and review the latest plan.");
         return;
       }
       const estimateMinutes = plan.estimateMinutes === null && taskDraft.duration === "30 min"
@@ -1617,7 +1927,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            version: plan.version,
+            version: taskPlanVersion,
             priority: taskDraft.priority,
             waiting: taskDraft.state === "waiting",
             deadlineOn: taskDraft.deadlineDate || null,
@@ -1644,6 +1954,62 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         setModal(null);
       } catch (error) {
         setModalError(error instanceof Error ? error.message : "Could not save the task plan.");
+      } finally {
+        setTaskPlanBusy(false);
+      }
+      return;
+    }
+
+    if (initial && !modal.taskId) {
+      const destination = taskDestinations.find((candidate) => destinationKey(candidate) === taskDestinationKey);
+      const inboxRow = modal.inboxId ? inboxRowById.get(modal.inboxId) : undefined;
+      if (!destination) {
+        setModalError(taskDestinationError || "Choose a Google task list before creating this task.");
+        return;
+      }
+      if (!taskCreateNonce) {
+        setModalError("The task identity is missing. Close this form and try again.");
+        return;
+      }
+      if (taskGoogleDue && !isDateKey(taskGoogleDue)) {
+        setModalError("Choose a valid Google due date or leave it blank.");
+        return;
+      }
+      if (/^\s*Fox-Focus-ID\s*:/im.test(taskNotes)) {
+        setModalError("Remove the Fox-Focus-ID line from notes. Fox Focus adds it.");
+        return;
+      }
+      if (modal.inboxId && (taskInboxVersion === null || !inboxRow || inboxRow.version !== taskInboxVersion)) {
+        setModalError("The Inbox item changed while this editor was open. Close it and review the latest item.");
+        return;
+      }
+      setTaskPlanBusy(true);
+      setModalError("");
+      try {
+        await createGoogleTask({
+          destination: { accountId: destination.accountId, listId: destination.listId },
+          nonce: taskCreateNonce,
+          title,
+          notes: taskNotes.trim(),
+          doOn: taskGoogleDue || null,
+          plan: {
+            priority: taskDraft.priority,
+            waiting: taskDraft.state === "waiting",
+            deadlineOn: taskDraft.deadlineDate || null,
+            plannedOn: taskDraft.scheduledDate && !plannedStartAt ? taskDraft.scheduledDate : null,
+            plannedAt: plannedStartAt,
+            estimateMinutes: parseDuration(taskDraft.duration),
+          },
+          ...(modal.inboxId && taskInboxVersion !== null
+            ? { inbox: { id: modal.inboxId, version: taskInboxVersion } }
+            : {}),
+        });
+        await refreshRowSnapshots();
+        setStatusMessage(`Creating "${title}" in ${destination.listName}.`);
+        setModal(null);
+      } catch (error) {
+        try { await refreshRowSnapshots(); } catch { /* the original error is more useful */ }
+        setModalError(error instanceof Error ? error.message : "Could not create the Google task.");
       } finally {
         setTaskPlanBusy(false);
       }
@@ -1845,6 +2211,202 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setModal(null);
   }
 
+  function selectWorkThread(thread: WorkThread) {
+    setSelectedWorkKey(thread.key);
+    setJobReply("");
+  }
+
+  function moveWorkSelection(delta: number) {
+    const index = selectedWorkIndex >= 0 ? selectedWorkIndex : 0;
+    const next = visibleWorkThreads[Math.max(0, Math.min(visibleWorkThreads.length - 1, index + delta))];
+    if (next) selectWorkThread(next);
+  }
+
+  async function runWorkMutation(key: string, operation: () => Promise<unknown>, message: string) {
+    if (workBusyKey) return;
+    setWorkBusyKey(key);
+    setStatusMessage("");
+    try {
+      await operation();
+      setStatusMessage(message);
+    } catch (error) {
+      try { await refreshRowSnapshots(); } catch {
+        setTaskRowsError(true);
+        setWorkRowsError(true);
+      }
+      setStatusMessage(error instanceof Error ? error.message : "The Inbox change could not be saved.");
+      return;
+    } finally {
+      setWorkBusyKey(null);
+    }
+    try { await refreshRowSnapshots(); } catch {
+      setTaskRowsError(true);
+      setWorkRowsError(true);
+    }
+  }
+
+  function chooseNextWorkThread(currentKey: string) {
+    const next = [...needsYouThreads, ...workingThreads].find((thread) => thread.key !== currentKey);
+    if (next) setSelectedWorkKey(next.key);
+  }
+
+  function decideWorkItem(item: InboxItemRow, outcome: "read" | "dismissed" | "noise") {
+    const key = `inbox:${item.id}`;
+    chooseNextWorkThread(key);
+    void runWorkMutation(key, () => decideInboxItem(item, {
+      state: "resolved",
+      outcome,
+      snoozedUntil: null,
+    }), outcome === "noise" ? "Marked as noise." : outcome === "dismissed" ? "Marked not interested." : "Marked done.");
+  }
+
+  function snoozeWorkItem(item: InboxItemRow) {
+    const key = `inbox:${item.id}`;
+    const until = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+    chooseNextWorkThread(key);
+    void runWorkMutation(key, () => decideInboxItem(item, {
+      state: "waiting",
+      outcome: null,
+      snoozedUntil: until,
+    }), `Snoozed until ${formatDublinInstant(until)}.`);
+  }
+
+  function canMutateInboxItem(item: InboxItemRow): boolean {
+    return item.state !== "resolved" && !pendingSendInboxIds.has(item.id) && workBusyKey === null;
+  }
+
+  function openReplyEditor(item: InboxItemRow) {
+    const draft = draftByInboxId.get(item.id);
+    if (!draft) {
+      setStatusMessage("There is no reply draft to edit yet.");
+      return;
+    }
+    setEditingReply({
+      inboxId: item.id,
+      inboxVersion: item.version,
+      reply: {
+        ...draft.reply,
+        references: [...draft.reply.references],
+        to: [...draft.reply.to],
+        cc: [...draft.reply.cc],
+        bcc: [...draft.reply.bcc],
+      },
+    });
+    setModalError("");
+  }
+
+  async function saveReplyEditor(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!editingReply) return;
+    const item = inboxRowById.get(editingReply.inboxId);
+    if (!item) {
+      setModalError("This Inbox item is no longer available.");
+      return;
+    }
+    if (item.version !== editingReply.inboxVersion) {
+      setModalError("The Inbox item changed while this draft was open. Close it and review the latest draft.");
+      return;
+    }
+    const reply = {
+      ...editingReply.reply,
+      from: editingReply.reply.from.trim(),
+      to: editingReply.reply.to.map((address) => address.trim()).filter(Boolean),
+      cc: editingReply.reply.cc.map((address) => address.trim()).filter(Boolean),
+      bcc: editingReply.reply.bcc.map((address) => address.trim()).filter(Boolean),
+    };
+    if (!reply.from || !reply.to.length) {
+      setModalError("Add the sender and at least one recipient.");
+      return;
+    }
+    setWorkBusyKey(`draft:${item.id}`);
+    setModalError("");
+    try {
+      await saveOwnerDraft({ id: item.id, version: editingReply.inboxVersion }, reply);
+      await refreshRowSnapshots();
+      setEditingReply(null);
+      setStatusMessage("Saved a new owner draft revision.");
+    } catch (error) {
+      try { await refreshRowSnapshots(); } catch { /* the original error is more useful */ }
+      setModalError(error instanceof Error ? error.message : "The draft could not be saved.");
+    } finally {
+      setWorkBusyKey(null);
+    }
+  }
+
+  function openJobComposer(input: { title: string; taskId?: string; inboxId?: string }) {
+    setJobComposer({ ...input, idempotencyKey: crypto.randomUUID() });
+    setJobInstruction("");
+    setModalError("");
+    setModal(null);
+  }
+
+  async function submitJob(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!jobComposer || !jobComposer.title.trim() || !jobInstruction.trim()) {
+      setModalError("Add a one-line title and short instruction for Hermes.");
+      return;
+    }
+    setWorkBusyKey("job:create");
+    setModalError("");
+    try {
+      const job = await createJob({ ...jobComposer, title: jobComposer.title.trim(), instruction: jobInstruction.trim() });
+      setWorkRows((current) => mergeWorkRows(current, {
+        inbox: [],
+        drafts: [],
+        jobs: [job],
+        jobUpdates: [],
+        actions: [],
+      }));
+      setJobComposer(null);
+      setStatusMessage("Handed to Hermes.");
+      try { await refreshRowSnapshots(); } catch { setWorkRowsError(true); }
+    } catch (error) {
+      setModalError(error instanceof Error ? error.message : "The job could not be queued.");
+    } finally {
+      setWorkBusyKey(null);
+    }
+  }
+
+  function answerSelectedJob(job: Job) {
+    const answer = jobReply.trim();
+    if (!answer) {
+      setStatusMessage("Write a one-line answer first.");
+      return;
+    }
+    void runWorkMutation(`job:${job.id}`, () => answerJob(job, answer), "Answer sent to Hermes.");
+    setJobReply("");
+  }
+
+  function sendBackSelectedJob(job: Job) {
+    const note = jobReply.trim();
+    if (!note) {
+      setStatusMessage("Write a one-line send-back note first.");
+      return;
+    }
+    void runWorkMutation(`job:${job.id}`, () => sendBackJob(job, note), "Sent back to Hermes.");
+    setJobReply("");
+  }
+
+  function settleSelectedJob(job: Job, outcome: "accepted" | "dropped") {
+    const task = job.taskId ? taskRowById.get(job.taskId) : undefined;
+    if (outcome === "accepted" && !canAcceptJob(job)) {
+      setStatusMessage("The linked Google task is not ready for completion.");
+      return;
+    }
+    void runWorkMutation(`job:${job.id}`, () => settleJob(job, outcome, outcome === "accepted" ? task?.version : undefined),
+      outcome === "accepted" ? "Accepted the result." : "Dropped the job.");
+  }
+
+  function canAcceptJob(job: Job): boolean {
+    if (!job.taskId) return true;
+    const task = taskRowById.get(job.taskId);
+    if (!task?.observed) return false;
+    const queuedReopen = (taskRows?.actions ?? []).some((action) => action.payload.taskId === task.id &&
+      action.payload.after === "open" && (action.state === "queued" || action.state === "failed"));
+    if (task.observed.status === "completed" && !queuedReopen) return true;
+    return task.binding.kind === "google" && task.observed.completionWritable && task.unavailableAt === null;
+  }
+
   function selectInbox(item: InboxItem) {
     setSelectedInboxId(item.id);
     setAgentRequest(item.moreWork ?? "");
@@ -1931,6 +2493,56 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }));
     setStatusMessage("Feedback saved locally. It has not been delivered to Hermes.");
   }
+
+  useEffect(() => {
+    const onInboxKeyDown = (event: KeyboardEvent) => {
+      if (activeSection !== "review" || isOverlayOpen || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
+      const thread = selectedWorkThread;
+      if (event.key === "j" || event.key === "k") {
+        event.preventDefault();
+        moveWorkSelection(event.key === "j" ? 1 : -1);
+        return;
+      }
+      if (!thread) return;
+      const item = thread.kind === "inbox" ? thread.item : null;
+      const job = thread.job;
+      const canAct = item ? canMutateInboxItem(item) : false;
+      if (event.key === "s" && item?.source.kind === "email") {
+        event.preventDefault();
+        setStatusMessage("Email sending is off until the Hermes executor is verified.");
+      } else if (event.key === "d" && canAct && item?.source.kind === "email" && draftByInboxId.has(item.id)) {
+        event.preventDefault();
+        openReplyEditor(item);
+      } else if (event.key === "h" && canAct && item) {
+        event.preventDefault();
+        openJobComposer({ title: item.title, inboxId: item.id });
+      } else if (event.key === "t" && canAct && item && !item.taskId) {
+        event.preventDefault();
+        openTaskComposer(undefined, undefined, item);
+      } else if (event.key === "z" && canAct && item) {
+        event.preventDefault();
+        snoozeWorkItem(item);
+      } else if (event.key === "e" && canAct && item) {
+        event.preventDefault();
+        decideWorkItem(item, "read");
+      } else if (event.key === "x" && canAct && item) {
+        event.preventDefault();
+        decideWorkItem(item, "dismissed");
+      } else if (event.key === "n" && canAct && item) {
+        event.preventDefault();
+        decideWorkItem(item, "noise");
+      } else if (event.key === "a" && job?.state === "review" && workBusyKey === null) {
+        event.preventDefault();
+        settleSelectedJob(job, "accepted");
+      } else if (event.key === "b" && job?.state === "review" && workBusyKey === null) {
+        event.preventDefault();
+        document.getElementById("job-reply")?.focus();
+      }
+    };
+    window.addEventListener("keydown", onInboxKeyDown);
+    return () => window.removeEventListener("keydown", onInboxKeyDown);
+  });
 
   function testReminder() {
     const reminder = allReminders.find((candidate) => candidate.state === "scheduled") ?? allReminders[0];
@@ -2042,7 +2654,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const row = taskRowById.get(task.id);
     const action = latestActionByTask.get(task.id);
     const googleOwned = row?.binding.kind === "google";
-    const pending = action?.state === "queued" || action?.state === "running";
+    const createAction = createActionByTask.get(task.id);
+    const pendingCreate = row?.binding.kind === "pending" ? createAction : undefined;
+    const createNeedsReview = createAction?.state === "failed" || createAction?.state === "conflict" || createAction?.state === "unknown";
+    const pending = action?.state === "queued" || action?.state === "running" ||
+      pendingCreate?.state === "queued" || pendingCreate?.state === "running";
     const unavailable = googleOwned && (row.observed?.completionWritable !== true || row.unavailableAt !== null);
     return <TaskRow
       compact={compact}
@@ -2051,7 +2667,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       dueLabel={taskDeadlineLabel(task, todayDate)}
       latestAction={action}
       plannedDate={plannedDateForTask(task)}
-      sourceBadge={googleOwned ? <em className="source-chip">Google Tasks</em> : undefined}
+      sourceBadge={createNeedsReview ? <em className={`task-action-state task-action-state--${createAction.state}`}>{actionStateLabel(createAction)}</em> : googleOwned ? <em className="source-chip">Google Tasks</em> : pendingCreate ? <em className={`task-action-state task-action-state--${pendingCreate.state}`}>Google {pendingCreate.state}</em> : undefined}
       toggleBusy={busyTaskIds.has(task.id) || pending}
       toggleDisabled={Boolean(initial && (!googleOwned || unavailable))}
       onToggle={toggleTask}
@@ -2098,8 +2714,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     openWorkspaceView("review");
   }
 
+  function openTodayWorkThread(thread: WorkThread) {
+    selectWorkThread(thread);
+    openWorkspaceView("review");
+  }
+
   function renderTodayView() {
     const openReviewItems = reviewItems.filter((item) => item.status !== "handled").slice(0, 3);
+    const todayWorkThreads = needsYouThreads.slice(0, 3);
 
     return <section className="workspace-page workspace-page--today" aria-labelledby="today-heading">
       <header className="workspace-heading today-heading">
@@ -2146,8 +2768,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <article className="pane today-card today-card--inbox">
           <PaneHeader eyebrow="Inbox" title={reviewCount ? `${reviewCount} decision${reviewCount === 1 ? "" : "s"}` : "Nothing waiting"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("review")}>Open Inbox <ChevronRight size={12} /></button>} />
           <div className="today-inbox-list">
-            {openReviewItems.map((item) => <button type="button" key={item.id} onClick={() => openTodayInbox(item)}><i className={`area-dot area-dot--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><ChevronRight size={14} /></button>)}
-            {!openReviewItems.length ? <div className="today-empty"><Inbox size={17} /><span><strong>Inbox is clear</strong><small>New proposals will appear here.</small></span></div> : null}
+            {initial ? todayWorkThreads.map((thread) => <button type="button" key={thread.key} onClick={() => openTodayWorkThread(thread)}><i className={`inbox-thread-dot inbox-thread-dot--${thread.group}`} /><span><strong>{thread.title}</strong><small>{thread.source}</small></span><ChevronRight size={14} /></button>) : openReviewItems.map((item) => <button type="button" key={item.id} onClick={() => openTodayInbox(item)}><i className={`area-dot area-dot--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><ChevronRight size={14} /></button>)}
+            {!(initial ? todayWorkThreads.length : openReviewItems.length) ? <div className="today-empty"><Inbox size={17} /><span><strong>Inbox is clear</strong><small>New proposals will appear here.</small></span></div> : null}
           </div>
         </article>
       </div>
@@ -2227,7 +2849,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     </section>;
   }
 
-  function renderReviewView() {
+  function renderLegacyReviewView() {
     return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
       <header className="workspace-heading"><div><p className="eyebrow">One decision at a time</p><h1 id="review-heading">Inbox</h1><p>Turn a proposal into a task, a calendar block, a draft, or nothing.</p></div><span className="review-page-count">{reviewCount} open</span></header>
       <article className="pane review-workspace">
@@ -2242,10 +2864,134 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     </section>;
   }
 
+  function renderWorkInboxView() {
+    function renderThread(thread: WorkThread) {
+      const pendingSend = thread.item ? pendingSendInboxIds.has(thread.item.id) : false;
+      const state = thread.job ? jobStateLabel(thread.job) : thread.item ? inboxStateLabel(thread.item, pendingSend) : "";
+      return <button
+        className={`work-thread${selectedWorkThread?.key === thread.key ? " work-thread--selected" : ""}`}
+        type="button"
+        aria-pressed={selectedWorkThread?.key === thread.key}
+        key={thread.key}
+        onClick={() => selectWorkThread(thread)}
+      >
+        <i className={`inbox-thread-dot inbox-thread-dot--${thread.group}`} />
+        <span className="work-thread-copy"><strong>{thread.title}</strong><small>{thread.source}</small></span>
+        <span className="work-thread-tail"><small>{relativeTime(thread.updatedAt)}</small><em>{state}</em></span>
+      </button>;
+    }
+
+    function renderAlwaysOpenGroup(label: string, threads: WorkThread[]) {
+      return <section className="work-thread-group" aria-label={label}>
+        <header><strong>{label}</strong><span>{threads.length}</span></header>
+        {threads.map(renderThread)}
+      </section>;
+    }
+
+    function renderCollapsibleGroup(label: string, threads: WorkThread[], open: boolean, setOpen: (open: boolean) => void) {
+      if (!threads.length) return null;
+      return <section className="work-thread-group work-thread-group--collapsed" aria-label={label}>
+        <button className="work-thread-group-toggle" type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
+          <ChevronDown size={12} /><strong>{label}</strong><span>{threads.length}</span>
+        </button>
+        {open ? threads.map(renderThread) : null}
+      </section>;
+    }
+
+    const actionItem = selectedWorkThread?.kind === "inbox" ? selectedWorkItem : null;
+    const pendingSend = actionItem ? pendingSendInboxIds.has(actionItem.id) : false;
+    const problemSend = actionItem ? problemSendInboxIds.has(actionItem.id) : false;
+    const detailState = selectedWorkJob
+      ? jobStateLabel(selectedWorkJob)
+      : selectedWorkItem
+        ? inboxStateLabel(selectedWorkItem, pendingSend)
+        : "";
+    const itemCanAct = actionItem ? canMutateInboxItem(actionItem) : false;
+    const jobBusy = workBusyKey !== null;
+    const linkedJobTaskUnavailable = selectedWorkJob ? !canAcceptJob(selectedWorkJob) : false;
+
+    return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
+      <header className="workspace-heading"><div><p className="eyebrow">Forward and back</p><h1 id="review-heading">Inbox</h1></div><span className="review-page-count">{reviewCount ? `${reviewCount} ${reviewCount === 1 ? "needs" : "need"} you` : "Clear"}</span></header>
+      <article className="pane review-workspace work-inbox">
+        {workRowsError ? <p className="task-sync-note task-sync-note--warning"><RefreshCw size={13} /> Inbox rows could not refresh.</p> : null}
+        <div className="review-workbench">
+          <aside className="work-thread-list" aria-label="Inbox threads">
+            {renderAlwaysOpenGroup("Needs you", needsYouThreads)}
+            {renderAlwaysOpenGroup("Working", workingThreads)}
+            {renderCollapsibleGroup("Likely noise", noiseThreads, noiseOpen, setNoiseOpen)}
+            {renderCollapsibleGroup("Settled", settledThreads, settledOpen, setSettledOpen)}
+            {!workThreads.length && workRows ? <p className="empty-line">Inbox is clear.</p> : null}
+            {!workRows ? <p className="empty-line">Loading Inbox…</p> : null}
+          </aside>
+          {selectedWorkThread ? <section className="work-thread-detail" aria-label={selectedWorkThread.title}>
+            <div className="review-queue-nav">
+              <span>{selectedWorkIndex >= 0 ? `${selectedWorkIndex + 1} of ${visibleWorkThreads.length}` : detailState}</span>
+              <div><button type="button" onClick={() => moveWorkSelection(-1)} disabled={selectedWorkIndex <= 0} aria-label="Previous thread"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveWorkSelection(1)} disabled={selectedWorkIndex < 0 || selectedWorkIndex >= visibleWorkThreads.length - 1} aria-label="Next thread"><ChevronRight size={14} /></button></div>
+            </div>
+            <header className="work-thread-heading">
+              <div><span>{selectedWorkThread.source}</span><time dateTime={selectedWorkThread.updatedAt}>{relativeTime(selectedWorkThread.updatedAt)}</time></div>
+              <h2>{selectedWorkThread.title}</h2>
+              <em className={`work-state work-state--${selectedWorkThread.group}`}>{detailState}</em>
+            </header>
+            <p className="work-thread-summary">{selectedWorkJob?.instruction ?? selectedWorkItem?.summary}</p>
+            {selectedWorkJob?.question ? <blockquote className="job-question"><span>Hermes asks</span>{selectedWorkJob.question}</blockquote> : null}
+            {selectedWorkJob?.taskId ? <p className="work-link-note"><ListTodo size={12} /> Linked task</p> : null}
+            {problemSend ? <p className="work-warning"><RefreshCw size={12} /> Send outcome needs reconciliation.</p> : null}
+            {selectedWorkDraft ? <section className="reply-preview">
+              <header><span>Reply draft</span><em>{selectedWorkDraft.author} · r{selectedWorkDraft.revision}</em></header>
+              <dl>
+                <div><dt>Account</dt><dd>{selectedWorkDraft.reply.accountId}</dd></div>
+                <div><dt>From</dt><dd>{selectedWorkDraft.reply.from}</dd></div>
+                <div><dt>To</dt><dd>{selectedWorkDraft.reply.to.join(", ") || "None"}</dd></div>
+                {selectedWorkDraft.reply.cc.length ? <div><dt>Cc</dt><dd>{selectedWorkDraft.reply.cc.join(", ")}</dd></div> : null}
+                {selectedWorkDraft.reply.bcc.length ? <div><dt>Bcc</dt><dd>{selectedWorkDraft.reply.bcc.join(", ")}</dd></div> : null}
+                <div><dt>Subject</dt><dd>{selectedWorkDraft.reply.subject}</dd></div>
+                <div><dt>Thread</dt><dd>{selectedWorkDraft.reply.threadId}</dd></div>
+                <div><dt>Reply to</dt><dd>{selectedWorkDraft.reply.replyToMessageId}</dd></div>
+                <div><dt>In reply to</dt><dd>{selectedWorkDraft.reply.inReplyTo}</dd></div>
+                <div><dt>References</dt><dd>{selectedWorkDraft.reply.references.join(" ") || "None"}</dd></div>
+              </dl>
+              <pre>{selectedWorkDraft.reply.bodyText}</pre>
+            </section> : null}
+            <section className="job-timeline" aria-label="Updates">
+              <header><span>Updates</span><small>{selectedWorkUpdates.length}</small></header>
+              {selectedWorkUpdates.map((update: JobUpdate) => <article className={`job-update job-update--${update.author}`} key={`${update.jobId}:${update.seq}`}>
+                <i />
+                <div><header><strong>{update.author === "hermes" ? "Hermes" : "You"}</strong><span>{update.kind.replace("_", " ")} · {relativeTime(update.at)}</span></header><p>{update.text}</p>{update.url ? <a href={update.url} target="_blank" rel="noreferrer">Open result <ChevronRight size={11} /></a> : null}</div>
+              </article>)}
+              {!selectedWorkUpdates.length ? <p className="timeline-empty">No updates yet.</p> : null}
+            </section>
+            {selectedWorkJob?.state === "needs_you" ? <div className="job-response"><label htmlFor="job-reply">One-line answer</label><div><input id="job-reply" maxLength={280} value={jobReply} onChange={(event) => setJobReply(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); answerSelectedJob(selectedWorkJob); } }} /><button className="page-primary-action" type="button" disabled={jobBusy} onClick={() => answerSelectedJob(selectedWorkJob)}>Answer</button></div></div> : null}
+            {selectedWorkJob?.state === "review" ? <div className="job-response"><label htmlFor="job-reply">Send-back note</label><div><input id="job-reply" maxLength={280} value={jobReply} onChange={(event) => setJobReply(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); sendBackSelectedJob(selectedWorkJob); } }} /><button className="secondary-action" type="button" disabled={jobBusy} onClick={() => sendBackSelectedJob(selectedWorkJob)}><CornerUpLeft size={12} /> Send back <kbd>b</kbd></button></div></div> : null}
+            <footer className="work-thread-actions">
+              {actionItem?.source.kind === "email" && actionItem.state !== "resolved" ? <>
+                <p className="send-disabled-copy" id="email-send-disabled-copy">Send is off until Hermes executor verification.</p>
+                <button className="page-primary-action" type="button" disabled aria-describedby="email-send-disabled-copy"><Send size={12} /> Send <kbd>s</kbd></button>
+                <button className="secondary-action" type="button" disabled={!selectedWorkDraft || !itemCanAct} onClick={() => openReplyEditor(actionItem)}><Pencil size={12} /> Edit draft <kbd>d</kbd></button>
+              </> : null}
+              {actionItem && actionItem.state !== "resolved" ? <>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => openJobComposer({ title: actionItem.title, inboxId: actionItem.id })}><MessageSquare size={12} /> Ask Hermes <kbd>h</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct || Boolean(actionItem.taskId)} onClick={() => openTaskComposer(undefined, undefined, actionItem)}><ListTodo size={12} /> Make task <kbd>t</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => snoozeWorkItem(actionItem)}><Clock3 size={12} /> Snooze <kbd>z</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "read")}><Check size={12} /> Done <kbd>e</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "dismissed")}><X size={12} /> Not interested <kbd>x</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "noise")}><Circle size={12} /> Noise <kbd>n</kbd></button>
+              </> : null}
+              {selectedWorkJob?.state === "review" ? <>
+                <button className="page-primary-action" type="button" disabled={jobBusy || linkedJobTaskUnavailable} title={linkedJobTaskUnavailable ? "The linked Google task is not ready" : undefined} onClick={() => settleSelectedJob(selectedWorkJob, "accepted")}><Check size={12} /> {selectedWorkJob.taskId ? "Accept & complete" : "Accept"} <kbd>a</kbd></button>
+                <button className="danger-button" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "dropped")}><Trash2 size={12} /> Drop</button>
+              </> : null}
+            </footer>
+          </section> : <section className="work-thread-detail work-thread-detail--empty"><Inbox size={19} /><span>{workThreads.length ? "Choose a thread." : "Inbox is clear."}</span></section>}
+        </div>
+      </article>
+    </section>;
+  }
+
   function renderWorkspaceView() {
     if (activeSection === "agenda") return renderCalendarView();
     if (activeSection === "tasks") return renderTasksView();
-    if (activeSection === "review") return renderReviewView();
+    if (activeSection === "review") return initial ? renderWorkInboxView() : renderLegacyReviewView();
     return renderTodayView();
   }
 
@@ -2256,7 +3002,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const modalTask = taskModal?.taskId ? taskById.get(taskModal.taskId) ?? null : null;
   const modalTaskRow = modalTask ? taskRowById.get(modalTask.id) : undefined;
   const modalGoogleOwned = modalTaskRow?.binding.kind === "google";
+  const modalPendingGoogle = modalTaskRow?.binding.kind === "pending";
+  const modalCreateAction = modalTask ? createActionByTask.get(modalTask.id) : undefined;
   const modalRowOwned = Boolean(initial && modalTaskRow);
+  const modalCreatingGoogle = Boolean(initial && taskModal && !taskModal.taskId);
+  const selectedTaskDestination = taskDestinations.find((destination) => destinationKey(destination) === taskDestinationKey) ?? null;
   const modalTaskAction = modalTask ? latestActionByTask.get(modalTask.id) : undefined;
   const taskConflictAction = taskConflictActionId
     ? taskRows?.actions.find((action) => action.id === taskConflictActionId) ?? null
@@ -2265,11 +3015,20 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const taskConflictTask = taskConflictAction ? taskById.get(taskConflictAction.payload.taskId) ?? null : null;
   const taskConflictRow = taskConflictAction ? taskRowById.get(taskConflictAction.payload.taskId) ?? null : null;
   const taskConflictDesired = taskConflictTask?.completed ? "open" : "completed";
+  const taskCreateConflictAction = taskCreateConflictActionId
+    ? workRows?.actions.find((action): action is TaskCreateActionRow =>
+        action.id === taskCreateConflictActionId && isTaskCreateActionRow(action)) ?? null
+    : null;
+  const taskCreateCandidates = taskCreateConflictCandidates(taskCreateConflictAction ?? undefined);
+  const taskCreateConflictTask = taskCreateConflictAction
+    ? taskById.get(taskCreateConflictAction.payload.taskId) ?? null
+    : null;
   const modalInbox = taskModal?.inboxId
     ? data.inboxItems.find((item) => item.id === taskModal.inboxId)
     : eventModal?.inboxId
       ? data.inboxItems.find((item) => item.id === eventModal.inboxId)
       : null;
+  const modalInboxRow = taskModal?.inboxId ? inboxRowById.get(taskModal.inboxId) ?? null : null;
   return (
     <div className="control-room">
       <header className="command-bar" aria-hidden={isOverlayOpen}>
@@ -2344,29 +3103,82 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <form onSubmit={(event) => { void saveTask(event); }}>
             <div className="editor-heading">
               <div className="composer-icon"><ListTodo size={17} /></div>
-              <div><p className="eyebrow">{modalGoogleOwned ? "Google task" : modalRowOwned ? "Legacy task" : taskModal.taskId ? "Local task" : "Capture task"}</p><h2>{modalRowOwned ? "Plan task" : taskModal.taskId ? "Edit task" : "Add a task"}</h2></div>
+              <div><p className="eyebrow">{modalGoogleOwned || modalPendingGoogle || modalCreatingGoogle ? "Google task" : modalRowOwned ? "Legacy task" : taskModal.taskId ? "Local task" : "Capture task"}</p><h2>{modalRowOwned ? "Plan task" : taskModal.taskId ? "Edit task" : "Add a task"}</h2></div>
               <button className="close-composer" type="button" onClick={() => setModal(null)} aria-label="Close task editor"><X size={17} /></button>
             </div>
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
             {modalInbox ? <div className="source-notice"><Inbox size={14} /> Accepting from <strong>{modalInbox.source}</strong>. It will stay on the created task.</div> : null}
-            {modalGoogleOwned ? <div className="source-notice"><Link2 size={14} /> Google owns the title, due date, and completion. Planning stays in Fox Focus.</div> : modalRowOwned ? <div className="source-notice"><Bot size={14} /> The current task owner keeps its content and completion until migration. Planning stays in Fox Focus.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
+            {modalInboxRow ? <div className="source-notice"><Inbox size={14} /> From <strong>{inboxSourceLabel(modalInboxRow)}</strong>.</div> : null}
+            {modalGoogleOwned ? <div className="source-notice"><Link2 size={14} /> Google owns the title, due date, and completion. Planning stays in Fox Focus.</div> : modalPendingGoogle ? <div className="source-notice"><Clock3 size={14} /> Waiting for Google creation confirmation.</div> : modalRowOwned ? <div className="source-notice"><Bot size={14} /> The current task owner keeps its content and completion until migration. Planning stays in Fox Focus.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
             {modalTaskAction && actionStateLabel(modalTaskAction) ? <div className={`task-action-notice task-action-notice--${modalTaskAction.state}`}><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.error ?? (modalTaskAction.state === "succeeded" ? "Google readback matched the approved change." : "The approved change is waiting for Google readback.")}</span></div> : null}
+            {modalCreateAction && actionStateLabel(modalCreateAction) ? <div className={`task-action-notice task-action-notice--${modalCreateAction.state}`}><strong>{actionStateLabel(modalCreateAction)}</strong><span>{modalCreateAction.error ?? (modalCreateAction.state === "succeeded" ? "Google readback matched the approved task." : "The approved creation is waiting for Google readback.")}</span></div> : null}
             <div className="editor-grid editor-grid--quick-task">
-              <label className="field field--full"><span>{modalGoogleOwned ? "Task · managed in Google" : modalRowOwned ? "Task · managed at source" : "Task"}</span><input autoFocus required readOnly={modalRowOwned} value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
+              {modalCreatingGoogle ? <label className="field field--full"><span>Destination</span><select autoFocus required value={taskDestinationKey} disabled={!taskDestinations.length} onChange={(event) => {
+                const destination = taskDestinations.find((candidate) => destinationKey(candidate) === event.target.value);
+                const area = destination?.area;
+                setTaskDestinationKey(event.target.value);
+                if (isOneOf(area, areas)) setTaskDraft((current) => ({ ...current, area }));
+              }}>{taskDestinations.map((destination) => <option value={destinationKey(destination)} key={destinationKey(destination)}>{destination.area} · {destination.listName}{destination.isFallback ? " · fallback" : ""}</option>)}</select>{taskDestinationError ? <small>{taskDestinationError}</small> : null}</label> : null}
+              <label className="field field--full"><span>{modalGoogleOwned || modalPendingGoogle ? "Task · managed in Google" : modalRowOwned ? "Task · managed at source" : "Task"}</span><input autoFocus={!modalCreatingGoogle} required readOnly={modalRowOwned} value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
+              {modalCreatingGoogle ? <><label className="field field--full"><span>Google due</span><input type="date" value={taskGoogleDue} onChange={(event) => setTaskGoogleDue(event.target.value)} /></label><label className="field field--full"><span>Notes</span><textarea className="task-notes-field" value={taskNotes} onChange={(event) => setTaskNotes(event.target.value)} /></label></> : null}
               {modalGoogleOwned ? <label className="field field--full"><span>Google due</span><input type="date" readOnly value={modalTaskRow?.observed?.doOn ?? ""} /></label> : null}
+              {modalPendingGoogle ? <label className="field field--full"><span>Google due · pending</span><input type="date" readOnly value={modalCreateAction?.payload.doOn ?? ""} /></label> : null}
               <label className="field field--full"><span>{modalGoogleOwned ? "Local deadline" : "Deadline"}</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
+            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div></dl><pre>{outgoingTaskNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
             {showTaskDetails ? <div className="editor-grid editor-grid--task-details" id="task-more-options">
-              <label className="field"><span>{modalGoogleOwned ? "Area · from list" : modalRowOwned ? "Area · from source" : "Area"}</span><select disabled={modalRowOwned} value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
+              <label className="field"><span>{modalGoogleOwned || modalPendingGoogle || modalCreatingGoogle ? "Area · from list" : modalRowOwned ? "Area · from source" : "Area"}</span><select disabled={modalRowOwned || modalCreatingGoogle} value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
               <label className="field"><span>Priority</span><select value={taskDraft.priority} onChange={(event) => { const value = event.target.value; if (isOneOf(value, priorities)) setTaskDraft((current) => ({ ...current, priority: value })); }}><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
               <label className="field"><span>Duration</span><select value={taskDraft.duration} onChange={(event) => setTaskDraft((current) => ({ ...current, duration: event.target.value }))}><option value="5 min">5 min</option><option value="10 min">10 min</option><option value="20 min">20 min</option><option value="30 min">30 min</option><option value="40 min">40 min</option><option value="45 min">45 min</option><option value="60 min">60 min</option></select></label>
               <label className="field"><span>Task state</span><select value={taskDraft.state} onChange={(event) => { const value = event.target.value; if (isOneOf(value, activeTaskStates)) setTaskDraft((current) => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="scheduled">Scheduled</option><option value="waiting">Waiting</option></select></label>
               <label className="field"><span>Planned day</span><input type="date" value={taskDraft.scheduledDate} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledDate: event.target.value }))} /></label>
               <label className="field"><span>Planned time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
-              {modalRowOwned ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
+              {modalRowOwned || modalCreatingGoogle ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
             </div> : null}
-            <div className="editor-footer"><span>{modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{modalTaskAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
+            <div className="editor-footer"><span>{modalCreatingGoogle ? selectedTaskDestination ? `${selectedTaskDestination.accountId} · ${selectedTaskDestination.listName}` : "Choose a destination." : modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{initial && modalTask && (modalGoogleOwned || modalPendingGoogle) ? <button className="secondary-action" type="button" disabled={modalPendingGoogle} title={modalPendingGoogle ? "Wait for Google creation confirmation" : undefined} onClick={() => openJobComposer({ title: modalTask.title, taskId: modalTask.id })}><MessageSquare size={13} /> Hand to Hermes</button> : null}{modalCreateAction?.state === "conflict" && taskCreateConflictCandidates(modalCreateAction).length ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setTaskCreateConflictActionId(modalCreateAction.id); }}><RefreshCw size={13} /> Review matches</button> : modalTaskAction?.state === "conflict" || modalCreateAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy || (modalCreatingGoogle && !selectedTaskDestination)}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalCreatingGoogle ? "Create in Google" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
+          </form>
+        </DialogFrame>
+      ) : null}
+
+      {jobComposer ? (
+        <DialogFrame title="Hand to Hermes" onClose={() => setJobComposer(null)} className="editor-dialog--job">
+          <form onSubmit={submitJob}>
+            <div className="editor-heading">
+              <div className="composer-icon"><MessageSquare size={17} /></div>
+              <div><p className="eyebrow">Hermes job</p><h2>Hand it over</h2></div>
+              <button className="close-composer" type="button" onClick={() => setJobComposer(null)} aria-label="Close job editor"><X size={17} /></button>
+            </div>
+            {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
+            <div className="editor-grid">
+              <label className="field field--full"><span>Title</span><input required value={jobComposer.title} maxLength={200} onChange={(event) => setJobComposer((current) => current ? { ...current, title: event.target.value } : current)} /></label>
+              <label className="field field--full"><span>Instruction</span><textarea autoFocus required maxLength={2000} value={jobInstruction} onChange={(event) => setJobInstruction(event.target.value)} /></label>
+            </div>
+            <div className="editor-footer"><span>{jobComposer.taskId ? "Linked task" : jobComposer.inboxId ? "Linked Inbox item" : "Unlinked job"}</span><div><button className="secondary-action" type="button" onClick={() => setJobComposer(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === "job:create"}><CornerUpLeft size={14} /> Queue</button></div></div>
+          </form>
+        </DialogFrame>
+      ) : null}
+
+      {editingReply ? (
+        <DialogFrame title="Edit reply draft" onClose={() => setEditingReply(null)} className="editor-dialog--draft">
+          <form onSubmit={saveReplyEditor}>
+            <div className="editor-heading">
+              <div className="composer-icon"><Mail size={17} /></div>
+              <div><p className="eyebrow">Reply revision</p><h2>Edit draft</h2></div>
+              <button className="close-composer" type="button" onClick={() => setEditingReply(null)} aria-label="Close reply editor"><X size={17} /></button>
+            </div>
+            {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
+            <div className="editor-grid reply-editor-grid">
+              <label className="field"><span>Account</span><input readOnly value={editingReply.reply.accountId} /></label>
+              <label className="field"><span>From</span><input required value={editingReply.reply.from} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, from: event.target.value } } : current)} /></label>
+              <label className="field field--full"><span>To · one recipient per line</span><textarea className="reply-recipient-field" required value={editingReply.reply.to.join("\n")} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, to: event.target.value.split(/\r?\n/) } } : current)} /></label>
+              <label className="field"><span>Cc · one per line</span><textarea className="reply-recipient-field" value={editingReply.reply.cc.join("\n")} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, cc: event.target.value.split(/\r?\n/) } } : current)} /></label>
+              <label className="field"><span>Bcc · one per line</span><textarea className="reply-recipient-field" value={editingReply.reply.bcc.join("\n")} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, bcc: event.target.value.split(/\r?\n/) } } : current)} /></label>
+              <label className="field field--full"><span>Subject</span><input value={editingReply.reply.subject} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, subject: event.target.value } } : current)} /></label>
+              <label className="field field--full"><span>Body</span><textarea autoFocus maxLength={200000} value={editingReply.reply.bodyText} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, bodyText: event.target.value } } : current)} /></label>
+            </div>
+            <div className="reply-envelope-ids"><span>Reply to {editingReply.reply.replyToMessageId}</span><span>Thread {editingReply.reply.threadId}</span></div>
+            <div className="editor-footer"><span>Creates a new owner revision.</span><div><button className="secondary-action" type="button" onClick={() => setEditingReply(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === `draft:${editingReply.inboxId}`}><Check size={14} /> Save revision</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -2443,6 +3255,28 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             <p className="draft-context">The first approval no longer matches Google. Approve this new before-and-after pair to try again.</p>
             <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setTaskConflictActionId(null)}>Cancel</button><button className="submit-button" type="button" disabled={busyTaskIds.has(taskConflictTask.id) || taskConflictRow.observed?.completionWritable !== true || taskConflictRow.unavailableAt !== null} onClick={approveTaskConflict}>{taskConflictDesired === "completed" ? "Approve complete" : "Approve reopen"}</button></div>
           </> : <><p className="draft-context">The stored conflict details are unavailable. Refresh sources before trying again.</p><div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setTaskConflictActionId(null)}>Close</button></div></>}
+        </DialogFrame>
+      ) : null}
+
+      {taskCreateConflictActionId ? (
+        <DialogFrame title="Review Google task matches" onClose={() => setTaskCreateConflictActionId(null)} className="editor-dialog--alert editor-dialog--create-conflict">
+          <div className="editor-heading"><div className="composer-icon"><RefreshCw size={17} /></div><div><p className="eyebrow">Create conflict</p><h2>More than one Google task matches</h2></div><button className="close-composer" type="button" onClick={() => setTaskCreateConflictActionId(null)} aria-label="Close task creation conflict"><X size={17} /></button></div>
+          {taskCreateConflictAction && taskCreateCandidates.length ? <>
+            <div className="create-conflict-approval">
+              <span>Approved {formatDublinInstant(taskCreateConflictAction.approval.at)}</span>
+              <strong>{taskCreateConflictAction.payload.title}</strong>
+              <small>Account {taskCreateConflictAction.payload.destination.accountId}</small>
+              <small>List {taskCreateConflictAction.payload.destination.listId} · due {taskCreateConflictAction.payload.doOn ?? "none"}</small>
+              <pre>{taskCreateConflictAction.payload.notes}</pre>
+            </div>
+            <div className="create-conflict-candidates" aria-label="Matching Google tasks">
+              {taskCreateCandidates.map((candidate) => <article key={candidate.externalId}>
+                <i className={`inbox-thread-dot inbox-thread-dot--${candidate.state === "completed" ? "settled" : "needs_you"}`} aria-hidden="true" />
+                <div><strong>{candidate.title}</strong><small>{candidate.state} · due {candidate.dueDate ?? "none"}</small><small>Task {candidate.externalId} · ETag {candidate.version ?? "none"}</small>{candidate.updatedAt ? <small>{formatDublinInstant(candidate.updatedAt)}</small> : null}</div>
+              </article>)}
+            </div>
+            <div className="editor-footer"><span>{taskCreateConflictTask?.title ?? "Pending Google task"} remains unbound.</span><div><button className="secondary-action" type="button" onClick={() => setTaskCreateConflictActionId(null)}>Close</button><button className="submit-button" type="button" onClick={() => { setTaskCreateConflictActionId(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button></div></div>
+          </> : <><p className="draft-context">The stored candidate details are unavailable.</p><div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setTaskCreateConflictActionId(null)}>Close</button></div></>}
         </DialogFrame>
       ) : null}
 

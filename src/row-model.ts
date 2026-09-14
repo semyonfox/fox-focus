@@ -108,6 +108,23 @@ export type TaskCreatePayload = {
   doOn: DateOnly | null;
 };
 
+export type TaskCreateInput = {
+  destination: { accountId: string; listId: string };
+  nonce: string;
+  title: string;
+  notes: string;
+  doOn: DateOnly | null;
+  plan: {
+    priority: Priority;
+    waiting: boolean;
+    deadlineOn: DateOnly | null;
+    plannedOn: DateOnly | null;
+    plannedAt: Instant | null;
+    estimateMinutes: number | null;
+  };
+  inbox?: { id: string; version: number };
+};
+
 export type TaskStatusPayload = {
   kind: "task-status";
   taskId: string;
@@ -195,6 +212,17 @@ export type JobUpdate = {
   at: Instant;
 };
 
+export type HermesInboxUpsertInput = {
+  expectedVersion: number | null;
+  source:
+    | { kind: "email"; accountId: string; messageId: string; threadId: string }
+    | { kind: "hermes"; reference: string };
+  title: string;
+  summary: string;
+  likelyNoise: boolean;
+  draft?: ReplyEnvelope;
+};
+
 export type ReminderRow = {
   id: string;
   version: number;
@@ -246,6 +274,10 @@ function isShortText(value: unknown, maximum: number, allowEmpty = false): value
   return typeof value === "string" && value.length <= maximum && (allowEmpty || value.trim().length > 0);
 }
 
+function isOneLineText(value: unknown, maximum: number): value is string {
+  return isShortText(value, maximum) && !/[\r\n]/.test(value);
+}
+
 export function isUtcInstant(value: unknown): value is Instant {
   return typeof value === "string" && value.endsWith("Z") && isIsoInstant(value);
 }
@@ -290,6 +322,30 @@ export function isTaskStatusInput(value: unknown): value is { version: number; s
     value.version >= 1 && (value.state === "open" || value.state === "completed");
 }
 
+export function taskCreateNotes(notes: string, nonce: string): string {
+  const trimmed = notes.trim();
+  const marker = `Fox-Focus-ID: ${nonce}`;
+  return trimmed ? `${trimmed}\n\n${marker}` : marker;
+}
+
+export function isTaskCreateInput(value: unknown): value is TaskCreateInput {
+  if (!isRecord(value) || !isRecord(value.destination) || !isRecord(value.plan)) return false;
+  const estimate = value.plan.estimateMinutes;
+  const inbox = value.inbox;
+  return isShortText(value.destination.accountId, 200) && isShortText(value.destination.listId, 500) &&
+    typeof value.nonce === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value.nonce) &&
+    isOneLineText(value.title, 1_024) && isShortText(value.notes, 8_192, true) &&
+    !/^\s*Fox-Focus-ID\s*:/im.test(value.notes) && isNullableDateOnly(value.doOn) &&
+    isOneOf(value.plan.priority, priorities) && typeof value.plan.waiting === "boolean" &&
+    isNullableDateOnly(value.plan.deadlineOn) && isNullableDateOnly(value.plan.plannedOn) &&
+    isNullableUtcInstant(value.plan.plannedAt) &&
+    (estimate === null || (typeof estimate === "number" && Number.isSafeInteger(estimate) && estimate >= 1 && estimate <= 1_440)) &&
+    !(value.plan.plannedOn !== null && value.plan.plannedAt !== null) &&
+    taskCreateNotes(value.notes, value.nonce).length <= 8_192 &&
+    (inbox === undefined || (isRecord(inbox) && isShortText(inbox.id, 200) &&
+      typeof inbox.version === "number" && Number.isSafeInteger(inbox.version) && inbox.version >= 1));
+}
+
 export function isInboxDecisionInput(value: unknown): value is {
   version: number;
   state: InboxState;
@@ -300,25 +356,67 @@ export function isInboxDecisionInput(value: unknown): value is {
   const state = value.state === "open" || value.state === "waiting" || value.state === "resolved";
   const outcome = value.outcome === null || ["sent", "task", "dismissed", "noise", "read"].includes(String(value.outcome));
   return state && outcome && isNullableUtcInstant(value.snoozedUntil) &&
-    (value.state === "resolved" ? value.outcome !== null : value.outcome === null);
+    (value.state === "resolved" ? value.outcome !== null : value.outcome === null) &&
+    (value.state === "waiting" ? value.snoozedUntil !== null : value.snoozedUntil === null);
 }
 
-export function isJobInstruction(value: unknown): value is { title: string; instruction: string; taskId?: string; inboxId?: string } {
-  return isRecord(value) && isShortText(value.title, 200) && isShortText(value.instruction, 2_000) &&
-    (value.taskId === undefined || isShortText(value.taskId, 200)) &&
-    (value.inboxId === undefined || isShortText(value.inboxId, 200));
+export function isHermesInboxUpsertInput(value: unknown): value is HermesInboxUpsertInput {
+  if (!isRecord(value) || !isRecord(value.source)) return false;
+  const source = value.source.kind === "email"
+    ? isShortText(value.source.accountId, 200) && isShortText(value.source.messageId, 998) &&
+      isShortText(value.source.threadId, 998)
+    : value.source.kind === "hermes" && isShortText(value.source.reference, 500);
+  return source &&
+    (value.expectedVersion === null || (
+      Number.isSafeInteger(value.expectedVersion) && typeof value.expectedVersion === "number" && value.expectedVersion >= 1
+    )) &&
+    isOneLineText(value.title, 500) && isShortText(value.summary, 10_000, true) &&
+    typeof value.likelyNoise === "boolean" &&
+    (value.draft === undefined || isReplyEnvelope(value.draft));
+}
+
+export function isJobInstruction(value: unknown): value is {
+  idempotencyKey: string;
+  title: string;
+  instruction: string;
+  taskId?: string | null;
+  inboxId?: string | null;
+} {
+  return isRecord(value) && isShortText(value.idempotencyKey, 200) && !/[\r\n]/.test(value.idempotencyKey) &&
+    isOneLineText(value.title, 200) && isShortText(value.instruction, 2_000) &&
+    (value.taskId === undefined || value.taskId === null || isShortText(value.taskId, 200)) &&
+    (value.inboxId === undefined || value.inboxId === null || isShortText(value.inboxId, 200));
 }
 
 export function isJobResultInput(value: unknown): value is {
-  claimId: string;
   kind: "progress" | "question" | "result";
   text: string;
   url: string | null;
 } {
-  return isRecord(value) && isShortText(value.claimId, 200) &&
-    (value.kind === "progress" || value.kind === "question" || value.kind === "result") &&
-    isShortText(value.text, 280) &&
+  return isRecord(value) && (value.kind === "progress" || value.kind === "question" || value.kind === "result") &&
+    isOneLineText(value.text, 280) &&
     (value.url === null || (isShortText(value.url, 2_000) && (() => {
       try { return new URL(value.url).protocol === "https:"; } catch { return false; }
     })()));
+}
+
+export function isJobAnswerInput(value: unknown): value is { version: number; text: string } {
+  return isRecord(value) && Number.isSafeInteger(value.version) && typeof value.version === "number" &&
+    value.version >= 1 && isOneLineText(value.text, 280);
+}
+
+export function isJobSendBackInput(value: unknown): value is { version: number; text: string } {
+  return isJobAnswerInput(value);
+}
+
+export function isJobSettleInput(value: unknown): value is {
+  version: number;
+  outcome: JobOutcome;
+  taskVersion?: number;
+} {
+  return isRecord(value) && Number.isSafeInteger(value.version) && typeof value.version === "number" && value.version >= 1 &&
+    (value.outcome === "accepted" || value.outcome === "dropped") &&
+    (value.taskVersion === undefined || (
+      Number.isSafeInteger(value.taskVersion) && typeof value.taskVersion === "number" && value.taskVersion >= 1
+    ));
 }

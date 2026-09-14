@@ -59,6 +59,15 @@ const actionWorker = createTaskStatusActionWorker(store, integrations ?? {
     notice: 'Google Tasks is not configured.',
     retryable: false,
   }),
+  createGoogleTask: async () => ({
+    outcome: 'failed',
+    notice: 'Google Tasks is not configured.',
+    retryable: false,
+  }),
+  reconcileGoogleTaskCreate: async () => ({
+    outcome: 'unknown',
+    notice: 'Google Tasks is not configured. Reconnect the original account to reconcile this create.',
+  }),
 });
 const app = createApp(store, password, hermes, integrations, {
   pushPublicKey: vapid.publicKey,

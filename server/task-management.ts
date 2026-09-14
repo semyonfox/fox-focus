@@ -240,7 +240,7 @@ export function previewTaskAction(
   const link = task.externalLinks?.find(candidate => candidate.provider === 'google_tasks');
   if (!link) throw new TaskManagementError('not_linked', 'This task has no Google Tasks link.');
   if (link.policy !== 'completion_only') throw new TaskManagementError('read_only', 'This source link is read-only.');
-  if (!link.connectionId || store.getConnection('google')?.connectionId !== link.connectionId) {
+  if (!link.connectionId || store.getConnection('google')?.accountId !== link.connectionId) {
     throw new TaskManagementError('read_only', 'Reconnect and reconcile this Google link before changing it.');
   }
   const sourceRecord = store.findProviderRecord('google', 'task', link.connectionId, link.containerId, link.externalId);

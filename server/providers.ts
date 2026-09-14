@@ -2,9 +2,9 @@
  * Narrow provider adapters.
  *
  * The callers own OAuth, token persistence, scheduling, database writes, and
- * approval. Reads are intentionally field-limited. The sole write operation is
- * an exact Google Task status transition followed by a readback; this module
- * exposes no create, delete, clear, or broad update primitive.
+ * approval. Reads are intentionally field-limited. Writes can create one exact
+ * Google Task or change one task's status, and both require a readback. This
+ * module exposes no delete, clear, move, or broad update primitive.
  *
  * An injected fetch implementation keeps the adapter deterministic and means
  * it never discovers, reads, logs, or persists credentials itself.
@@ -25,6 +25,8 @@ export type ProviderOperation =
   | "google.calendar-changes"
   | "google.task-lists"
   | "google.tasks"
+  | "google.task-create"
+  | "google.task-create-reconcile"
   | "google.task-status-update"
   | "microsoft.calendar-list"
   | "microsoft.calendar-view"
@@ -198,6 +200,73 @@ export interface GoogleTaskStatusUpdateInput {
   /** The task ETag captured during import. Sent as If-Match when present. */
   readonly expectedEtag?: string;
 }
+
+export interface GoogleTaskCreateInput {
+  readonly taskListId: string;
+  readonly title: string;
+  readonly notes: string;
+  readonly dueOn: string | null;
+}
+
+export interface GoogleTaskCreate {
+  readonly taskListId: string;
+  readonly taskId: string;
+  /** Exact task returned by a GET after the insert completed. */
+  readonly task: ImportedTask;
+}
+
+export type GoogleTaskCreateResult =
+  | ProviderWriteSuccess<GoogleTaskCreate>
+  | {
+      readonly status: "failed";
+      readonly provider: "google";
+      readonly operation: "google.task-create";
+      readonly failure: ProviderReadFailureStatus;
+      readonly phase: "pre-dispatch" | "rejected";
+      readonly httpStatus?: number;
+      readonly retryAfterSeconds?: number;
+    }
+  | {
+      readonly status: "unknown";
+      readonly provider: "google";
+      readonly operation: "google.task-create";
+      readonly phase: "dispatch" | "readback";
+      readonly candidateTaskId?: string;
+    };
+
+export interface GoogleTaskCreateReconcileInput {
+  readonly taskListId: string;
+  readonly nonce: string;
+  readonly candidateTaskId?: string;
+}
+
+export type GoogleTaskCreateCandidate = Pick<
+  ImportedTask,
+  "externalId" | "title" | "state" | "dueDate" | "updatedAt" | "version"
+>;
+
+export type GoogleTaskCreateReconcileResult =
+  | ProviderWriteSuccess<GoogleTaskCreate>
+  | {
+      readonly status: "failed";
+      readonly provider: "google";
+      readonly operation: "google.task-create-reconcile";
+      readonly failure: "invalid-request";
+    }
+  | {
+      readonly status: "unknown";
+      readonly provider: "google";
+      readonly operation: "google.task-create-reconcile";
+      readonly failure: ProviderReadFailureStatus | "not-found";
+      readonly candidateTaskId?: string;
+    }
+  | {
+      readonly status: "conflict";
+      readonly provider: "google";
+      readonly operation: "google.task-create-reconcile";
+      readonly candidates: readonly GoogleTaskCreateCandidate[];
+      readonly candidateTaskId?: string;
+    };
 
 export interface GoogleTaskStatusUpdate {
   readonly taskListId: string;
@@ -874,6 +943,227 @@ export async function listGoogleTasks(
   });
   if (result.status !== "ok") return result;
   return success("google", operation, result.pageCount, { records: result.value.records });
+}
+
+function validGoogleTaskCreateInput(input: GoogleTaskCreateInput): boolean {
+  const nonceMarkers = typeof input.notes === "string"
+    ? input.notes.split(/\r\n|\r|\n/).filter(line => /^Fox-Focus-ID: [A-Za-z0-9_-]{1,200}$/.test(line))
+    : [];
+  return isNonEmptyText(input.taskListId)
+    && typeof input.title === "string"
+    && input.title.length <= 1_024
+    && input.title.trim() === input.title
+    && typeof input.notes === "string"
+    && input.notes.length <= 8_192
+    && nonceMarkers.length === 1
+    && (input.dueOn === null || asCanonicalDate(input.dueOn) !== null);
+}
+
+function createFailure(
+  failureStatus: ProviderReadFailureStatus,
+  phase: "pre-dispatch" | "rejected",
+  extras: { readonly httpStatus?: number; readonly retryAfterSeconds?: number } = {},
+): GoogleTaskCreateResult {
+  return {
+    status: "failed",
+    provider: "google",
+    operation: "google.task-create",
+    failure: failureStatus,
+    phase,
+    ...extras,
+  };
+}
+
+function createUnknown(
+  phase: "dispatch" | "readback",
+  candidateTaskId?: string,
+): GoogleTaskCreateResult {
+  return {
+    status: "unknown",
+    provider: "google",
+    operation: "google.task-create",
+    phase,
+    ...(candidateTaskId === undefined ? {} : { candidateTaskId }),
+  };
+}
+
+/**
+ * Inserts one approved Google Task, once, then verifies it with an exact GET.
+ * Once the POST starts, any ambiguous response is unknown and must be
+ * reconciled by nonce before another insert is considered.
+ */
+export async function createGoogleTask(
+  client: ProviderReadClient,
+  input: GoogleTaskCreateInput,
+): Promise<GoogleTaskCreateResult> {
+  const operation: ProviderOperation = "google.task-create";
+  if (!validGoogleTaskCreateInput(input)) return createFailure("invalid-request", "pre-dispatch");
+  const clientError = validateClient(client, "google", operation);
+  if (clientError) return createFailure(clientError.status, "pre-dispatch");
+
+  const encodedTaskListId = encodeURIComponent(input.taskListId);
+  const insertUrl = googleTasksUrl(`/lists/${encodedTaskListId}/tasks`, { fields: "id" });
+  let response: Response;
+  try {
+    response = await client.fetch(insertUrl, {
+      method: "POST",
+      headers: {
+        ...googleHeaders(client.accessToken),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: input.title,
+        notes: input.notes,
+        ...(input.dueOn === null ? {} : { due: `${input.dueOn}T00:00:00.000Z` }),
+      }),
+      signal: client.signal,
+    });
+  } catch {
+    return createUnknown("dispatch");
+  }
+
+  if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfter(response.headers.get("retry-after"));
+    try { await response.body?.cancel(); } catch { /* the HTTP status is authoritative */ }
+    if (response.status === 408) return createUnknown("dispatch");
+    if (response.status >= 400 && response.status < 500) {
+      const rejected = httpFailure("google", operation, response);
+      return createFailure(rejected.status, "rejected", {
+        httpStatus: response.status,
+        ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+      });
+    }
+    return createUnknown("dispatch");
+  }
+
+  let candidateTaskId: string;
+  try {
+    const payload: unknown = await response.json();
+    if (!isRecord(payload) || !isNonEmptyText(payload.id) || optionalVersion(payload.id) === INVALID) {
+      return createUnknown("dispatch");
+    }
+    candidateTaskId = payload.id;
+  } catch {
+    return createUnknown("dispatch");
+  }
+
+  const encodedTaskId = encodeURIComponent(candidateTaskId);
+  const readUrl = googleTasksUrl(`/lists/${encodedTaskListId}/tasks/${encodedTaskId}`, {
+    fields: googleTaskResourceFields,
+  });
+  const readback = await fetchJson(client, "google", operation, readUrl, googleHeaders(client.accessToken));
+  if ("error" in readback) return createUnknown("readback", candidateTaskId);
+  const task = parseGoogleTask(input.taskListId, readback.payload);
+  if (
+    task === null
+    || task.externalId !== candidateTaskId
+    || task.isDeleted
+    || task.state !== "open"
+    || task.completedAt !== null
+    || task.version === null
+    || task.completionWritable === false
+    || task.title !== input.title
+    || task.notes !== input.notes
+    || task.dueDate !== input.dueOn
+  ) return createUnknown("readback", candidateTaskId);
+
+  return writeSuccess("google", operation, {
+    taskListId: input.taskListId,
+    taskId: candidateTaskId,
+    task,
+  });
+}
+
+function hasExactNonceMarker(notes: string | null, nonce: string): boolean {
+  if (notes === null) return false;
+  const marker = `Fox-Focus-ID: ${nonce}`;
+  return notes.split(/\r\n|\r|\n/).some(line => line === marker);
+}
+
+function createCandidate(task: ImportedTask): GoogleTaskCreateCandidate {
+  return {
+    externalId: task.externalId,
+    title: task.title,
+    state: task.state,
+    dueDate: task.dueDate,
+    updatedAt: task.updatedAt,
+    version: task.version,
+  };
+}
+
+/** Finds a prior uncertain insert by an exact marker line across every page. */
+export async function reconcileGoogleTaskCreate(
+  client: ProviderReadClient,
+  input: GoogleTaskCreateReconcileInput,
+): Promise<GoogleTaskCreateReconcileResult> {
+  const operation = "google.task-create-reconcile" as const;
+  if (
+    !isNonEmptyText(input.taskListId)
+    || !/^[A-Za-z0-9_-]{1,200}$/.test(input.nonce)
+    || (input.candidateTaskId !== undefined && optionalVersion(input.candidateTaskId) === INVALID)
+  ) return { status: "failed", provider: "google", operation, failure: "invalid-request" };
+
+  const clientError = validateClient(client, "google", operation);
+  if (clientError) {
+    return {
+      status: "unknown",
+      provider: "google",
+      operation,
+      failure: clientError.status,
+      ...(input.candidateTaskId === undefined ? {} : { candidateTaskId: input.candidateTaskId }),
+    };
+  }
+  const result = await listGoogleTasks(client, { taskListId: input.taskListId });
+  if (result.status !== "ok") {
+    return {
+      status: "unknown",
+      provider: "google",
+      operation,
+      failure: result.status,
+      ...(input.candidateTaskId === undefined ? {} : { candidateTaskId: input.candidateTaskId }),
+    };
+  }
+  const matches = result.value.records.filter(task =>
+    !task.isDeleted && hasExactNonceMarker(task.notes, input.nonce));
+  const candidateMatches = input.candidateTaskId === undefined
+    || matches.some(task => task.externalId === input.candidateTaskId);
+  if (matches.length === 1 && candidateMatches) {
+    const task = matches[0];
+    if (
+      task.version === null
+      || (task.state === "open" && task.completedAt !== null)
+      || task.completionWritable === false
+    ) {
+      return {
+        status: "unknown",
+        provider: "google",
+        operation,
+        failure: "invalid-response",
+        candidateTaskId: task.externalId,
+      };
+    }
+    return writeSuccess("google", operation, {
+      taskListId: input.taskListId,
+      taskId: task.externalId,
+      task,
+    });
+  }
+  if (matches.length === 0) {
+    return {
+      status: "unknown",
+      provider: "google",
+      operation,
+      failure: "not-found",
+      ...(input.candidateTaskId === undefined ? {} : { candidateTaskId: input.candidateTaskId }),
+    };
+  }
+  return {
+    status: "conflict",
+    provider: "google",
+    operation,
+    candidates: matches.map(createCandidate),
+    ...(input.candidateTaskId === undefined ? {} : { candidateTaskId: input.candidateTaskId }),
+  };
 }
 
 /**

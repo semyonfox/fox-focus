@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createApp } from './app.ts';
 import type { HermesMirrorService } from './hermes.ts';
 import type { GoogleTaskWriteResult, IntegrationService } from './integrations.ts';
+import { ROW_SCHEMA_VERSION } from './row-store.ts';
 import { openStore, type ImportedRecord } from './store.ts';
 import type { HermesFeed } from '../src/hermes-model.ts';
 import type { PrototypeData } from '../src/model.ts';
@@ -50,6 +51,13 @@ test('an existing legacy workspace password remains valid', async () => {
 
 const password = 'test-only-password-at-least-24-characters';
 const authorization = `Basic ${Buffer.from(`fox:${password}`).toString('base64')}`;
+const unusedTaskCreation: Pick<IntegrationService, 'listGoogleTaskDestinations' | 'createGoogleTask' | 'reconcileGoogleTaskCreate'> = {
+  listGoogleTaskDestinations: () => ({
+    accountId: null, connectionGeneration: null, destinations: [], fallbackListId: null,
+  }),
+  createGoogleTask: async () => ({ outcome: 'failed', notice: 'unused', retryable: false }),
+  reconcileGoogleTaskCreate: async () => ({ outcome: 'unknown', notice: 'unused' }),
+};
 
 function linkedTaskData(): PrototypeData {
   return {
@@ -205,7 +213,7 @@ test('SQLite adds the Hermes mirror schema to an existing workspace without chan
       DROP TABLE hermes_task_mirrors;
       DROP TABLE hermes_sync_state;
     `);
-    assert.equal((previous.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+    assert.equal((previous.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, ROW_SCHEMA_VERSION);
     previous.close();
 
     store = openStore(path);
@@ -226,6 +234,7 @@ test('integration routes keep browser OAuth callbacks authenticated and expose n
   const store = openStore(':memory:');
   let callbackQuery = '';
   const integrations: IntegrationService = {
+    ...unusedTaskCreation,
     overview: () => ({
       providers: [
         {
@@ -341,12 +350,12 @@ test('SQLite migrates the global delivery ledger without dropping its table', ()
     }]);
     const db = new DatabaseSync(path);
     try {
-      assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
+      assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, ROW_SCHEMA_VERSION);
       assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='push_deliveries'").get());
     } finally { db.close(); }
   } finally { store.close(); rmSync(dir, { recursive: true }); }
 });
-test('Hermes can read a redacted native task status and submit idempotent Inbox proposals with its own token', async () => {
+test('Hermes can upsert email Inbox rows and run a claim-bound job through the five-route API', async () => {
   const store = openStore(':memory:', testData());
   const token = 'hermes-test-token-at-least-24-characters';
   const bearer = `Bearer ${token}`;
@@ -355,65 +364,122 @@ test('Hermes can read a redacted native task status and submit idempotent Inbox 
       taskStatusToken: token,
       now: () => new Date('2026-09-13T10:00:00.000Z'),
     });
-    assert.equal((await app.request('/api/v1/task-status')).status, 401);
-    const status = await app.request('/api/v1/task-status', { headers: { authorization: bearer } });
-    assert.equal(status.status, 200);
-    assert.equal(status.headers.get('etag'), '"workspace-0"');
-    const statusBody = await status.json() as { counts: { open: number }; tasks: Array<Record<string, unknown>> };
-    assert.equal(statusBody.counts.open, 1);
-    assert.deepEqual(Object.keys(statusBody.tasks[0]).sort(), [
-      'area', 'completed', 'completedAt', 'deadlineDate', 'dueLabel', 'id', 'origin', 'planned', 'priority', 'state', 'title',
-    ]);
-    assert.equal((await app.request('/api/v1/task-status', {
-      headers: { authorization: bearer, 'If-None-Match': '"workspace-0"' },
-    })).status, 304);
-
     const proposalBody = JSON.stringify({
-      idempotencyKey: 'proposal-unique-1',
-      title: 'Check event timing',
-      summary: 'Hermes found a possible clash. Review it before making a task.',
-      area: 'University',
+      expectedVersion: null,
+      source: { kind: 'email', accountId: 'mail-account', messageId: 'message-1', threadId: 'thread-1' },
+      title: 'Check event timing', summary: 'Hermes found a possible clash.', likelyNoise: false,
+      draft: {
+        accountId: 'mail-account', threadId: 'thread-1', replyToMessageId: 'message-1',
+        inReplyTo: '<message-1@example.test>', references: [], from: 'owner@example.test',
+        to: ['sender@example.test'], cc: [], bcc: [], subject: 'Re: Event timing', bodyText: 'I will check.',
+      },
     });
-    const first = await app.request('/api/v1/task-proposals', {
-      method: 'POST', headers: { authorization: bearer, 'Content-Type': 'application/json' }, body: proposalBody,
+    const first = await app.request('/api/v1/inbox/email-message-1', {
+      method: 'PUT', headers: { authorization: bearer, 'Content-Type': 'application/json' }, body: proposalBody,
     });
     assert.equal(first.status, 201);
-    const second = await app.request('/api/v1/task-proposals', {
-      method: 'POST', headers: { authorization: bearer, 'Content-Type': 'application/json' }, body: proposalBody,
+    const firstBody = await first.json() as { item: { id: string; version: number }; draftOutcome: string };
+    assert.equal(firstBody.draftOutcome, 'created');
+    const second = await app.request('/api/v1/inbox/email-message-1', {
+      method: 'PUT', headers: { authorization: bearer, 'Content-Type': 'application/json' }, body: proposalBody,
     });
     assert.equal(second.status, 200);
-    const conflicting = await app.request('/api/v1/task-proposals', {
-      method: 'POST', headers: { authorization: bearer, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        idempotencyKey: 'proposal-unique-1',
-        title: 'A different proposal',
-        summary: 'The same key must not silently alias a different request.',
-        area: 'University',
-      }),
+    assert.equal((await second.json() as { outcome: string }).outcome, 'replayed');
+    const conflicting = await app.request('/api/v1/inbox/email-message-1', {
+      method: 'PUT', headers: { authorization: bearer, 'Content-Type': 'application/json' },
+      body: proposalBody.replace('possible clash', 'different clash'),
     });
     assert.equal(conflicting.status, 409);
     assert.equal(store.listInboxItems().length, 1);
-    assert.equal(store.listInboxItems()[0].title, 'Check event timing');
-    assert.equal(store.listInboxItems()[0].state, 'open');
     assert.equal(store.read().revision, 0);
-    assert.equal(store.read().data.tasks.length, 1);
+    const directSent = await app.request(`/api/v1/inbox-items/${firstBody.item.id}`, {
+      method: 'PUT', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: firstBody.item.version, state: 'resolved', outcome: 'sent', snoozedUntil: null }),
+    });
+    assert.equal(directSent.status, 400);
+    assert.equal(store.getInboxItem(firstBody.item.id)?.outcome, null);
+
+    const createJob = await app.request('/api/v1/jobs', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idempotencyKey: 'job-check-event-1', title: 'Check the event', instruction: 'Confirm its start time.',
+        taskId: null, inboxId: firstBody.item.id,
+      }),
+    });
+    assert.equal(createJob.status, 201);
+    const job = (await createJob.json() as { job: { id: string } }).job;
+    const replayedJob = await app.request('/api/v1/jobs', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idempotencyKey: 'job-check-event-1', title: 'Check the event', instruction: 'Confirm its start time.',
+        taskId: null, inboxId: firstBody.item.id,
+      }),
+    });
+    assert.equal(replayedJob.status, 200);
+    assert.equal((await replayedJob.json() as { job: { id: string } }).job.id, job.id);
+    assert.equal(store.listJobs().length, 1);
+    const conflictingJob = await app.request('/api/v1/jobs', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        idempotencyKey: 'job-check-event-1', title: 'Check the event', instruction: 'Do something different.',
+        taskId: null, inboxId: firstBody.item.id,
+      }),
+    });
+    assert.equal(conflictingJob.status, 409);
+    const claim = await app.request(`/api/v1/requests/${job.id}/claim`, {
+      method: 'POST', headers: { authorization: bearer },
+    });
+    assert.equal(claim.status, 200);
+    const claimBody = await claim.json() as { claimId: string };
+    const multiline = await app.request(`/api/v1/requests/${job.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: JSON.stringify({ kind: 'progress', text: 'First line\nsecond line', url: null }),
+    });
+    assert.equal(multiline.status, 400);
+    const progressBody = JSON.stringify({ kind: 'progress', text: 'Checking the source page.', url: null });
+    const progress = await app.request(`/api/v1/requests/${job.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: progressBody,
+    });
+    assert.equal(progress.status, 200);
+    const progressReplay = await app.request(`/api/v1/requests/${job.id}/result`, {
+      method: 'POST',
+      headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
+      body: progressBody,
+    });
+    assert.equal((await progressReplay.json() as { outcome: string }).outcome, 'replayed');
+
+    const context = await app.request('/api/v1/context?from=2026-09-01&to=2026-10-31', {
+      headers: { authorization: bearer },
+    });
+    assert.equal(context.status, 200);
+    const contextBody = await context.json() as { jobs: unknown[]; jobUpdates: unknown[] };
+    assert.equal(contextBody.jobs.length, 1);
+    assert.equal(contextBody.jobUpdates.length, 1);
   } finally {
     store.close();
   }
 });
 
-test('the Hermes bearer is limited to task status and Inbox proposals', async () => {
+test('the Hermes bearer is accepted only on the five exact Hermes routes', async () => {
   const store = openStore(':memory:', linkedTaskData());
   const token = 'hermes-route-scope-token-at-least-24-characters';
   const bearer = `Bearer ${token}`;
   try {
     const app = createApp(store, password, undefined, undefined, { taskStatusToken: token });
-    const deniedRequests: Array<{ path: string; method?: 'GET' | 'POST' | 'PUT'; body?: unknown }> = [
+    const deniedRequests: Array<{ path: string; method?: 'DELETE' | 'GET' | 'POST' | 'PUT'; body?: unknown }> = [
       { path: '/api/v1/workspace' },
       { path: '/api/v1/workspace', method: 'PUT', body: store.read() },
+      { path: '/api/v1/rows' },
       { path: '/api/v1/hermes' },
+      { path: '/api/v1/hermes/sync', method: 'POST' },
+      { path: '/api/v1/hermes/tasks/task/annotation', method: 'PUT', body: {} },
+      { path: '/api/v1/hermes/tasks/task/complete', method: 'POST', body: {} },
       { path: '/api/v1/integrations' },
       { path: '/api/v1/integrations/google/connect' },
+      { path: '/api/v1/integrations/google/callback' },
       { path: '/api/v1/integrations/google/sync', method: 'POST' },
       { path: '/api/v1/task-adoptions/preview', method: 'POST', body: { source: 'google', recordId: 1 } },
       { path: '/api/v1/task-adoptions/not-an-approval/approve', method: 'POST' },
@@ -424,6 +490,25 @@ test('the Hermes bearer is limited to task status and Inbox proposals', async ()
       },
       { path: '/api/v1/task-actions/not-an-action/approve', method: 'POST' },
       { path: '/api/v1/task-actions/not-an-action/retry', method: 'POST' },
+      { path: '/api/v1/task-status' },
+      { path: '/api/v1/task-proposals', method: 'POST', body: {} },
+      { path: '/api/v1/task-destinations' },
+      { path: '/api/v1/tasks', method: 'POST', body: {} },
+      { path: '/api/v1/tasks/linked-task/plan', method: 'PUT', body: {} },
+      { path: '/api/v1/tasks/linked-task/status', method: 'POST', body: { version: 1, state: 'completed' } },
+      { path: '/api/v1/jobs', method: 'POST', body: { title: 'No', instruction: 'No', taskId: null, inboxId: null } },
+      { path: '/api/v1/jobs/not-a-job/answer', method: 'POST', body: {} },
+      { path: '/api/v1/jobs/not-a-job/send-back', method: 'POST', body: {} },
+      { path: '/api/v1/jobs/not-a-job/settle', method: 'POST', body: { version: 1, outcome: 'dropped' } },
+      { path: '/api/v1/inbox-items/not-an-item', method: 'PUT', body: {} },
+      { path: '/api/v1/inbox-items/not-an-item/drafts', method: 'POST', body: {} },
+      { path: '/api/v1/push/public-key' },
+      { path: '/api/v1/push/subscriptions', method: 'POST', body: {} },
+      { path: '/api/v1/push/subscriptions', method: 'DELETE', body: {} },
+      { path: '/api/v1/inbox/key' },
+      { path: '/api/v1/inbox/key', method: 'POST', body: {} },
+      { path: '/api/v1/requests/key/claim' },
+      { path: '/api/v1/requests/key/result', method: 'PUT', body: {} },
     ];
     for (const request of deniedRequests) {
       const response = await app.request(request.path, {
@@ -436,7 +521,10 @@ test('the Hermes bearer is limited to task status and Inbox proposals', async ()
       });
       assert.equal(response.status, 401, `${request.method ?? 'GET'} ${request.path}`);
     }
-    assert.equal((await app.request('/api/v1/task-status', { headers: { authorization: bearer } })).status, 200);
+    assert.equal((await app.request('/api/v1/context?from=2026-09-01&to=2026-10-31', {
+      headers: { authorization: bearer },
+    })).status, 200);
+    assert.equal((await app.request('/api/v1/changes?after=0&limit=1', { headers: { authorization: bearer } })).status, 200);
   } finally {
     store.close();
   }
@@ -580,6 +668,7 @@ test('approved Google completion keeps the local task done when upstream fails a
   });
   let attempts = 0;
   const integrations: IntegrationService = {
+    ...unusedTaskCreation,
     overview: () => emptyIntegrationOverview(),
     startAuthorization: () => null,
     completeAuthorization: async () => ({ outcome: 'failed', notice: 'unused' }),
@@ -637,6 +726,7 @@ test('a delayed Google update blocks a second-tab action for the same task', asy
   const providerStarted = new Promise<void>(resolve => { signalProviderStarted = resolve; });
   const providerResult = new Promise<GoogleTaskWriteResult>(resolve => { releaseProvider = resolve; });
   const integrations: IntegrationService = {
+    ...unusedTaskCreation,
     overview: () => emptyIntegrationOverview(),
     startAuthorization: () => null,
     completeAuthorization: async () => ({ outcome: 'failed', notice: 'unused' }),
@@ -685,6 +775,7 @@ test('a task-action approval is rejected if the workspace changed after its exac
   const store = openStore(':memory:', linkedTaskData());
   let providerWrites = 0;
   const integrations: IntegrationService = {
+    ...unusedTaskCreation,
     overview: () => emptyIntegrationOverview(),
     startAuthorization: () => null,
     completeAuthorization: async () => ({ outcome: 'failed', notice: 'unused' }),
@@ -745,3 +836,87 @@ function emptyIntegrationOverview(): ReturnType<IntegrationService['overview']> 
     records: [],
   };
 }
+
+test('task creation exposes fresh destinations and durably queues the approved Google command', async () => {
+  const store = openStore(':memory:', testData());
+  let providerCreates = 0;
+  let kicks = 0;
+  let destinationAvailable = true;
+  const integrations: IntegrationService = {
+    overview: () => emptyIntegrationOverview(),
+    listGoogleTaskDestinations: () => ({
+      accountId: 'google-connection-1',
+      connectionGeneration: 'google-generation-1',
+      destinations: destinationAvailable ? [{
+        accountId: 'google-connection-1', listId: 'list-personal', name: 'My Tasks',
+        area: 'Personal', fallback: true, fresh: true, explicitMapping: false,
+      }] : [],
+      fallbackListId: destinationAvailable ? 'list-personal' : null,
+    }),
+    startAuthorization: () => null,
+    completeAuthorization: async () => ({ outcome: 'failed', notice: 'unused' }),
+    sync: async () => ({ outcome: 'synced', recordCount: 0 }),
+    syncConnected: async () => {},
+    updateGoogleTaskCompletion: async () => ({ outcome: 'failed', notice: 'unused', retryable: false }),
+    createGoogleTask: async () => {
+      providerCreates += 1;
+      return { outcome: 'unknown', notice: 'unused' };
+    },
+    reconcileGoogleTaskCreate: async () => ({ outcome: 'unknown', notice: 'unused' }),
+  };
+  try {
+    const app = createApp(store, password, undefined, integrations, {
+      now: () => new Date('2026-09-14T10:00:00.000Z'),
+      actionWorker: { kick: () => { kicks += 1; } },
+    });
+    const destinationsResponse = await app.request('/api/v1/task-destinations', { headers: { authorization } });
+    assert.equal(destinationsResponse.status, 200);
+    assert.deepEqual(await destinationsResponse.json(), {
+      destinations: [{
+        accountId: 'google-connection-1', listId: 'list-personal', listName: 'My Tasks',
+        area: 'Personal', isFallback: true, explicitMapping: false,
+      }],
+      fallback: {
+        accountId: 'google-connection-1', listId: 'list-personal', listName: 'My Tasks',
+        area: 'Personal', isFallback: true, explicitMapping: false,
+      },
+    });
+    const body = {
+      destination: { accountId: 'google-connection-1', listId: 'list-personal' },
+      nonce: 'nonce_api_create', title: 'Create through API', notes: 'Exact owner notes', doOn: '2026-09-20',
+      plan: {
+        priority: 'medium', waiting: false, deadlineOn: null, plannedOn: '2026-09-19',
+        plannedAt: null, estimateMinutes: 20,
+      },
+    };
+    const created = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    assert.equal(created.status, 202);
+    const value = await created.json() as { task: { id: string }; action: { state: string; payload: { notes: string } } };
+    assert.equal(value.action.state, 'queued');
+    assert.equal(value.action.payload.notes, 'Exact owner notes\n\nFox-Focus-ID: nonce_api_create');
+    assert.equal(store.getTask(value.task.id)?.binding.kind, 'pending');
+    assert.equal(providerCreates, 0, 'the request only persists and wakes the worker');
+    assert.equal(kicks, 1);
+
+    const replay = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    assert.equal(replay.status, 200);
+    assert.equal(kicks, 2);
+    assert.equal(store.listActions().filter(action => action.payload.kind === 'task-create').length, 1);
+
+    destinationAvailable = false;
+    const stale = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, nonce: 'nonce_stale_destination' }),
+    });
+    assert.equal(stale.status, 409);
+    const forgedMarker = await app.request('/api/v1/tasks', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, nonce: 'nonce_marker', notes: 'Fox-Focus-ID: forged' }),
+    });
+    assert.equal(forgedMarker.status, 400);
+  } finally { store.close(); }
+});
