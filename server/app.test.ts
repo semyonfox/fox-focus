@@ -102,9 +102,11 @@ test('workspace API protects data, validates writes and rejects stale revisions'
       method: 'PUT', headers: { authorization, 'Content-Type': 'application/json', ...(origin ? { Origin: origin } : {}) }, body: JSON.stringify(body),
     });
     const snapshot = store.read();
-    snapshot.data.tasks[0].title = 'New fixture task title';
+    const editableEvent = snapshot.data.events.find(event => event.editable);
+    assert.ok(editableEvent);
+    editableEvent.subtitle = 'Saved local note';
     assert.equal((await put(snapshot)).status, 200);
-    assert.equal(store.read().data.tasks[0].title, 'New fixture task title');
+    assert.equal(store.read().data.events.find(event => event.editable)?.subtitle, 'Saved local note');
     assert.equal((await put(snapshot)).status, 409);
     assert.equal((await put({ revision: 1, data: {} })).status, 400);
     assert.equal((await put(store.read(), 'https://evil.example')).status, 403);
@@ -203,7 +205,7 @@ test('SQLite adds the Hermes mirror schema to an existing workspace without chan
       DROP TABLE hermes_task_mirrors;
       DROP TABLE hermes_sync_state;
     `);
-    assert.equal((previous.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 7);
+    assert.equal((previous.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
     previous.close();
 
     store = openStore(path);
@@ -339,7 +341,7 @@ test('SQLite migrates the global delivery ledger without dropping its table', ()
     }]);
     const db = new DatabaseSync(path);
     try {
-      assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 7);
+      assert.equal((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8);
       assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='push_deliveries'").get());
     } finally { db.close(); }
   } finally { store.close(); rmSync(dir, { recursive: true }); }
@@ -390,9 +392,10 @@ test('Hermes can read a redacted native task status and submit idempotent Inbox 
       }),
     });
     assert.equal(conflicting.status, 409);
-    assert.equal(store.read().data.inboxItems.length, 1);
-    assert.equal(store.read().data.inboxItems[0].title, 'Check event timing');
-    assert.equal(store.read().data.inboxItems[0].status, 'new');
+    assert.equal(store.listInboxItems().length, 1);
+    assert.equal(store.listInboxItems()[0].title, 'Check event timing');
+    assert.equal(store.listInboxItems()[0].state, 'open');
+    assert.equal(store.read().revision, 0);
     assert.equal(store.read().data.tasks.length, 1);
   } finally {
     store.close();
@@ -707,7 +710,7 @@ test('a task-action approval is rejected if the workspace changed after its exac
     const action = await preview.json() as { id: string };
 
     const changed = store.read();
-    changed.data.tasks[0].title = 'Edited after preview';
+    changed.data.listAreas = { 'google:id:list-1': 'Personal' };
     const saved = await app.request('/api/v1/workspace', {
       method: 'PUT', headers: { authorization, 'Content-Type': 'application/json' }, body: JSON.stringify(changed),
     });

@@ -149,6 +149,10 @@ export interface ImportedTask {
   readonly taskListId: string;
   readonly externalId: string;
   readonly title: string;
+  readonly notes: string | null;
+  readonly parentId: string | null;
+  readonly position: string | null;
+  readonly sourceUrl: string | null;
   readonly state: "open" | "completed";
   /** The provider's non-sensitive state, retained for deterministic mappings. */
   readonly sourceState: string;
@@ -325,11 +329,31 @@ function optionalText(value: unknown): string | null | Invalid {
   return typeof value === "string" ? value : INVALID;
 }
 
+function optionalGoogleTaskNotes(value: unknown): string | null | Invalid {
+  if (value === undefined || value === null) return null;
+  return typeof value === "string" && value.length <= 8_192 ? value : INVALID;
+}
+
 function optionalVersion(value: unknown): string | null | Invalid {
   if (value === undefined || value === null) return null;
   return isNonEmptyText(value) && value.length <= 1_024 && !/[\r\n]/.test(value)
     ? value
     : INVALID;
+}
+
+function optionalGoogleTaskUrl(value: unknown): string | null | Invalid {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return INVALID;
+  try {
+    const url = new URL(value);
+    return url.origin === "https://tasks.google.com"
+      && url.username === ""
+      && url.password === ""
+      ? url.toString()
+      : INVALID;
+  } catch {
+    return INVALID;
+  }
 }
 
 function optionalBoolean(value: unknown, fallback: boolean): boolean | Invalid {
@@ -601,6 +625,10 @@ function parseGoogleTask(taskListId: string, value: unknown): ImportedTask | nul
   }
   if (!isDeleted && sourceState === "deleted") return null;
   const title = optionalText(value.title);
+  const notes = optionalGoogleTaskNotes(value.notes);
+  const parentId = optionalVersion(value.parent);
+  const position = optionalVersion(value.position);
+  const sourceUrl = optionalGoogleTaskUrl(value.webViewLink);
   const due = optionalText(value.due);
   const completedAt = optionalInstant(value.completed);
   const updatedAt = optionalInstant(value.updated);
@@ -608,6 +636,10 @@ function parseGoogleTask(taskListId: string, value: unknown): ImportedTask | nul
   const isAssigned = value.assignmentInfo !== undefined && value.assignmentInfo !== null;
   if (
     title === INVALID
+    || notes === INVALID
+    || parentId === INVALID
+    || position === INVALID
+    || sourceUrl === INVALID
     || due === INVALID
     || completedAt === INVALID
     || updatedAt === INVALID
@@ -621,6 +653,10 @@ function parseGoogleTask(taskListId: string, value: unknown): ImportedTask | nul
     taskListId,
     externalId: value.id,
     title: titleOrFallback(title, "Untitled task"),
+    notes,
+    parentId,
+    position,
+    sourceUrl,
     state: sourceState === "completed" ? "completed" : "open",
     sourceState,
     dueDate,
@@ -663,7 +699,7 @@ function googlePagedUrl(
 const googleCalendarListFields = "items(id,summary,primary),nextPageToken";
 const googleCalendarEventFields = "items(id,status,summary,start(date,dateTime,timeZone),end(date,dateTime,timeZone),updated),nextPageToken,nextSyncToken";
 const googleTaskListFields = "items(id,title),nextPageToken";
-const googleTaskResourceFields = "id,title,status,due,completed,updated,deleted,etag,assignmentInfo";
+const googleTaskResourceFields = "id,title,notes,parent,position,webViewLink,status,due,completed,updated,deleted,etag,assignmentInfo";
 const googleTaskFields = `items(${googleTaskResourceFields}),nextPageToken`;
 
 /** Lists visible Google calendars. No calendar contents are requested here. */
@@ -1195,6 +1231,10 @@ function parseMicrosoftTask(taskListId: string, value: unknown): ImportedTask | 
     taskListId,
     externalId: value.id,
     title: titleOrFallback(title, "Untitled task"),
+    notes: null,
+    parentId: null,
+    position: null,
+    sourceUrl: null,
     state: value.status === "completed" ? "completed" : "open",
     sourceState: value.status,
     dueDate,

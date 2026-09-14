@@ -328,6 +328,196 @@ test('provider overview keeps ordinary-sized task collections when calendar reco
   }
 });
 
+test('Google publishes calendars and task lists independently and retains rows for failed scopes', async () => {
+  const store = openStore(':memory:');
+  const connectionId = 'scoped-google-generation';
+  const scopes = ['https://www.googleapis.com/auth/tasks'];
+  let attempt = 1;
+  let currentTime = new Date('2026-09-13T10:00:00.000Z');
+  try {
+    store.saveConnection({
+      provider: 'google', connectionId, state: 'connected', scopes,
+      tokenEnvelope: serializeOAuthTokenEnvelope(sealOAuthTokenSet({
+        accessToken: 'scoped-access', refreshToken: 'scoped-refresh', scopes,
+        expiresAt: '2027-09-13T10:00:00.000Z', tokenType: 'Bearer',
+      }, masterKey, { provider: 'google', connectionId })),
+      connectedAt: currentTime.toISOString(), updatedAt: currentTime.toISOString(),
+      lastSyncedAt: null, lastError: null,
+    });
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test',
+      tokenMasterKey: masterKey,
+      now: () => currentTime,
+      fetch: async (input) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        if (url.pathname === '/calendar/v3/users/me/calendarList') {
+          return json({ items: [
+            { id: 'calendar-a', summary: 'Calendar A' },
+            { id: 'calendar-b', summary: 'Calendar B' },
+          ] });
+        }
+        if (url.pathname === '/calendar/v3/calendars/calendar-a/events') {
+          return attempt === 1
+            ? json({ items: [{
+                id: 'event-a', status: 'confirmed', summary: 'Retained event',
+                start: { dateTime: '2026-09-13T11:00:00.000Z' },
+                end: { dateTime: '2026-09-13T12:00:00.000Z' },
+              }] })
+            : json({ error: 'temporary failure' }, 503);
+        }
+        if (url.pathname === '/calendar/v3/calendars/calendar-b/events') {
+          return attempt === 1
+            ? json({ items: [{
+                id: 'event-b', status: 'confirmed', summary: 'Removed event',
+                start: { dateTime: '2026-09-13T13:00:00.000Z' },
+                end: { dateTime: '2026-09-13T14:00:00.000Z' },
+              }] })
+            : json({ items: [] });
+        }
+        if (url.pathname === '/tasks/v1/users/@me/lists') {
+          return json({ items: [
+            { id: 'list-a', title: 'List A' },
+            { id: 'list-b', title: 'List B' },
+          ] });
+        }
+        if (url.pathname === '/tasks/v1/lists/list-a/tasks') {
+          return attempt === 1
+            ? json({ items: [{
+                id: 'task-a', title: 'Retained task', status: 'needsAction', etag: 'etag-a',
+                updated: '2026-09-13T09:00:00.000Z',
+              }] })
+            : json({ error: 'temporary failure' }, 503);
+        }
+        if (url.pathname === '/tasks/v1/lists/list-b/tasks') {
+          return attempt === 1
+            ? json({ items: [{
+                id: 'task-b', title: 'Removed task', status: 'needsAction', etag: 'etag-b',
+                updated: '2026-09-13T09:00:00.000Z',
+              }] })
+            : json({ items: [] });
+        }
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes, additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    assert.deepEqual(await integrations.sync('google'), { outcome: 'synced', recordCount: 4 });
+    assert.deepEqual(store.listProviderRecords(10, 'task').map(record => record.externalId).sort(), ['task-a', 'task-b']);
+    assert.deepEqual(store.listProviderRecords(10, 'calendar_event').map(record => record.externalId).sort(), ['event-a', 'event-b']);
+
+    attempt = 2;
+    currentTime = new Date('2026-09-13T10:05:00.000Z');
+    const partial = await integrations.sync('google');
+    assert.equal(partial.outcome, 'failed');
+    assert.deepEqual(store.listProviderRecords(10, 'task').map(record => record.externalId), ['task-a']);
+    assert.deepEqual(store.listProviderRecords(10, 'calendar_event').map(record => record.externalId), ['event-a']);
+
+    const states = new Map(store.listSyncStates().map(state => [state.containerId, state]));
+    assert.deepEqual(states.get('list-a') && {
+      state: states.get('list-a')?.state,
+      successfulFetchAt: states.get('list-a')?.successfulFetchAt,
+      error: states.get('list-a')?.error,
+      connectionGeneration: states.get('list-a')?.connectionGeneration,
+    }, {
+      state: 'failed',
+      successfulFetchAt: '2026-09-13T10:00:00.000Z',
+      error: 'google.tasks: remote-error',
+      connectionGeneration: connectionId,
+    });
+    assert.deepEqual(states.get('list-b') && {
+      state: states.get('list-b')?.state,
+      successfulFetchAt: states.get('list-b')?.successfulFetchAt,
+      error: states.get('list-b')?.error,
+    }, {
+      state: 'fresh',
+      successfulFetchAt: '2026-09-13T10:05:00.000Z',
+      error: null,
+    });
+    assert.deepEqual(states.get('calendar-a') && {
+      state: states.get('calendar-a')?.state,
+      successfulFetchAt: states.get('calendar-a')?.successfulFetchAt,
+      coverageFrom: states.get('calendar-a')?.coverageFrom,
+      coverageTo: states.get('calendar-a')?.coverageTo,
+      error: states.get('calendar-a')?.error,
+    }, {
+      state: 'failed',
+      successfulFetchAt: '2026-09-13T10:00:00.000Z',
+      coverageFrom: '2026-08-30T10:05:00.000Z',
+      coverageTo: '2026-12-12T10:05:00.000Z',
+      error: 'google.calendar-events: remote-error',
+    });
+    assert.deepEqual(states.get('calendar-b') && {
+      state: states.get('calendar-b')?.state,
+      successfulFetchAt: states.get('calendar-b')?.successfulFetchAt,
+      error: states.get('calendar-b')?.error,
+    }, {
+      state: 'fresh',
+      successfulFetchAt: '2026-09-13T10:05:00.000Z',
+      error: null,
+    });
+  } finally {
+    store.close();
+  }
+});
+
+test('provider reads abort at their configured deadline without blocking other source discovery', async () => {
+  const store = openStore(':memory:');
+  const connectionId = 'timed-google-generation';
+  const scopes = ['https://www.googleapis.com/auth/tasks'];
+  let calendarSignal: AbortSignal | null | undefined;
+  let taskListsRead = false;
+  try {
+    store.saveConnection({
+      provider: 'google', connectionId, state: 'connected', scopes,
+      tokenEnvelope: serializeOAuthTokenEnvelope(sealOAuthTokenSet({
+        accessToken: 'timed-access', refreshToken: 'timed-refresh', scopes,
+        expiresAt: '2027-09-13T10:00:00.000Z', tokenType: 'Bearer',
+      }, masterKey, { provider: 'google', connectionId })),
+      connectedAt: '2026-09-13T10:00:00.000Z', updatedAt: '2026-09-13T10:00:00.000Z',
+      lastSyncedAt: null, lastError: null,
+    });
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test', tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-13T10:00:00.000Z'), providerReadTimeoutMs: 10,
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        if (url.pathname === '/calendar/v3/users/me/calendarList') {
+          calendarSignal = init?.signal;
+          return await new Promise<Response>((_resolve, reject) => {
+            const abort = () => reject(new Error('test request aborted'));
+            if (calendarSignal?.aborted) abort();
+            else calendarSignal?.addEventListener('abort', abort, { once: true });
+          });
+        }
+        if (url.pathname === '/tasks/v1/users/@me/lists') {
+          taskListsRead = true;
+          return json({ items: [] });
+        }
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes, additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    assert.equal((await integrations.sync('google')).outcome, 'failed');
+    assert.equal(calendarSignal?.aborted, true);
+    assert.equal(taskListsRead, true);
+  } finally {
+    store.close();
+  }
+});
+
 test('Google callback stores encrypted offline credentials and imports only read-only calendar/task fields', async () => {
   let currentTime = new Date('2026-09-11T10:00:00.000Z');
   const calls: Array<{ url: URL; method: string }> = [];
@@ -431,6 +621,34 @@ test('Google callback stores encrypted offline credentials and imports only read
       { kind: 'task', title: 'Renew library book', startsOn: null, dueOn: '2026-09-14', allDay: false },
     ]);
     const stored = store.getConnection('google');
+    const calendarState = store.listSyncStates().find(state => state.resourceKind === 'calendar');
+    const taskState = store.listSyncStates().find(state => state.resourceKind === 'task-list');
+    assert.deepEqual(calendarState && {
+      state: calendarState.state,
+      accountId: calendarState.accountId,
+      connectionGeneration: calendarState.connectionGeneration,
+      containerId: calendarState.containerId,
+      coverageFrom: calendarState.coverageFrom,
+      coverageTo: calendarState.coverageTo,
+      successfulFetchAt: calendarState.successfulFetchAt,
+    }, {
+      state: 'fresh',
+      accountId: stored?.connectionId,
+      connectionGeneration: stored?.connectionId,
+      containerId: 'primary',
+      coverageFrom: '2026-08-28T10:00:00.000Z',
+      coverageTo: '2026-12-10T10:00:00.000Z',
+      successfulFetchAt: '2026-09-11T10:00:00.000Z',
+    });
+    assert.deepEqual(taskState && {
+      state: taskState.state,
+      coverageFrom: taskState.coverageFrom,
+      coverageTo: taskState.coverageTo,
+      successfulFetchAt: taskState.successfulFetchAt,
+    }, {
+      state: 'fresh', coverageFrom: null, coverageTo: null,
+      successfulFetchAt: '2026-09-11T10:00:00.000Z',
+    });
     assert.ok(stored?.tokenEnvelope);
     assert.ok(!stored.tokenEnvelope.includes('test-access-token'));
     assert.ok(!stored.tokenEnvelope.includes('test-refresh-token'));

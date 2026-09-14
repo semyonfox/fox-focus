@@ -42,6 +42,8 @@ import {
 } from './store.ts';
 // Leave time for response handling and the final SQLite write before recovery.
 const DEFAULT_TASK_ACTION_TIMEOUT_MS = TASK_ACTION_LEASE_MS - 30_000;
+const DEFAULT_PROVIDER_READ_TIMEOUT_MS = 30_000;
+const MAX_PROVIDER_READ_TIMEOUT_MS = 5 * 60_000;
 
 const googleScopes = [
   'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
@@ -77,6 +79,7 @@ export type IntegrationConfig = {
   now?: () => Date;
   syncWindowPastDays?: number;
   syncWindowFutureDays?: number;
+  providerReadTimeoutMs?: number;
   taskActionTimeoutMs?: number;
 };
 
@@ -124,6 +127,7 @@ type RuntimeConfig = IntegrationConfig & {
   now: () => Date;
   syncWindowPastDays: number;
   syncWindowFutureDays: number;
+  providerReadTimeoutMs: number;
   taskActionTimeoutMs: number;
 };
 
@@ -262,12 +266,16 @@ function normalizeConfig(config: IntegrationConfig): RuntimeConfig {
   if (!baseUrl || !isOAuthTokenMasterKey(config.tokenMasterKey)) throw new Error('Invalid integration configuration');
   const past = config.syncWindowPastDays ?? 14;
   const future = config.syncWindowFutureDays ?? 90;
+  const providerReadTimeoutMs = config.providerReadTimeoutMs ?? DEFAULT_PROVIDER_READ_TIMEOUT_MS;
   const taskActionTimeoutMs = config.taskActionTimeoutMs ?? DEFAULT_TASK_ACTION_TIMEOUT_MS;
   if (!Number.isSafeInteger(past) || past < 0 || past > 366 || !Number.isSafeInteger(future) || future < 1 || future > 366) {
     throw new Error('Invalid integration sync window');
   }
   if (!Number.isSafeInteger(taskActionTimeoutMs) || taskActionTimeoutMs < 1 || taskActionTimeoutMs > DEFAULT_TASK_ACTION_TIMEOUT_MS) {
     throw new Error('Invalid task action timeout');
+  }
+  if (!Number.isSafeInteger(providerReadTimeoutMs) || providerReadTimeoutMs < 1 || providerReadTimeoutMs > MAX_PROVIDER_READ_TIMEOUT_MS) {
+    throw new Error('Invalid provider read timeout');
   }
   return {
     ...config,
@@ -277,6 +285,7 @@ function normalizeConfig(config: IntegrationConfig): RuntimeConfig {
     now: config.now ?? (() => new Date()),
     syncWindowPastDays: past,
     syncWindowFutureDays: future,
+    providerReadTimeoutMs,
     taskActionTimeoutMs,
   };
 }
@@ -402,6 +411,18 @@ function providerReadFailure(failure: ProviderReadFailure): SyncFailure {
   );
 }
 
+function providerClient(config: RuntimeConfig, accessToken: string) {
+  return {
+    accessToken,
+    fetch: config.fetch,
+    signal: AbortSignal.timeout(config.providerReadTimeoutMs),
+  };
+}
+
+function scopeError(failure: ProviderReadFailure): string {
+  return `${failure.operation}: ${failure.status}`;
+}
+
 function eventRecord(
   provider: Provider,
   calendar: ImportedCalendar,
@@ -454,7 +475,10 @@ function taskRecord(
     sourceUpdatedAt: task.updatedAt,
     sourceVersion: task.version,
     completionWritable: provider === 'google' && task.completionWritable !== false,
-    sourceUrl: null,
+    notes: task.notes,
+    parentId: task.parentId,
+    position: task.position,
+    sourceUrl: task.sourceUrl,
     sourceTimeZone: null,
   };
 }
@@ -467,40 +491,162 @@ function windowFor(config: RuntimeConfig): { timeMin: string; timeMax: string } 
   };
 }
 
-async function syncGoogle(config: RuntimeConfig, accessToken: string): Promise<ImportedRecord[]> {
-  const client = { accessToken, fetch: config.fetch };
-  const calendars = resultRecords(await listGoogleCalendars(client));
-  const taskLists = resultRecords(await listGoogleTaskLists(client));
-  const range = windowFor(config);
-  const records: ImportedRecord[] = [];
+type ScopedSyncResult = {
+  recordCount: number;
+  failures: ProviderReadFailure[];
+};
 
-  for (const calendar of calendars) {
-    const events = await listGoogleCalendarEvents(client, { calendarId: calendar.externalId, ...range });
-    if (events.status !== 'ok') throw providerReadFailure(events);
-    for (const event of events.value.events) {
-      const record = eventRecord('google', calendar, event);
-      if (record) records.push(record);
+async function syncGoogle(
+  store: Store,
+  config: RuntimeConfig,
+  accessToken: string,
+  connectionId: string,
+): Promise<ScopedSyncResult> {
+  const range = windowFor(config);
+  const failures: ProviderReadFailure[] = [];
+  let recordCount = 0;
+
+  const assertCurrentConnection = () => {
+    if (store.getConnection('google')?.connectionId !== connectionId) throw new ConnectionChanged();
+  };
+  const markFailed = (
+    resourceKind: 'calendar' | 'task-list',
+    containerId: string,
+    containerName: string,
+    failure: ProviderReadFailure,
+  ) => {
+    assertCurrentConnection();
+    const fetchedAt = config.now().toISOString();
+    store.markScopeFailed({
+      provider: 'google',
+      resourceKind,
+      accountId: connectionId,
+      connectionGeneration: connectionId,
+      containerId,
+      containerName,
+      coverageFrom: resourceKind === 'calendar' ? range.timeMin : null,
+      coverageTo: resourceKind === 'calendar' ? range.timeMax : null,
+      fetchedAt,
+    }, scopeError(failure));
+  };
+  const markKnownScopesFailed = (
+    resourceKind: 'calendar' | 'task-list',
+    failure: ProviderReadFailure,
+  ) => {
+    for (const state of store.listSyncStates()) {
+      if (
+        state.provider === 'google' && state.resourceKind === resourceKind &&
+        state.accountId === connectionId && state.connectionGeneration === connectionId
+      ) markFailed(resourceKind, state.containerId, state.containerName, failure);
+    }
+  };
+
+  const calendarResult = await listGoogleCalendars(providerClient(config, accessToken));
+  if (calendarResult.status !== 'ok') {
+    failures.push(calendarResult);
+    markKnownScopesFailed('calendar', calendarResult);
+  } else {
+    const discovered = new Set(calendarResult.value.records.map(calendar => calendar.externalId));
+    for (const calendar of calendarResult.value.records) {
+      const events = await listGoogleCalendarEvents(providerClient(config, accessToken), {
+        calendarId: calendar.externalId,
+        ...range,
+      });
+      if (events.status !== 'ok') {
+        failures.push(events);
+        markFailed('calendar', calendar.externalId, calendar.title, events);
+        continue;
+      }
+      const records = events.value.events.flatMap(event => {
+        const record = eventRecord('google', calendar, event);
+        return record ? [{ ...record, connectionId }] : [];
+      });
+      assertCurrentConnection();
+      recordCount += store.publishProviderScope({
+        provider: 'google',
+        resourceKind: 'calendar',
+        accountId: connectionId,
+        connectionGeneration: connectionId,
+        containerId: calendar.externalId,
+        containerName: calendar.title,
+        records,
+        coverageFrom: range.timeMin,
+        coverageTo: range.timeMax,
+        fetchedAt: config.now().toISOString(),
+      });
+    }
+    for (const state of store.listSyncStates()) {
+      if (
+        state.provider !== 'google' || state.resourceKind !== 'calendar' ||
+        state.accountId !== connectionId || state.connectionGeneration !== connectionId ||
+        discovered.has(state.containerId)
+      ) continue;
+      assertCurrentConnection();
+      store.publishProviderScope({
+        provider: 'google', resourceKind: 'calendar', accountId: connectionId,
+        connectionGeneration: connectionId, containerId: state.containerId, containerName: state.containerName,
+        records: [], coverageFrom: range.timeMin, coverageTo: range.timeMax, fetchedAt: config.now().toISOString(),
+      });
     }
   }
-  for (const list of taskLists) {
-    const tasks = resultRecords(await listGoogleTasks(client, { taskListId: list.externalId }));
-    for (const task of tasks) {
-      const record = taskRecord('google', list.externalId, list.title, task);
-      if (record) records.push(record);
+
+  const taskListResult = await listGoogleTaskLists(providerClient(config, accessToken));
+  if (taskListResult.status !== 'ok') {
+    failures.push(taskListResult);
+    markKnownScopesFailed('task-list', taskListResult);
+  } else {
+    const discovered = new Set(taskListResult.value.records.map(list => list.externalId));
+    for (const list of taskListResult.value.records) {
+      const tasks = await listGoogleTasks(providerClient(config, accessToken), { taskListId: list.externalId });
+      if (tasks.status !== 'ok') {
+        failures.push(tasks);
+        markFailed('task-list', list.externalId, list.title, tasks);
+        continue;
+      }
+      const records = tasks.value.records.flatMap(task => {
+        const record = taskRecord('google', list.externalId, list.title, task);
+        return record ? [{ ...record, connectionId }] : [];
+      });
+      assertCurrentConnection();
+      recordCount += store.publishProviderScope({
+        provider: 'google',
+        resourceKind: 'task-list',
+        accountId: connectionId,
+        connectionGeneration: connectionId,
+        containerId: list.externalId,
+        containerName: list.title,
+        records,
+        coverageFrom: null,
+        coverageTo: null,
+        fetchedAt: config.now().toISOString(),
+      });
+    }
+    for (const state of store.listSyncStates()) {
+      if (
+        state.provider !== 'google' || state.resourceKind !== 'task-list' ||
+        state.accountId !== connectionId || state.connectionGeneration !== connectionId ||
+        discovered.has(state.containerId)
+      ) continue;
+      assertCurrentConnection();
+      store.publishProviderScope({
+        provider: 'google', resourceKind: 'task-list', accountId: connectionId,
+        connectionGeneration: connectionId, containerId: state.containerId, containerName: state.containerName,
+        records: [], coverageFrom: null, coverageTo: null, fetchedAt: config.now().toISOString(),
+      });
     }
   }
-  return records;
+
+  return { recordCount, failures };
 }
 
 async function syncMicrosoft(config: RuntimeConfig, accessToken: string): Promise<ImportedRecord[]> {
-  const client = { accessToken, fetch: config.fetch };
-  const calendars = resultRecords(await listMicrosoftCalendars(client));
-  const taskLists = resultRecords(await listMicrosoftTodoLists(client));
+  const calendars = resultRecords(await listMicrosoftCalendars(providerClient(config, accessToken)));
+  const taskLists = resultRecords(await listMicrosoftTodoLists(providerClient(config, accessToken)));
   const range = windowFor(config);
   const records: ImportedRecord[] = [];
 
   for (const calendar of calendars) {
-    const events = resultRecords(await listMicrosoftCalendarView(client, {
+    const events = resultRecords(await listMicrosoftCalendarView(providerClient(config, accessToken), {
       calendarId: calendar.externalId,
       startDateTime: range.timeMin,
       endDateTime: range.timeMax,
@@ -511,7 +657,7 @@ async function syncMicrosoft(config: RuntimeConfig, accessToken: string): Promis
     }
   }
   for (const list of taskLists) {
-    const tasks = resultRecords(await listMicrosoftTodoTasks(client, { taskListId: list.externalId }));
+    const tasks = resultRecords(await listMicrosoftTodoTasks(providerClient(config, accessToken), { taskListId: list.externalId }));
     for (const task of tasks) {
       const record = taskRecord('microsoft', list.externalId, list.title, task);
       if (record) records.push(record);
@@ -674,10 +820,43 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
     store.setSyncState(provider, 'syncing');
     try {
       if (!expectedConnectionId) throw new SyncFailure(true);
-      const grant = await freshAccessToken(provider, expectedConnectionId);
-      const records = provider === 'google'
-        ? await syncGoogle(config, grant.accessToken)
-        : await syncMicrosoft(config, grant.accessToken);
+      const grant = await freshAccessToken(
+        provider,
+        expectedConnectionId,
+        AbortSignal.timeout(config.providerReadTimeoutMs),
+      );
+      if (provider === 'google') {
+        const result = await syncGoogle(store, config, grant.accessToken, grant.connectionId);
+        if (store.getConnection(provider)?.connectionId !== grant.connectionId) throw new ConnectionChanged();
+        if (result.failures.length > 0) {
+          const needsReconnect = result.failures.some(failure =>
+            failure.status === 'reauthorization-required' || failure.status === 'permission-denied');
+          const notice = needsReconnect
+            ? 'Google needs to be reconnected.'
+            : `Google refreshed ${result.recordCount} records, but ${result.failures.length} source${result.failures.length === 1 ? '' : 's'} failed.`;
+          store.setSyncState(provider, 'failed', notice);
+          const connection = store.getConnection(provider);
+          if (connection) {
+            store.saveConnection({
+              ...connection,
+              state: needsReconnect ? 'needs_reconnect' : connection.state,
+              lastError: notice,
+            });
+          }
+          return { outcome: 'failed', notice };
+        }
+        store.setSyncState(provider, 'idle');
+        const connection = store.getConnection(provider);
+        if (connection) {
+          store.saveConnection({
+            ...connection,
+            lastSyncedAt: config.now().toISOString(),
+            lastError: null,
+          });
+        }
+        return { outcome: 'synced', recordCount: result.recordCount };
+      }
+      const records = await syncMicrosoft(config, grant.accessToken);
       if (store.getConnection(provider)?.connectionId !== grant.connectionId) throw new ConnectionChanged();
       const recordCount = store.replaceProviderRecords(provider, records.map(record => ({ ...record, connectionId: grant.connectionId })));
       return { outcome: 'synced', recordCount };

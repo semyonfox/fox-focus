@@ -5,7 +5,9 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
 import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
+import { isDateKey } from '../src/calendar-time.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
+import { isInboxDecisionInput, isTaskPlanInput } from '../src/row-model.ts';
 import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
 import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
@@ -50,8 +52,9 @@ function tokenMatches(value: string, expected: string): boolean {
   return supplied.length === wanted.length && timingSafeEqual(supplied, wanted);
 }
 
-function isHermesApiPath(path: string): boolean {
-  return path === '/api/v1/task-status' || path === '/api/v1/task-proposals';
+function isHermesApiRequest(method: string, path: string): boolean {
+  return (method === 'GET' && (path === '/api/v1/context' || path === '/api/v1/changes' || path === '/api/v1/task-status')) ||
+    (method === 'POST' && path === '/api/v1/task-proposals');
 }
 
 function taskManagementStatus(error: TaskManagementError): 404 | 409 | 422 {
@@ -86,7 +89,7 @@ export function createApp(
   app.use('/api/*', async (c, next) => {
     const authorization = c.req.header('Authorization') ?? '';
     const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
-    if (isHermesApiPath(c.req.path) && options.taskStatusToken && tokenMatches(bearer, options.taskStatusToken)) {
+    if (isHermesApiRequest(c.req.method, c.req.path) && options.taskStatusToken && tokenMatches(bearer, options.taskStatusToken)) {
       await next();
       return;
     }
@@ -109,6 +112,68 @@ export function createApp(
   app.get('/healthz', (c) => c.json({ ok: true, mode: 'workspace' }));
   app.get('/app', (c) => c.redirect('/', 302));
   app.get('/api/v1/workspace', (c) => c.json(store.read()));
+  app.get('/api/v1/rows', (c) => c.json({
+    tasks: store.listTasks(),
+    taskPlans: store.listTaskPlans(),
+    inbox: store.listInboxItems(),
+    drafts: store.listDrafts(),
+    actions: store.listActions(),
+    reminders: store.listReminders(),
+    freshness: store.listSyncStates(),
+  }));
+  app.get('/api/v1/context', (c) => {
+    const from = c.req.query('from');
+    const to = c.req.query('to');
+    if (!from || !to || !isDateKey(from) || !isDateKey(to) || from > to) {
+      return c.json({ error: 'A valid from and to date are required' }, 400);
+    }
+    return c.json(store.readContext(from, to));
+  });
+  app.get('/api/v1/changes', (c) => {
+    const afterText = c.req.query('after') ?? '0';
+    const limitText = c.req.query('limit') ?? '100';
+    if (!/^\d+$/.test(afterText) || !/^\d+$/.test(limitText)) return c.json({ error: 'Invalid change cursor' }, 400);
+    const after = Number(afterText);
+    const limit = Number(limitText);
+    if (!Number.isSafeInteger(after) || !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+      return c.json({ error: 'Invalid change cursor' }, 400);
+    }
+    const page = store.listChanges(after, limit);
+    return page.resetRequired ? c.json({ error: 'Change cursor expired', resetRequired: true, cursor: page.cursor }, 410) : c.json(page);
+  });
+  app.put('/api/v1/tasks/:taskId/plan', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isTaskPlanInput(body)) return c.json({ error: 'Invalid task plan' }, 400);
+    const current = store.getTaskPlan(c.req.param('taskId'));
+    const updated = store.updateTaskPlan(c.req.param('taskId'), body.version, {
+      priority: body.priority,
+      waiting: body.waiting,
+      deadlineOn: body.deadlineOn,
+      plannedOn: body.plannedOn,
+      plannedAt: body.plannedAt,
+      estimateMinutes: body.estimateMinutes,
+    }, now().toISOString());
+    return updated ? c.json({ plan: updated }) : current
+      ? c.json({ error: 'Task plan changed', current }, 409)
+      : c.json({ error: 'Task not found' }, 404);
+  });
+  app.put('/api/v1/inbox-items/:inboxId', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isInboxDecisionInput(body)) return c.json({ error: 'Invalid Inbox decision' }, 400);
+    const current = store.getInboxItem(c.req.param('inboxId'));
+    const updated = store.updateInboxDecision(c.req.param('inboxId'), body.version, {
+      state: body.state,
+      outcome: body.outcome,
+      snoozedUntil: body.snoozedUntil,
+    }, now().toISOString());
+    return updated ? c.json({ item: updated }) : current
+      ? c.json({ error: 'Inbox item changed', current }, 409)
+      : c.json({ error: 'Inbox item not found' }, 404);
+  });
   app.get('/api/v1/push/public-key', (c) => options.pushPublicKey
     ? c.json({ publicKey: options.pushPublicKey })
     : c.json({ error: 'Push notifications are unavailable' }, 503));
@@ -384,6 +449,10 @@ export function createApp(
     }
     const data = body.data;
     const current = store.read();
+    if (JSON.stringify(data.tasks) !== JSON.stringify(current.data.tasks) ||
+      JSON.stringify(data.inboxItems) !== JSON.stringify(current.data.inboxItems)) {
+      return c.json({ error: 'Tasks and Inbox items use versioned row routes' }, 403);
+    }
     // Fixture calendar context stands in for authoritative imported records.
     const imported = current.data.events.filter(e => !e.editable);
     if (imported.some(e => JSON.stringify(data.events.find(next => next.id === e.id)) !== JSON.stringify(e)) ||

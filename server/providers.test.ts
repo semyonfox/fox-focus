@@ -199,7 +199,7 @@ test("Google calendar snapshots establish a cursor without bounded-window parame
   assertReadOnly(transport.requests);
 });
 
-test("Google Tasks follows pagination and requests completed, hidden, and deleted tasks without notes", async () => {
+test("Google Tasks keeps notes, hierarchy, position, and a safe source URL across pagination", async () => {
   const transport = queuedFetch(
     json({
       items: [{
@@ -210,7 +210,6 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
         due: "2026-09-12T00:00:00.000Z",
         completed: "2026-09-11T08:00:00Z",
         updated: "2026-09-11T08:00:00Z",
-        notes: "private task note",
       }, {
         id: "assigned",
         etag: '"assigned-v1"',
@@ -221,7 +220,23 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       }],
       nextPageToken: "next",
     }),
-    json({ items: [{ id: "deleted", etag: '"deleted-v1"', title: "Old item", deleted: true }] }),
+    json({
+      items: [{
+        id: "nested",
+        title: "File renewal receipt",
+        status: "needsAction",
+        notes: "Renew through the library portal",
+        parent: "admin",
+        position: "00000000000000000001",
+        webViewLink: "https://tasks.google.com/task/nested",
+        body: "unrelated provider body",
+      }, {
+        id: "deleted",
+        etag: '"deleted-v1"',
+        title: "Old item",
+        deleted: true,
+      }],
+    }),
   );
 
   const result = await listGoogleTasks(client(transport.fetch), { taskListId: "list/with slash" });
@@ -234,6 +249,10 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       taskListId: "list/with slash",
       externalId: "done",
       title: "Renew library book",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
       state: "completed",
       sourceState: "completed",
       dueDate: "2026-09-12",
@@ -247,6 +266,10 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       taskListId: "list/with slash",
       externalId: "assigned",
       title: "Source-managed assignment",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
       state: "open",
       sourceState: "needsAction",
       dueDate: null,
@@ -259,8 +282,29 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
     {
       provider: "google",
       taskListId: "list/with slash",
+      externalId: "nested",
+      title: "File renewal receipt",
+      notes: "Renew through the library portal",
+      parentId: "admin",
+      position: "00000000000000000001",
+      sourceUrl: "https://tasks.google.com/task/nested",
+      state: "open",
+      sourceState: "needsAction",
+      dueDate: null,
+      completedAt: null,
+      updatedAt: null,
+      version: null,
+      isDeleted: false,
+    },
+    {
+      provider: "google",
+      taskListId: "list/with slash",
       externalId: "deleted",
       title: "Old item",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
       state: "open",
       sourceState: "deleted",
       dueDate: null,
@@ -270,7 +314,7 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       isDeleted: true,
     },
   ]);
-  assert.ok(!JSON.stringify(result).includes("private task note"));
+  assert.ok(!JSON.stringify(result).includes("unrelated provider body"));
   const first = new URL(transport.requests[0].url);
   assert.equal(first.pathname, "/tasks/v1/lists/list%2Fwith%20slash/tasks");
   assert.equal(first.searchParams.get("showAssigned"), "true");
@@ -279,8 +323,32 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
   assert.equal(first.searchParams.get("showDeleted"), "true");
   assert.ok(first.searchParams.get("fields")?.includes("etag"));
   assert.ok(first.searchParams.get("fields")?.includes("assignmentInfo"));
-  assert.ok(!first.searchParams.get("fields")?.includes("notes"));
+  assert.ok(first.searchParams.get("fields")?.includes("notes"));
+  assert.ok(first.searchParams.get("fields")?.includes("parent"));
+  assert.ok(first.searchParams.get("fields")?.includes("position"));
+  assert.ok(first.searchParams.get("fields")?.includes("webViewLink"));
+  assert.ok(!first.searchParams.get("fields")?.includes("body"));
   assert.equal(new URL(transport.requests[1].url).searchParams.get("pageToken"), "next");
+  assertReadOnly(transport.requests);
+});
+
+test("Google Tasks rejects an untrusted task source URL", async () => {
+  const transport = queuedFetch(json({
+    items: [{
+      id: "task-1",
+      title: "Review notes",
+      status: "needsAction",
+      webViewLink: "https://tasks.google.com.example.test/task/task-1",
+    }],
+  }));
+
+  const result = await listGoogleTasks(client(transport.fetch), { taskListId: "list-1" });
+
+  assert.deepEqual(result, {
+    status: "invalid-response",
+    provider: "google",
+    operation: "google.tasks",
+  });
   assertReadOnly(transport.requests);
 });
 
@@ -319,6 +387,10 @@ test("Google task completion patches only status with an ETag and verifies an ex
         taskListId: "list/with slash",
         externalId: "task/id",
         title: "Renew library book",
+        notes: null,
+        parentId: null,
+        position: null,
+        sourceUrl: null,
         state: "completed",
         sourceState: "completed",
         dueDate: null,
@@ -349,7 +421,7 @@ test("Google task completion patches only status with an ETag and verifies an ex
   assert.equal(readbackUrl.pathname, patchUrl.pathname);
   assert.equal(
     readbackUrl.searchParams.get("fields"),
-    "id,title,status,due,completed,updated,deleted,etag,assignmentInfo",
+    "id,title,notes,parent,position,webViewLink,status,due,completed,updated,deleted,etag,assignmentInfo",
   );
   assert.equal(headers(readback).get("if-match"), null);
 });
@@ -603,6 +675,10 @@ test("Microsoft To Do requests no body fields, maps task states, and rejects unt
     taskListId: "tasks-list",
     externalId: "todo-1",
     title: "Submit assignment",
+    notes: null,
+    parentId: null,
+    position: null,
+    sourceUrl: null,
     state: "completed",
     sourceState: "completed",
     dueDate: "2026-09-18",

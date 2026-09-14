@@ -19,6 +19,7 @@ import type {
   HermesTaskAnnotationInput,
 } from '../src/hermes-model.ts';
 import { isPushSubscription, type StoredPushDelivery, type StoredPushSubscription } from './push.ts';
+import { createRowStore, initializeRowStore } from './row-store.ts';
 
 export type Snapshot = { revision: number; data: PrototypeData };
 export type Provider = 'google' | 'microsoft';
@@ -68,6 +69,9 @@ export type ImportedRecord = {
   sourceVersion?: string | null;
   connectionId?: string | null;
   completionWritable?: boolean;
+  notes?: string | null;
+  parentId?: string | null;
+  position?: string | null;
   sourceUrl: string | null;
   sourceTimeZone: string | null;
 };
@@ -240,6 +244,9 @@ function rowToRecord(row: Record<string, unknown>): StoredRecord | null {
     sourceVersion: stringOrNull(row.source_version),
     connectionId: stringOrNull(row.connection_id),
     completionWritable: booleanFromInteger(row.completion_writable),
+    notes: stringOrNull(row.notes),
+    parentId: stringOrNull(row.parent_id),
+    position: stringOrNull(row.position),
     sourceUrl: stringOrNull(row.source_url),
     sourceTimeZone: stringOrNull(row.source_time_zone),
     importedAt: row.imported_at,
@@ -438,6 +445,9 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       completion_writable INTEGER NOT NULL DEFAULT 0 CHECK(completion_writable IN (0, 1)),
       source_url TEXT,
       source_time_zone TEXT,
+      notes TEXT,
+      parent_id TEXT,
+      position TEXT,
       imported_at TEXT NOT NULL,
       sync_marker TEXT NOT NULL,
       deleted_at TEXT,
@@ -592,6 +602,9 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   if (!recordColumns.has('source_version')) db.exec('ALTER TABLE provider_records ADD COLUMN source_version TEXT');
   if (!recordColumns.has('connection_id')) db.exec('ALTER TABLE provider_records ADD COLUMN connection_id TEXT');
   if (!recordColumns.has('completion_writable')) db.exec('ALTER TABLE provider_records ADD COLUMN completion_writable INTEGER NOT NULL DEFAULT 0');
+  if (!recordColumns.has('notes')) db.exec('ALTER TABLE provider_records ADD COLUMN notes TEXT');
+  if (!recordColumns.has('parent_id')) db.exec('ALTER TABLE provider_records ADD COLUMN parent_id TEXT');
+  if (!recordColumns.has('position')) db.exec('ALTER TABLE provider_records ADD COLUMN position TEXT');
   const connectionColumns = new Set((db.prepare('PRAGMA table_info(provider_connections)').all() as Record<string, unknown>[])
     .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
   if (!connectionColumns.has('connection_id')) db.exec('ALTER TABLE provider_connections ADD COLUMN connection_id TEXT');
@@ -612,9 +625,16 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   const proposalColumns = new Set((db.prepare('PRAGMA table_info(agent_proposals)').all() as Record<string, unknown>[])
     .flatMap(column => typeof column.name === 'string' ? [column.name] : []));
   if (!proposalColumns.has('request_hash')) db.exec("ALTER TABLE agent_proposals ADD COLUMN request_hash TEXT NOT NULL DEFAULT 'legacy'");
-  db.exec('PRAGMA user_version=7;');
+  if (previousSchemaVersion < 7) db.exec('PRAGMA user_version=7;');
   db.prepare('INSERT OR IGNORE INTO workspace VALUES (1, 0, ?, ?)')
     .run(JSON.stringify(initialData), new Date().toISOString());
+  const workspaceForMigration = db.prepare('SELECT data FROM workspace WHERE id=1').get() as Record<string, unknown> | undefined;
+  const parsedWorkspace: unknown = typeof workspaceForMigration?.data === 'string'
+    ? JSON.parse(workspaceForMigration.data)
+    : null;
+  if (!isPrototypeData(parsedWorkspace)) throw new Error('Invalid stored workspace');
+  initializeRowStore(db, previousSchemaVersion, parsedWorkspace);
+  const rows = createRowStore(db);
 
   function read(): Snapshot {
     const row = db.prepare('SELECT revision, data FROM workspace WHERE id=1').get() as Record<string, unknown> | undefined;
@@ -742,8 +762,9 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     const upsert = db.prepare(`INSERT INTO provider_records (
       provider, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
-      completion_writable, source_url, source_time_zone, imported_at, sync_marker, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      completion_writable, source_url, source_time_zone, imported_at, sync_marker, deleted_at,
+      notes, parent_id, position
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
     ON CONFLICT(provider, kind, container_id, external_id) DO UPDATE SET
       connection_id=excluded.connection_id, container_name=excluded.container_name, title=excluded.title, status=excluded.status,
       starts_at=excluded.starts_at, ends_at=excluded.ends_at,
@@ -752,7 +773,8 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       source_updated_at=excluded.source_updated_at, source_version=excluded.source_version,
       completion_writable=excluded.completion_writable, source_url=excluded.source_url,
       source_time_zone=excluded.source_time_zone, imported_at=excluded.imported_at,
-      sync_marker=excluded.sync_marker, deleted_at=NULL`);
+      sync_marker=excluded.sync_marker, deleted_at=NULL,
+      notes=excluded.notes, parent_id=excluded.parent_id, position=excluded.position`);
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const record of records) {
@@ -763,6 +785,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
           record.completedAt, record.sourceUpdatedAt, record.sourceVersion ?? null,
           (record.completionWritable ?? (record.provider === 'google' && record.kind === 'task')) ? 1 : 0,
           record.sourceUrl, record.sourceTimeZone, now, marker,
+          record.notes ?? null, record.parentId ?? null, record.position ?? null,
         );
       }
       // Each provider read is a complete rolling snapshot. Retain only records
@@ -1138,7 +1161,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   function getProviderRecord(id: number): StoredRecord | null {
     const row = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
-      completion_writable,
+      completion_writable, notes, parent_id, position,
       source_url, source_time_zone, imported_at
       FROM provider_records WHERE id=? AND deleted_at IS NULL`).get(id) as Record<string, unknown> | undefined;
     return row ? rowToRecord(row) : null;
@@ -1153,7 +1176,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
   ): StoredRecord | null {
     const row = db.prepare(`SELECT id, provider, connection_id, kind, container_id, container_name, external_id, title, status,
       starts_at, ends_at, starts_on, ends_on, all_day, due_on, completed_at, source_updated_at, source_version,
-      completion_writable, source_url, source_time_zone, imported_at
+      completion_writable, notes, parent_id, position, source_url, source_time_zone, imported_at
       FROM provider_records WHERE deleted_at IS NULL AND provider=? AND kind=? AND connection_id=? AND container_id=? AND external_id=?`)
       .get(provider, kind, connectionId, containerId, externalId) as Record<string, unknown> | undefined;
     return row ? rowToRecord(row) : null;
@@ -1452,35 +1475,31 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
 
   function addAgentProposal(idempotencyKey: string, requestHash: string, item: InboxItem, now: string): { created: boolean; conflict: boolean; snapshot: Snapshot; inboxItemId: string } {
     if (!isInboxItem(item)) throw new Error('Invalid agent proposal');
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const existing = db.prepare('SELECT inbox_item_id, request_hash FROM agent_proposals WHERE idempotency_key=?')
-        .get(idempotencyKey) as Record<string, unknown> | undefined;
-      if (typeof existing?.inbox_item_id === 'string') {
-        db.exec('COMMIT');
-        return {
-          created: false,
-          conflict: existing.request_hash !== requestHash,
-          snapshot: read(),
-          inboxItemId: existing.inbox_item_id,
-        };
-      }
-      const snapshot = read();
-      const data = { ...snapshot.data, inboxItems: [item, ...snapshot.data.inboxItems] };
-      if (!isPrototypeData(data)) throw new Error('Agent proposal produced an invalid workspace');
-      db.prepare('UPDATE workspace SET revision=revision+1, data=?, updated_at=? WHERE id=1')
-        .run(JSON.stringify(data), now);
-      db.prepare('INSERT INTO agent_proposals (idempotency_key, request_hash, inbox_item_id, created_at) VALUES (?, ?, ?, ?)')
-        .run(idempotencyKey, requestHash, item.id, now);
-      db.exec('COMMIT');
-      return { created: true, conflict: false, snapshot: read(), inboxItemId: item.id };
-    } catch (error) {
-      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
-      throw error;
-    }
+    const result = rows.addLegacyProposal(idempotencyKey, requestHash, {
+      id: item.id,
+      version: 1,
+      source: { kind: 'hermes', reference: `proposal:${idempotencyKey}` },
+      title: item.title,
+      summary: item.summary,
+      state: 'open',
+      outcome: null,
+      taskId: null,
+      currentDraftId: null,
+      likelyNoise: false,
+      snoozedUntil: null,
+      createdAt: now,
+      updatedAt: now,
+    }, now);
+    return {
+      created: result.created,
+      conflict: result.conflict,
+      snapshot: read(),
+      inboxItemId: result.item.id,
+    };
   }
 
   return {
+    ...rows,
     read,
     save,
     getConnection,
