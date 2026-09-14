@@ -30,6 +30,9 @@ import {
   type ReplyEnvelope,
   type SyncStateRow,
   type TaskCreateInput,
+  type MigrationPayload,
+  type TaskMigrationPreview,
+  type TaskMigrationPreviewItem,
   type TaskPlanRow,
   type TaskRow,
   type TaskWithPlan,
@@ -1062,8 +1065,14 @@ export type TaskCreateSettlement =
   | { outcome: 'unknown'; notice: string; candidateExternalId?: string }
   | { outcome: 'conflict'; notice: string; candidates: readonly TaskCreateCandidate[] };
 
+export type TaskCreateActionPayload =
+  | Extract<ActionRow['payload'], { kind: 'task-create' }>
+  | (MigrationPayload & { operation: 'create'; nonce: string });
+
+export type TaskCreateAction = ActionRow & { payload: TaskCreateActionPayload };
+
 export type TaskCreateClaim = {
-  action: ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> };
+  action: TaskCreateAction;
   mode: 'create' | 'reconcile';
 };
 
@@ -1074,6 +1083,18 @@ export type TaskCreateQueueResult =
   | { outcome: 'idempotency_conflict'; action: ActionRow }
   | { outcome: 'inbox_not_found'; inbox: null }
   | { outcome: 'inbox_conflict'; inbox: InboxItemRow };
+
+export type TaskMigrationApprovalResult =
+  | { outcome: 'queued' | 'replayed'; migrationId: string; actions: ActionRow[] }
+  | { outcome: 'conflict'; migrationId: string; actions: ActionRow[] };
+
+function asTaskCreateAction(action: ActionRow | null): TaskCreateAction | null {
+  if (!action) return null;
+  if (action.payload.kind === 'task-create') return action as TaskCreateAction;
+  if (action.payload.kind === 'task-migration' && action.payload.operation === 'create' &&
+    typeof action.payload.nonce === 'string') return action as TaskCreateAction;
+  return null;
+}
 
 export function createRowStore(db: DatabaseSync) {
   function listTasks(): TaskRow[] {
@@ -1555,7 +1576,7 @@ export function createRowStore(db: DatabaseSync) {
   }
 
   function transitionTaskCreateAction(
-    action: ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> },
+    action: TaskCreateAction,
     state: 'succeeded' | 'failed' | 'conflict' | 'unknown',
     now: string,
     receipt: Record<string, unknown> | null,
@@ -1579,7 +1600,7 @@ export function createRowStore(db: DatabaseSync) {
   }
 
   function bindCreatedTask(
-    action: ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> },
+    action: TaskCreateAction,
     externalId: string,
     current: TaskStatusRemoteSnapshot,
     now: string,
@@ -1697,11 +1718,23 @@ export function createRowStore(db: DatabaseSync) {
     const conflict = forceConflict ?? (destinationUnavailable
       ? 'The destination list disappeared while Google task creation was being confirmed.'
       : null);
+    const migrationMapping = action.payload.kind === 'task-migration' ? {
+      migrationId: action.payload.migrationId,
+      sourceKey: action.payload.sourceKey,
+      localTaskId: task.id,
+    } : {};
     return transitionTaskCreateAction(
       action,
       conflict ? 'conflict' : 'succeeded',
       now,
-      { providerId: externalId, verifiedAt: now, sourceVersion: current.version, via, destinationUnavailable },
+      {
+        ...migrationMapping,
+        providerId: externalId,
+        verifiedAt: now,
+        sourceVersion: current.version,
+        via,
+        destinationUnavailable,
+      },
       conflict,
       null,
       'provider',
@@ -1792,12 +1825,12 @@ export function createRowStore(db: DatabaseSync) {
       if (input.provider === 'google' && input.resourceKind === 'task-list') {
         const pendingRows = db.prepare(`SELECT actions.* FROM actions
           JOIN tasks ON tasks.id=actions.task_id AND tasks.binding_kind='pending'
-          WHERE actions.kind='task-create' AND actions.state IN ('running', 'unknown')
+          WHERE actions.kind IN ('task-create', 'task-migration') AND actions.state IN ('running', 'unknown')
             AND tasks.account_id=? AND tasks.list_id=?`).all(input.accountId, input.containerId) as Record<string, unknown>[];
         for (const row of pendingRows) {
           const parsed = actionFromSql(row);
-          if (!parsed || parsed.payload.kind !== 'task-create') continue;
-          const action = parsed as ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> };
+          const action = asTaskCreateAction(parsed);
+          if (!action) continue;
           const matches = input.records.filter(record => record.provider === 'google' && record.kind === 'task' &&
             record.containerId === input.containerId &&
             hasTaskCreateMarker(record.notes, action.payload.nonce));
@@ -2181,6 +2214,499 @@ export function createRowStore(db: DatabaseSync) {
       action.createdAt,
       action.updatedAt,
     );
+  }
+
+  function migrationActions(migrationId: string): ActionRow[] {
+    const rows = db.prepare(`SELECT * FROM actions
+      WHERE kind='task-migration' AND json_extract(payload_json, '$.migrationId')=?
+      ORDER BY created_at, id`).all(migrationId) as Record<string, unknown>[];
+    return rows.flatMap(row => {
+      const action = actionFromSql(row);
+      return action?.payload.kind === 'task-migration' ? [action] : [];
+    });
+  }
+
+  function listTaskMigrationRuns(limit = 20): Array<{ migrationId: string; updatedAt: string }> {
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const rows = db.prepare(`SELECT json_extract(payload_json, '$.migrationId') AS migration_id,
+        MAX(updated_at) AS updated_at
+      FROM actions WHERE kind='task-migration'
+      GROUP BY json_extract(payload_json, '$.migrationId')
+      ORDER BY updated_at DESC, migration_id DESC LIMIT ?`).all(safeLimit) as Record<string, unknown>[];
+    return rows.flatMap(row =>
+      typeof row.migration_id === 'string' && /^migration-[a-f0-9]{32}$/.test(row.migration_id) &&
+      typeof row.updated_at === 'string'
+        ? [{ migrationId: row.migration_id, updatedAt: row.updated_at }]
+        : []);
+  }
+
+  function isHermesTaskCoveredByMigration(boardSlug: string, taskId: string): boolean {
+    if (!boardSlug || !taskId || boardSlug.length > 200 || taskId.length > 200) return false;
+    return Boolean(db.prepare(`SELECT 1 FROM actions
+      WHERE kind='task-migration' AND state IN ('queued', 'running', 'unknown', 'succeeded', 'failed', 'conflict')
+        AND (
+          (json_extract(payload_json, '$.source.kind')='hermes'
+            AND json_extract(payload_json, '$.source.boardSlug')=?
+            AND json_extract(payload_json, '$.source.taskId')=?)
+          OR (?='personal-tasks' AND json_extract(payload_json, '$.sourceSnapshot.relatedHermes.id')=?)
+          OR EXISTS (
+            SELECT 1 FROM json_each(actions.payload_json, '$.sourceAliases') AS alias
+            WHERE json_extract(alias.value, '$.kind')='hermes'
+              AND json_extract(alias.value, '$.boardSlug')=?
+              AND json_extract(alias.value, '$.taskId')=?
+          )
+        ) LIMIT 1`).get(boardSlug, taskId, boardSlug, taskId, boardSlug, taskId));
+  }
+
+  function updateMigrationPlan(taskId: string, desired: TaskMigrationPreviewItem['plan'], now: string, actionId: string): void {
+    const current = getTaskPlan(taskId);
+    if (!current) throw new Error('Migration task plan is missing');
+    const same = current.priority === desired.priority && current.waiting === desired.waiting &&
+      current.deadlineOn === desired.deadlineOn && current.plannedOn === desired.plannedOn &&
+      current.plannedAt === desired.plannedAt && current.estimateMinutes === desired.estimateMinutes;
+    if (same) return;
+    const version = current.version + 1;
+    db.prepare(`UPDATE task_plans SET version=?, priority=?, waiting=?, deadline_on=?, planned_on=?, planned_at=?,
+      estimate_minutes=?, updated_at=? WHERE task_id=? AND version=?`).run(
+      version,
+      desired.priority,
+      desired.waiting ? 1 : 0,
+      desired.deadlineOn,
+      desired.plannedOn,
+      desired.plannedAt,
+      desired.estimateMinutes,
+      now,
+      taskId,
+      current.version,
+    );
+    const next = getTaskPlan(taskId);
+    if (!next) throw new Error('Migration task plan disappeared');
+    insertChange(db, {
+      actor: 'owner', mutationKey: `owner:task-migration-plan:${actionId}:${version}`, entityKind: 'task-plan',
+      entityId: taskId, entityVersion: version, operation: 'upsert', snapshot: planSnapshot(next),
+      details: { actionId, migration: true }, at: now,
+    });
+  }
+
+  function addMigrationReminder(
+    taskId: string,
+    reminder: TaskMigrationPreviewItem['reminder'],
+    now: string,
+    actionId: string,
+  ): void {
+    if (!reminder) return;
+    const existing = db.prepare('SELECT * FROM reminders WHERE id=?').get(reminder.id) as Record<string, unknown> | undefined;
+    if (existing) {
+      if (existing.target_kind !== 'task' || existing.target_id !== taskId || existing.fire_at !== reminder.fireAt) {
+        throw new Error('Migration reminder identity is already in use');
+      }
+      return;
+    }
+    const row: ReminderRow = {
+      id: reminder.id,
+      version: 1,
+      target: { kind: 'task', id: taskId },
+      fireAt: reminder.fireAt,
+      state: 'scheduled',
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.prepare(`INSERT INTO reminders (
+      id, version, target_kind, target_id, fire_at, state, legacy_json, created_at, updated_at
+    ) VALUES (?, 1, 'task', ?, ?, 'scheduled', NULL, ?, ?)`).run(
+      row.id,
+      taskId,
+      row.fireAt,
+      now,
+      now,
+    );
+    insertChange(db, {
+      actor: 'owner', mutationKey: `owner:task-migration-reminder:${actionId}`, entityKind: 'reminder',
+      entityId: row.id, entityVersion: 1, operation: 'upsert', snapshot: reminderSnapshot(row),
+      details: { actionId, migration: true }, at: now,
+    });
+  }
+
+  function migrationReminderSnapshot(taskId: string): TaskMigrationPreviewItem['preservedReminders'] {
+    return listReminders()
+      .filter(reminder => reminder.target.kind === 'task' && reminder.target.id === taskId)
+      .map(reminder => ({
+        id: reminder.id,
+        version: reminder.version,
+        fireAt: reminder.fireAt,
+        state: reminder.state,
+      }))
+      .sort((first, second) => first.id.localeCompare(second.id));
+  }
+
+  function approveTaskMigration(
+    preview: TaskMigrationPreview,
+    idempotencyKey: string,
+    now: string,
+  ): TaskMigrationApprovalResult {
+    const migrationId = `migration-${createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 32)}`;
+    const expectedPreviewHash = createHash('sha256').update(canonicalJson({
+      accountId: preview.accountId,
+      items: preview.items,
+      blockers: preview.blockers,
+    })).digest('hex');
+    if (preview.hash !== expectedPreviewHash || preview.blockers.length > 0 || preview.items.length === 0) {
+      return { outcome: 'conflict', migrationId, actions: migrationActions(migrationId) };
+    }
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = migrationActions(migrationId);
+      if (existing.length > 0) {
+        const samePreview = existing.length === preview.items.length && existing.every(action =>
+          action.payload.kind === 'task-migration' && action.payload.previewHash === preview.hash);
+        db.exec('COMMIT');
+        return { outcome: samePreview ? 'replayed' : 'conflict', migrationId, actions: existing };
+      }
+
+      const actions: ActionRow[] = [];
+      for (const item of preview.items) {
+        const actionId = randomUUID();
+        const currentTask = getTask(item.localTaskId);
+        const currentPlan = getTaskPlan(item.localTaskId);
+        const freshDestination = typeof preview.connectionGeneration === 'string'
+          ? db.prepare(`SELECT 1 FROM sync_state
+              WHERE provider='google' AND resource_kind='task-list' AND account_id=? AND container_id=?
+                AND connection_generation=? AND container_name=? AND state='fresh'
+                AND successful_fetch_at IS NOT NULL`).get(
+              item.destination.accountId,
+              item.destination.listId,
+              preview.connectionGeneration,
+              item.destination.listName,
+            )
+          : undefined;
+        if (item.operation === 'bind' && !freshDestination) {
+          throw new Error('Migration destination is not fresh');
+        }
+        if (item.expectedTaskVersion !== null && currentTask?.version !== item.expectedTaskVersion) {
+          throw new Error('Migration task source changed');
+        }
+        if (item.expectedPlanVersion !== null && currentPlan?.version !== item.expectedPlanVersion) {
+          throw new Error('Migration task plan changed');
+        }
+        if (item.expectedTaskVersion === null && currentTask) {
+          throw new Error('Migration task target already exists');
+        }
+        if (canonicalHash(migrationReminderSnapshot(item.localTaskId)) !== canonicalHash(item.preservedReminders)) {
+          throw new Error('Migration task reminders changed');
+        }
+        const resumedAction = item.replacesActionId ? getAction(item.replacesActionId) : null;
+        if (item.replacesActionId && (
+          !resumedAction || resumedAction.payload.kind !== 'task-migration' ||
+          resumedAction.payload.operation !== 'create' || resumedAction.payload.taskId !== item.localTaskId ||
+          !currentTask || currentTask.binding.kind !== 'pending' ||
+          currentTask.binding.createActionId !== resumedAction.id ||
+          typeof resumedAction.receipt?.providerId === 'string' ||
+          (resumedAction.state !== 'conflict' &&
+            !(resumedAction.state === 'failed' && resumedAction.nextAttemptAt === null)) ||
+          item.resumeMode !== (resumedAction.state === 'failed' ? 'create' : 'reconcile')
+        )) {
+          throw new Error('Terminal migration create is no longer recoverable');
+        }
+        if (!item.replacesActionId && item.resumeMode !== null) {
+          throw new Error('Migration resume mode has no prior action');
+        }
+        const outgoing = item.operation === 'create' ? item.outgoing : null;
+        if (item.operation === 'create' && (!outgoing || !item.outgoing || item.existingExternalId !== null)) {
+          throw new Error('Invalid migration create preview');
+        }
+        if (item.operation === 'bind' && (!item.targetSnapshot || !item.existingExternalId || item.outgoing !== null)) {
+          throw new Error('Invalid migration bind preview');
+        }
+        const nonce = item.operation === 'create'
+          ? item.outgoing?.notes.match(/(?:^|\n)Fox-Focus-ID: ([A-Za-z0-9_-]+)(?:\n|$)/)?.[1] ?? null
+          : null;
+        if (item.operation === 'create' && !nonce) throw new Error('Migration create nonce is missing');
+        const payload: MigrationPayload = {
+          kind: 'task-migration',
+          migrationId,
+          previewHash: preview.hash,
+          sourceKey: item.sourceKey,
+          sourceSnapshot: item.sourceSnapshot,
+          operation: item.operation,
+          taskId: item.localTaskId,
+          source: item.source,
+          sourceAliases: item.sourceAliases,
+          destination: { accountId: item.destination.accountId, listId: item.destination.listId },
+          destinationName: item.destination.listName,
+          existingExternalId: item.existingExternalId,
+          targetSnapshot: item.targetSnapshot,
+          nonce,
+          title: outgoing?.title ?? item.targetSnapshot?.title ?? item.title,
+          notes: outgoing?.notes ?? '',
+          doOn: outgoing?.doOn ?? item.targetSnapshot?.doOn ?? null,
+          plan: item.plan,
+          reminder: item.reminder,
+          preservedReminders: item.preservedReminders,
+          resumedFromActionId: item.replacesActionId,
+        };
+        const operationKey = `task-migration:${migrationId}:${createHash('sha256').update(item.sourceKey).digest('hex').slice(0, 32)}`;
+        const action: ActionRow = {
+          id: actionId,
+          version: 1,
+          payload,
+          operationKey,
+          requestHash: canonicalHash(payload),
+          approval: { actor: 'owner', at: now, previewText: item.approvalText },
+          state: item.operation === 'bind'
+            ? 'succeeded'
+            : item.resumeMode === 'reconcile' ? 'unknown' : 'queued',
+          attemptCount: 0,
+          nextAttemptAt: item.operation === 'create' ? now : null,
+          claimId: null,
+          leaseUntil: null,
+          receipt: item.operation === 'bind' ? {
+            migrationId,
+            sourceKey: item.sourceKey,
+            localTaskId: item.localTaskId,
+            providerId: item.existingExternalId,
+            verifiedAt: now,
+            sourceVersion: item.targetSnapshot?.etag ?? null,
+            via: 'existing-id',
+          } : item.replacesActionId ? {
+            resumedFromActionId: item.replacesActionId,
+            ...(typeof resumedAction?.receipt?.candidateExternalId === 'string'
+              ? { candidateExternalId: resumedAction.receipt.candidateExternalId }
+              : {}),
+          } : null,
+          error: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        if (resumedAction) {
+          const resumedVersion = resumedAction.version + 1;
+          db.prepare(`UPDATE actions SET version=?, state='superseded', next_attempt_at=NULL,
+            claim_id=NULL, lease_until=NULL, error=?, updated_at=? WHERE id=? AND version=?`).run(
+            resumedVersion,
+            `Superseded by migration action ${action.id}.`,
+            now,
+            resumedAction.id,
+            resumedAction.version,
+          );
+          const superseded = getAction(resumedAction.id);
+          if (!superseded) throw new Error('Superseded migration action disappeared');
+          insertChange(db, {
+            actor: 'owner', mutationKey: `owner:task-migration-supersede:${resumedAction.id}:${resumedVersion}`,
+            entityKind: 'action', entityId: resumedAction.id, entityVersion: resumedVersion,
+            operation: 'transition', snapshot: actionSnapshot(superseded),
+            details: { before: resumedAction.state, after: 'superseded', replacementActionId: action.id }, at: now,
+          });
+        }
+
+        if (item.operation === 'create') {
+          const current = getTask(item.localTaskId);
+          if (resumedAction) {
+            if (!current || current.binding.kind !== 'pending' ||
+              current.binding.createActionId !== resumedAction.id) {
+              throw new Error('Terminal migration task changed');
+            }
+            const version = current.version + 1;
+            db.prepare(`UPDATE tasks SET version=?, account_id=?, list_id=?, create_action_id=?,
+              unavailable_at=NULL, updated_at=? WHERE id=? AND version=?`).run(
+              version,
+              item.destination.accountId,
+              item.destination.listId,
+              action.id,
+              now,
+              current.id,
+              current.version,
+            );
+            const pending = getTask(current.id);
+            if (!pending) throw new Error('Resumed migration task disappeared');
+            insertChange(db, {
+              actor: 'owner', mutationKey: `owner:task-migration-resume:${action.id}:${version}`,
+              entityKind: 'task', entityId: current.id, entityVersion: version,
+              operation: 'transition', snapshot: taskSnapshot(pending),
+              details: { actionId: action.id, resumedFromActionId: resumedAction.id }, at: now,
+            });
+          } else if (item.source.kind === 'fox') {
+            if (!current || current.version !== item.source.version || current.binding.kind !== 'legacy') {
+              throw new Error('Fox Focus migration source changed');
+            }
+            const version = current.version + 1;
+            db.prepare(`UPDATE tasks SET version=?, binding_kind='pending', account_id=?, list_id=?, external_id=NULL,
+              create_action_id=?, legacy_source_json=NULL, title=NULL, notes=NULL, status=NULL, completed_at=NULL,
+              do_on=NULL, parent_id=NULL, position=NULL, source_url=NULL, etag=NULL, observed_at=NULL,
+              completion_writable=0, unavailable_at=NULL, updated_at=? WHERE id=? AND version=?`).run(
+              version,
+              item.destination.accountId,
+              item.destination.listId,
+              action.id,
+              now,
+              current.id,
+              current.version,
+            );
+            const pending = getTask(current.id);
+            if (!pending) throw new Error('Migration task disappeared');
+            insertChange(db, {
+              actor: 'owner', mutationKey: `owner:task-migration:${action.id}:${version}`, entityKind: 'task',
+              entityId: current.id, entityVersion: version, operation: 'transition', snapshot: taskSnapshot(pending),
+              details: { actionId: action.id, before: 'legacy', after: 'pending' }, at: now,
+            });
+          } else {
+            if (current) throw new Error('Hermes migration target already exists');
+            const sourceCreatedAt = typeof item.sourceSnapshot.createdAt === 'string'
+              ? item.sourceSnapshot.createdAt
+              : now;
+            const pending: TaskRow = {
+              id: item.localTaskId,
+              version: 1,
+              binding: {
+                kind: 'pending',
+                destination: { accountId: item.destination.accountId, listId: item.destination.listId },
+                createActionId: action.id,
+              },
+              observed: null,
+              unavailableAt: null,
+              intentVersion: 0,
+              originInboxId: null,
+              createdAt: sourceCreatedAt,
+              updatedAt: now,
+            };
+            insertTask(db, pending);
+            insertPlan(db, {
+              taskId: pending.id,
+              version: 1,
+              ...item.plan,
+              createdAt: sourceCreatedAt,
+              updatedAt: now,
+            });
+            insertChange(db, {
+              actor: 'owner', mutationKey: `owner:task-migration:${action.id}:1`, entityKind: 'task',
+              entityId: pending.id, entityVersion: 1, operation: 'upsert', snapshot: taskSnapshot(pending),
+              details: { actionId: action.id, source: item.source }, at: now,
+            });
+            const plan = getTaskPlan(pending.id);
+            if (!plan) throw new Error('Migration task plan disappeared');
+            insertChange(db, {
+              actor: 'owner', mutationKey: `owner:task-migration-plan:${action.id}:1`, entityKind: 'task-plan',
+              entityId: pending.id, entityVersion: 1, operation: 'upsert', snapshot: planSnapshot(plan),
+              details: { actionId: action.id, source: item.source }, at: now,
+            });
+          }
+        } else {
+          const target = getTask(item.localTaskId);
+          const provider = db.prepare(`SELECT * FROM provider_records
+            WHERE provider='google' AND kind='task' AND deleted_at IS NULL AND account_id=?
+              AND connection_id=? AND container_id=? AND external_id=?`).get(
+            item.destination.accountId,
+            preview.connectionGeneration,
+            item.destination.listId,
+            item.existingExternalId,
+          ) as Record<string, unknown> | undefined;
+          const providerStatus = provider?.status === 'completed' ? 'completed' : 'open';
+          if (!target || !provider || typeof provider.title !== 'string' ||
+            provider.title !== item.targetSnapshot?.title || providerStatus !== item.targetSnapshot.status ||
+            stringOrNull(provider.due_on) !== item.targetSnapshot.doOn ||
+            stringOrNull(provider.source_version) !== item.targetSnapshot.etag ||
+            stringOrNull(provider.source_updated_at) !== item.targetSnapshot.observedAt) {
+            throw new Error('Google migration target changed');
+          }
+          if (item.source.kind === 'fox') {
+            const validLegacyBinding = target.binding.kind === 'legacy';
+            const validRetiredBinding = target.binding.kind === 'google' &&
+              target.binding.ref.accountId !== item.destination.accountId &&
+              target.binding.ref.listId === item.destination.listId &&
+              target.binding.ref.externalId === item.existingExternalId;
+            if (target.version !== item.source.version || (!validLegacyBinding && !validRetiredBinding)) {
+              throw new Error('Fox Focus migration source changed');
+            }
+            const occupiedRow = db.prepare(`SELECT * FROM tasks
+              WHERE binding_kind='google' AND account_id=? AND list_id=? AND external_id=? AND id<>?`).get(
+              item.destination.accountId,
+              item.destination.listId,
+              item.existingExternalId,
+              target.id,
+            ) as Record<string, unknown> | undefined;
+            const occupied = occupiedRow ? taskRowFromSql(occupiedRow) : null;
+            if (occupied) {
+              const actionReference = db.prepare('SELECT 1 FROM actions WHERE task_id=? LIMIT 1').get(occupied.id);
+              if (actionReference) throw new Error('Replacement Google row already has action history');
+              const inboxReference = db.prepare('SELECT 1 FROM inbox_items WHERE task_id=? LIMIT 1').get(occupied.id);
+              const jobReference = db.prepare('SELECT 1 FROM jobs WHERE task_id=? LIMIT 1').get(occupied.id);
+              const reminderReference = db.prepare(
+                "SELECT 1 FROM reminders WHERE target_kind='task' AND target_id=? LIMIT 1",
+              ).get(occupied.id);
+              if (inboxReference || jobReference || reminderReference) {
+                throw new Error('Replacement Google row is referenced by local records');
+              }
+              db.prepare('DELETE FROM tasks WHERE id=?').run(occupied.id);
+              insertChange(db, {
+                actor: 'owner', mutationKey: `owner:task-migration-merge:${action.id}:${occupied.id}`,
+                entityKind: 'task', entityId: occupied.id, entityVersion: occupied.version + 1,
+                operation: 'remove', snapshot: null,
+                details: { actionId: action.id, mergedInto: target.id, duplicateImport: true }, at: now,
+              });
+            }
+            const version = target.version + 1;
+            db.prepare(`UPDATE tasks SET version=?, binding_kind='google', account_id=?, list_id=?, external_id=?,
+              create_action_id=NULL, legacy_source_json=NULL, title=?, notes=?, status=?, completed_at=?, do_on=?,
+              parent_id=?, position=?, source_url=?, etag=?, observed_at=?, completion_writable=?, unavailable_at=NULL,
+              updated_at=? WHERE id=? AND version=?`).run(
+              version,
+              item.destination.accountId,
+              item.destination.listId,
+              item.existingExternalId,
+              provider.title,
+              stringOrNull(provider.notes),
+              providerStatus,
+              stringOrNull(provider.completed_at),
+              stringOrNull(provider.due_on),
+              stringOrNull(provider.parent_id),
+              stringOrNull(provider.position),
+              stringOrNull(provider.source_url),
+              stringOrNull(provider.source_version),
+              stringOrNull(provider.source_updated_at) ?? now,
+              provider.completion_writable === 1 ? 1 : 0,
+              now,
+              target.id,
+              target.version,
+            );
+            const bound = getTask(target.id);
+            if (!bound) throw new Error('Bound migration task disappeared');
+            insertChange(db, {
+              actor: 'owner', mutationKey: `owner:task-migration:${action.id}:${version}`, entityKind: 'task',
+              entityId: target.id, entityVersion: version, operation: 'transition', snapshot: taskSnapshot(bound),
+              details: {
+                actionId: action.id,
+                before: target.binding.kind,
+                after: 'google',
+                externalId: item.existingExternalId,
+                mergedTaskId: occupied?.id ?? null,
+              }, at: now,
+            });
+          } else if (target.binding.kind !== 'google' ||
+            target.binding.ref.accountId !== item.destination.accountId ||
+            target.binding.ref.listId !== item.destination.listId ||
+            target.binding.ref.externalId !== item.existingExternalId) {
+            throw new Error('Hermes migration target changed');
+          }
+        }
+
+        insertApprovedAction(action);
+        if (item.operation === 'create' || item.operation === 'bind') {
+          updateMigrationPlan(item.localTaskId, item.plan, now, action.id);
+        }
+        addMigrationReminder(item.localTaskId, item.reminder, now, action.id);
+        insertChange(db, {
+          actor: 'owner', mutationKey: `owner:action:${action.id}:1`, entityKind: 'action', entityId: action.id,
+          entityVersion: 1, operation: 'upsert', snapshot: actionSnapshot(action),
+          details: { migrationId, sourceKey: item.sourceKey, bulkApproval: true }, at: now,
+        });
+        actions.push(action);
+      }
+      db.exec('COMMIT');
+      return { outcome: 'queued', migrationId, actions };
+    } catch {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      return { outcome: 'conflict', migrationId, actions: migrationActions(migrationId) };
+    }
   }
 
   function queueTaskCreateAction(input: TaskCreateQueueInput, now: string): TaskCreateQueueResult {
@@ -2768,12 +3294,13 @@ export function createRowStore(db: DatabaseSync) {
 
   function recoverExpiredTaskCreateActions(now: string): number {
     const rows = db.prepare(`SELECT * FROM actions
-      WHERE kind='task-create' AND state='running' AND lease_until IS NOT NULL AND lease_until<=?`).all(now) as Record<string, unknown>[];
+      WHERE kind IN ('task-create', 'task-migration') AND state='running'
+        AND lease_until IS NOT NULL AND lease_until<=?`).all(now) as Record<string, unknown>[];
     let recovered = 0;
     for (const row of rows) {
       const parsed = actionFromSql(row);
-      if (!parsed || parsed.payload.kind !== 'task-create') continue;
-      const action = parsed as ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> };
+      const action = asTaskCreateAction(parsed);
+      if (!action) continue;
       transitionTaskCreateAction(
         action,
         'unknown',
@@ -2787,12 +3314,28 @@ export function createRowStore(db: DatabaseSync) {
     return recovered;
   }
 
+  function migrationHermesSourcesAreCurrent(action: TaskCreateAction): boolean {
+    if (action.payload.kind !== 'task-migration') return true;
+    const sources = [action.payload.source, ...(action.payload.sourceAliases ?? [])]
+      .filter(source => source.kind === 'hermes');
+    if (sources.length === 0) return true;
+    const sync = db.prepare("SELECT state, board_slug FROM hermes_sync_state WHERE id=1").get() as
+      Record<string, unknown> | undefined;
+    if (sync?.state !== 'connected' || sync.board_slug !== 'personal-tasks') return false;
+    return sources.every(source => {
+      if (source.kind !== 'hermes' || source.boardSlug !== 'personal-tasks') return false;
+      const mirror = db.prepare(`SELECT remote_version FROM hermes_task_mirrors
+        WHERE board_slug=? AND task_id=?`).get(source.boardSlug, source.taskId) as Record<string, unknown> | undefined;
+      return mirror?.remote_version === source.version;
+    });
+  }
+
   function claimNextTaskCreateAction(now: string, leaseMilliseconds: number): TaskCreateClaim | null {
     db.exec('BEGIN IMMEDIATE');
     try {
       recoverExpiredTaskCreateActions(now);
       const row = db.prepare(`SELECT candidate.* FROM actions AS candidate
-        WHERE candidate.kind='task-create'
+        WHERE candidate.kind IN ('task-create', 'task-migration')
           AND (
             candidate.state='queued' OR candidate.state='unknown' OR
             (candidate.state='failed' AND candidate.next_attempt_at IS NOT NULL)
@@ -2805,15 +3348,21 @@ export function createRowStore(db: DatabaseSync) {
           )
         ORDER BY candidate.created_at, candidate.id LIMIT 1`).get(now, now) as Record<string, unknown> | undefined;
       const parsed = row ? actionFromSql(row) : null;
-      if (!parsed || parsed.payload.kind !== 'task-create') {
+      const action = asTaskCreateAction(parsed);
+      if (!action) {
         db.exec('COMMIT');
         return null;
       }
-      const action = parsed as ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> };
       const task = getTask(action.payload.taskId);
       if (!task || task.binding.kind !== 'pending' || task.binding.createActionId !== action.id) {
         transitionTaskCreateAction(action, 'conflict', now, action.receipt,
           'The pending task changed before its create action could run.');
+        db.exec('COMMIT');
+        return null;
+      }
+      if (action.state !== 'unknown' && !migrationHermesSourcesAreCurrent(action)) {
+        transitionTaskCreateAction(action, 'conflict', now, action.receipt,
+          'The approved Hermes migration source changed before Google creation. Review a new preview.');
         db.exec('COMMIT');
         return null;
       }
@@ -2826,15 +3375,16 @@ export function createRowStore(db: DatabaseSync) {
         version, claimId, leaseUntil, now, action.id, action.version,
       );
       const claimed = getAction(action.id);
-      if (!claimed || claimed.payload.kind !== 'task-create') throw new Error('Claimed task create disappeared');
+      const claimedCreate = asTaskCreateAction(claimed);
+      if (!claimedCreate) throw new Error('Claimed task create disappeared');
       insertChange(db, {
         actor: 'system', mutationKey: `system:task-create-claim:${action.id}:${version}`, entityKind: 'action',
-        entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(claimed),
-        details: { before: action.state, after: 'running', mode, attempt: claimed.attemptCount }, at: now,
+        entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(claimedCreate),
+        details: { before: action.state, after: 'running', mode, attempt: claimedCreate.attemptCount }, at: now,
       });
       db.exec('COMMIT');
       return {
-        action: claimed as ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> },
+        action: claimedCreate,
         mode,
       };
     } catch (error) {
@@ -2852,11 +3402,11 @@ export function createRowStore(db: DatabaseSync) {
     db.exec('BEGIN IMMEDIATE');
     try {
       const parsed = getAction(id);
-      if (!parsed || parsed.payload.kind !== 'task-create') {
+      const action = asTaskCreateAction(parsed);
+      if (!action) {
         db.exec('ROLLBACK');
         return null;
       }
-      const action = parsed as ActionRow & { payload: Extract<ActionRow['payload'], { kind: 'task-create' }> };
       if (action.state !== 'running' || action.claimId !== claimId) {
         const task = getTask(action.payload.taskId);
         const sameSettledCreate = result.outcome === 'succeeded' && task?.binding.kind === 'google' &&
@@ -3141,6 +3691,10 @@ export function createRowStore(db: DatabaseSync) {
     listChanges,
     readContext,
     insertApprovedAction,
+    migrationActions,
+    listTaskMigrationRuns,
+    isHermesTaskCoveredByMigration,
+    approveTaskMigration,
     queueTaskCreateAction,
     createJob,
     claimJob,

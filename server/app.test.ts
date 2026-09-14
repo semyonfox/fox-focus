@@ -494,6 +494,10 @@ test('the Hermes bearer is accepted only on the five exact Hermes routes', async
       { path: '/api/v1/task-proposals', method: 'POST', body: {} },
       { path: '/api/v1/task-destinations' },
       { path: '/api/v1/tasks', method: 'POST', body: {} },
+      { path: '/api/v1/task-migrations' },
+      { path: '/api/v1/task-migrations/preview' },
+      { path: '/api/v1/task-migrations/approve', method: 'POST', body: {} },
+      { path: '/api/v1/task-migrations/migration-00000000000000000000000000000000' },
       { path: '/api/v1/tasks/linked-task/plan', method: 'PUT', body: {} },
       { path: '/api/v1/tasks/linked-task/status', method: 'POST', body: { version: 1, state: 'completed' } },
       { path: '/api/v1/jobs', method: 'POST', body: { title: 'No', instruction: 'No', taskId: null, inboxId: null } },
@@ -919,4 +923,152 @@ test('task creation exposes fresh destinations and durably queues the approved G
     });
     assert.equal(forgedMarker.status, 400);
   } finally { store.close(); }
+});
+
+test('task migration preview is read-only, rejects stale approval, and replays one durable batch', async () => {
+  const data: PrototypeData = {
+    tasks: [{
+      id: 'migration-native', title: 'Move exact task', area: 'Personal', state: 'up-next',
+      duration: '30 min', due: 'No deadline', priority: 'medium', completed: false,
+      scheduledTime: null, origin: 'manual', createdAt: '2026-09-13T09:00:00.000Z',
+      externalLinks: [{
+        provider: 'hermes', containerId: 'personal-tasks', containerName: 'Personal Tasks',
+        externalId: 'migration-hermes-source', policy: 'read_only',
+        sourceStatus: 'todo', sourceVersion: '1', linkedAt: '2026-09-13T09:00:00.000Z',
+      }],
+    }],
+    events: [], inboxItems: [], reminders: [], listAreas: {},
+  };
+  const store = openStore(':memory:', data);
+  const feed: HermesFeed = {
+    state: 'connected', checkedAt: '2026-09-14T09:55:00.000Z', completionAvailable: false,
+    board: {
+      slug: 'personal-tasks', name: 'Personal Tasks', total: 1, sources: ['Direct request'],
+      tasks: [{
+        id: 'migration-hermes-source', title: 'Move exact task', status: 'todo', priority: 2,
+        createdAt: '2026-09-13T09:00:00.000Z', updatedAt: '2026-09-13T09:30:00.000Z', version: 1,
+        owner: 'human', source: 'Direct request', parentTitle: null, sourceProvider: null,
+        sourceExternalId: null, sourceDueOn: null, sourceStatus: null, sourceContainerId: null,
+        sourceContainerName: null, sourceMatchUnique: false, area: 'Personal', localState: 'up-next',
+        duration: '30 min', due: 'No deadline', scheduledAt: null, reminderMode: 'none',
+        reminderFireAt: null, annotationUpdatedAt: null,
+      }],
+    },
+  };
+  const hermes: HermesMirrorService = {
+    feed: () => feed,
+    poll: async () => feed,
+    updateAnnotation: () => null,
+    completeTask: async () => { throw new Error('unused'); },
+  };
+  const integrations: IntegrationService = {
+    overview: () => emptyIntegrationOverview(),
+    listGoogleTaskDestinations: () => ({
+      accountId: 'google-account', connectionGeneration: 'google-generation',
+      destinations: [{
+        accountId: 'google-account', listId: 'my-tasks', name: 'My Tasks', area: 'Personal',
+        fallback: true, fresh: true, explicitMapping: false,
+      }],
+      fallbackListId: 'my-tasks',
+    }),
+    startAuthorization: () => null,
+    completeAuthorization: async () => ({ outcome: 'failed', notice: 'unused' }),
+    sync: async () => ({ outcome: 'synced', recordCount: 0 }),
+    syncConnected: async () => {},
+    updateGoogleTaskCompletion: async () => ({ outcome: 'failed', notice: 'unused', retryable: false }),
+    createGoogleTask: async () => ({ outcome: 'unknown', notice: 'unused' }),
+    reconcileGoogleTaskCreate: async () => ({ outcome: 'unknown', notice: 'unused' }),
+  };
+  let kicks = 0;
+  try {
+    const app = createApp(store, password, hermes, integrations, {
+      now: () => new Date('2026-09-14T10:00:00.000Z'),
+      actionWorker: { kick: () => { kicks += 1; } },
+    });
+    const previewResponse = await app.request('/api/v1/task-migrations/preview', { headers: { authorization } });
+    assert.equal(previewResponse.status, 200);
+    const first = await previewResponse.json() as {
+      preview: { hash: string; items: Array<{ sourceKey: string; approvalText: string }>; blockers: unknown[] };
+    };
+    assert.equal(first.preview.items.length, 1);
+    assert.equal(first.preview.items[0]?.sourceKey, 'fox:migration-native');
+    assert.match(first.preview.items[0]?.approvalText ?? '', /google-account/);
+    assert.equal(first.preview.blockers.length, 0);
+    assert.equal(store.listActions().length, 0, 'preview must not persist or dispatch anything');
+
+    const plan = store.getTaskPlan('migration-native');
+    assert.ok(plan);
+    store.updateTaskPlan('migration-native', plan.version, {
+      priority: 'high', waiting: false, deadlineOn: null, plannedOn: null,
+      plannedAt: null, estimateMinutes: 30,
+    }, '2026-09-14T09:59:00.000Z');
+    const stale = await app.request('/api/v1/task-migrations/approve', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ previewHash: first.preview.hash, idempotencyKey: 'migration-approval-one' }),
+    });
+    assert.equal(stale.status, 409);
+    assert.equal(store.listActions().length, 0);
+
+    const currentResponse = await app.request('/api/v1/task-migrations/preview', { headers: { authorization } });
+    const current = await currentResponse.json() as typeof first;
+    const approvalBody = { previewHash: current.preview.hash, idempotencyKey: 'migration-approval-one' };
+    const approval = await app.request('/api/v1/task-migrations/approve', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify(approvalBody),
+    });
+    assert.equal(approval.status, 202);
+    const approved = await approval.json() as {
+      outcome: string;
+      migration: { migrationId: string; state: string; counts: { total: number; queued: number } };
+    };
+    assert.equal(approved.outcome, 'queued');
+    assert.deepEqual(approved.migration.counts, {
+      total: 1, queued: 1, running: 0, succeeded: 0, failed: 0, conflict: 0, unknown: 0,
+    });
+    assert.equal(store.getTask('migration-native')?.binding.kind, 'pending');
+    assert.equal(store.listActions().filter(action => action.payload.kind === 'task-migration').length, 1);
+    assert.equal(kicks, 1);
+
+    const frozenAnnotation = await app.request('/api/v1/hermes/tasks/migration-hermes-source/annotation', {
+      method: 'PUT', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        area: 'Personal', localState: 'up-next', duration: '30 min', due: 'No deadline',
+        scheduledAt: null, reminderMode: 'none', reminderFireAt: null,
+      }),
+    });
+    assert.equal(frozenAnnotation.status, 409);
+    const frozenCompletion = await app.request('/api/v1/hermes/tasks/migration-hermes-source/complete', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        expectedVersion: 1,
+        confirmation: { beforeStatus: 'todo', afterStatus: 'done', confirmedAt: '2026-09-14T10:00:00.000Z' },
+      }),
+    });
+    assert.equal(frozenCompletion.status, 409);
+    const frozenAdoption = await app.request('/api/v1/task-adoptions/preview', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'hermes', externalId: 'migration-hermes-source' }),
+    });
+    assert.equal(frozenAdoption.status, 409);
+
+    const replay = await app.request('/api/v1/task-migrations/approve', {
+      method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
+      body: JSON.stringify(approvalBody),
+    });
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json() as { outcome: string }).outcome, 'replayed');
+    assert.equal(store.listActions().filter(action => action.payload.kind === 'task-migration').length, 1);
+    assert.equal(kicks, 1);
+
+    const status = await app.request(`/api/v1/task-migrations/${approved.migration.migrationId}`, {
+      headers: { authorization },
+    });
+    assert.equal(status.status, 200);
+    const history = await app.request('/api/v1/task-migrations', { headers: { authorization } });
+    assert.equal(history.status, 200);
+    const historyBody = await history.json() as { migrations: Array<{ migrationId: string }> };
+    assert.equal(historyBody.migrations[0]?.migrationId, approved.migration.migrationId);
+  } finally {
+    store.close();
+  }
 });

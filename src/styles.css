@@ -2976,6 +2976,263 @@ body {
   margin-top: 20px;
 }
 
+.task-migration-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.task-migration-panel > header,
+.task-migration-panel > header > span,
+.migration-preview-summary,
+.migration-approval,
+.migration-progress > div:first-child {
+  display: flex;
+  align-items: center;
+}
+
+.task-migration-panel > header {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.task-migration-panel > header > span {
+  gap: 7px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.task-migration-panel > header svg {
+  color: var(--blue-text);
+}
+
+.task-migration-panel > p,
+.migration-progress p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.task-migration-panel code {
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 680;
+}
+
+.migration-preview,
+.migration-progress,
+.migration-items,
+.migration-item-detail,
+.migration-blockers {
+  display: grid;
+}
+
+.migration-preview,
+.migration-progress {
+  gap: 9px;
+}
+
+.migration-preview-summary {
+  gap: 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.migration-preview-summary span {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.migration-preview-summary strong {
+  color: var(--text);
+}
+
+.migration-preview-summary small {
+  margin-left: auto;
+  color: var(--muted-light);
+  font-size: 9px;
+}
+
+.migration-preview-summary .migration-blocked,
+.migration-blockers,
+.migration-progress--needs_review {
+  color: var(--amber-text);
+}
+
+.migration-blockers {
+  gap: 5px;
+  padding: 8px 9px;
+  border: 1px solid color-mix(in srgb, var(--amber-text) 28%, transparent);
+  border-radius: 8px;
+  background: var(--amber-soft);
+}
+
+.migration-blockers p {
+  margin: 0;
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+
+.migration-items {
+  gap: 5px;
+}
+
+.migration-items details {
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel-solid);
+}
+
+.migration-items summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 7px 9px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.migration-items summary::-webkit-details-marker {
+  display: none;
+}
+
+.migration-items summary > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.migration-items summary strong,
+.migration-items summary small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.migration-items summary strong {
+  color: var(--text);
+  font-size: 10px;
+}
+
+.migration-items summary small,
+.migration-items summary em,
+.migration-item-detail > span,
+.migration-item-detail > small {
+  color: var(--muted-light);
+  font-size: 9px;
+  font-style: normal;
+}
+
+.migration-items summary em {
+  text-transform: capitalize;
+}
+
+.migration-item-detail {
+  gap: 6px;
+  padding: 0 9px 9px 24px;
+}
+
+.migration-item-detail pre {
+  max-width: 100%;
+  margin: 0;
+  padding: 8px;
+  overflow-wrap: anywhere;
+  border-radius: 7px;
+  background: var(--panel-muted);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 9px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.migration-approval {
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.migration-approval > span {
+  color: var(--muted);
+  font-size: 9.5px;
+}
+
+.migration-approval .submit-button {
+  flex: 0 0 auto;
+}
+
+.migration-progress {
+  padding: 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: var(--panel-solid);
+}
+
+.migration-progress > div:first-child {
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.migration-progress > div:first-child strong {
+  color: var(--text);
+}
+
+.migration-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.migration-counts span {
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: var(--panel-muted);
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.migration-progress-mappings {
+  display: grid;
+  gap: 4px;
+}
+
+.migration-progress-mappings > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.migration-progress-mappings strong,
+.migration-progress-mappings small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.migration-progress-mappings strong {
+  color: var(--text);
+  font-weight: 620;
+}
+
+.migration-progress .mini-action {
+  justify-self: start;
+}
+
 .integration-task-lists-note {
   margin: -2px 0 4px 23px;
   color: var(--muted);

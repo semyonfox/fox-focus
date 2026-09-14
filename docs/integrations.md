@@ -1,10 +1,12 @@
 # Google and Microsoft connections
 
-Fox Focus uses server-side OAuth to import calendar and task context. Google Calendar, Microsoft Calendar, and Microsoft To Do remain read-only. Google Tasks has one optional write capability: completion or reopening of an explicitly adopted legacy task.
+Fox Focus uses server-side OAuth to import calendar and task context. Google Calendar, Microsoft Calendar, and Microsoft To Do remain read-only. Google Tasks owns task content and completion, including tasks created through Fox Focus; Fox Focus stores local planning and reminders against its stable task rows.
 
-New Fox Focus tasks remain local. Connecting Google never creates, moves, edits, clears, or deletes a Google task.
+Task creation and status changes are the only Google writes. Every create shows its destination and outgoing fields before approval, and every status change starts from the owner's explicit checkbox click. Fox Focus never moves, clears, or deletes a Google task.
 
 The separate legacy Hermes action bridge can complete an unadopted Hermes-owned task after confirmation. It never writes Google Tasks or Microsoft To Do and is blocked once Fox Focus adopts that task.
+
+The owner-facing legacy migration preview is implemented but has not been run. Approval records one immutable, resumable mapping batch for native Fox tasks and the `personal-tasks` board; it binds exact existing Google IDs or creates through nonce reconciliation. Keep the Hermes mirror, annotations, completion bridge, and `fox-focus-sync` plugin until the owner approves a live batch and its Google readbacks, local planning, reminders, and mappings are verified. Remove those four legacy paths only after that cutover.
 
 ## Private deployment setup
 

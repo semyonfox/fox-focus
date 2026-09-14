@@ -971,6 +971,30 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     });
   }
 
+  function listProviderRecordsForAccount(
+    provider: Provider,
+    accountId: string,
+    kind?: ProviderRecordKind,
+  ): StoredRecord[] {
+    const rows = (kind
+      ? db.prepare(`SELECT id, provider, account_id, connection_id, kind, container_id, container_name,
+          external_id, title, status, starts_at, ends_at, starts_on, ends_on, all_day, due_on,
+          completed_at, source_updated_at, source_version, completion_writable, notes, parent_id, position,
+          source_url, source_time_zone, imported_at
+        FROM provider_records WHERE deleted_at IS NULL AND provider=? AND account_id=? AND kind=?
+        ORDER BY container_id, external_id`).all(provider, accountId, kind)
+      : db.prepare(`SELECT id, provider, account_id, connection_id, kind, container_id, container_name,
+          external_id, title, status, starts_at, ends_at, starts_on, ends_on, all_day, due_on,
+          completed_at, source_updated_at, source_version, completion_writable, notes, parent_id, position,
+          source_url, source_time_zone, imported_at
+        FROM provider_records WHERE deleted_at IS NULL AND provider=? AND account_id=?
+        ORDER BY kind, container_id, external_id`).all(provider, accountId)) as Record<string, unknown>[];
+    return rows.flatMap(row => {
+      const record = rowToRecord(row);
+      return record ? [record] : [];
+    });
+  }
+
   const hermesTaskSelect = `SELECT
       mirror.task_id, mirror.title, mirror.remote_status, mirror.priority, mirror.owner,
       mirror.source_label, mirror.parent_title, mirror.remote_created_at,
@@ -1659,6 +1683,7 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
     replaceProviderRecords,
     clearProviderRecords,
     listProviderRecords,
+    listProviderRecordsForAccount,
     replaceHermesTasks,
     markHermesUnavailable,
     readHermesFeed,

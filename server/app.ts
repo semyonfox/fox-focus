@@ -16,6 +16,7 @@ import {
   isJobSendBackInput,
   isJobSettleInput,
   isReplyEnvelope,
+  isTaskMigrationApprovalInput,
   isTaskPlanInput,
   isTaskCreateInput,
   isTaskStatusInput,
@@ -26,6 +27,11 @@ import type { Store } from './store.ts';
 import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
 import { canonicalHash } from './row-store.ts';
+import {
+  buildTaskMigrationPreview,
+  migrationIdForIdempotencyKey,
+  summarizeTaskMigration,
+} from './task-migration.ts';
 import {
   TaskManagementError,
   adoptionSourceStillMatches,
@@ -268,6 +274,72 @@ export function createApp(
     return c.json({ task: result.task, plan: result.plan, action: result.action, inbox: result.inbox },
       result.outcome === 'queued' ? 202 : 200);
   });
+  app.get('/api/v1/task-migrations', (c) => {
+    const migrations = store.listTaskMigrationRuns(20)
+      .map(({ migrationId }) => summarizeTaskMigration(store.migrationActions(migrationId), migrationId));
+    return c.json({ migrations });
+  });
+  app.get('/api/v1/task-migrations/preview', (c) => {
+    const generatedAt = now().toISOString();
+    const catalogue = integrations?.listGoogleTaskDestinations() ?? {
+      accountId: null,
+      connectionGeneration: null,
+      destinations: [],
+      fallbackListId: null,
+    };
+    const feed = hermes?.feed() ?? { state: 'unavailable' as const, checkedAt: generatedAt, board: null };
+    return c.json({ preview: buildTaskMigrationPreview(store, catalogue, feed, generatedAt) });
+  });
+  app.post('/api/v1/task-migrations/approve', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isTaskMigrationApprovalInput(body)) return c.json({ error: 'Invalid task migration approval' }, 400);
+    const migrationId = migrationIdForIdempotencyKey(body.idempotencyKey);
+    const existingActions = store.migrationActions(migrationId);
+    if (existingActions.length > 0) {
+      const samePreview = existingActions.every(action =>
+        action.payload.kind === 'task-migration' && action.payload.previewHash === body.previewHash);
+      return samePreview
+        ? c.json({ outcome: 'replayed', migration: summarizeTaskMigration(existingActions, migrationId) })
+        : c.json({
+            error: 'That migration approval key was already used for a different batch.',
+            migration: summarizeTaskMigration(existingActions, migrationId),
+          }, 409);
+    }
+    const approvedAt = now().toISOString();
+    const catalogue = integrations?.listGoogleTaskDestinations() ?? {
+      accountId: null,
+      connectionGeneration: null,
+      destinations: [],
+      fallbackListId: null,
+    };
+    const feed = hermes?.feed() ?? { state: 'unavailable' as const, checkedAt: approvedAt, board: null };
+    const preview = buildTaskMigrationPreview(store, catalogue, feed, approvedAt);
+    if (preview.hash !== body.previewHash || preview.blockers.length > 0 || preview.items.length === 0) {
+      return c.json({ error: 'Task migration sources changed or no eligible tasks remain. Review a new preview.', preview }, 409);
+    }
+    const result = store.approveTaskMigration(preview, body.idempotencyKey, approvedAt);
+    const actions = result.actions;
+    if (result.outcome === 'conflict') {
+      return c.json({
+        error: 'That migration approval key was already used for a different batch.',
+        migration: summarizeTaskMigration(actions, migrationId),
+      }, 409);
+    }
+    options.actionWorker?.kick();
+    return c.json({
+      outcome: result.outcome,
+      migration: summarizeTaskMigration(actions, migrationId),
+    }, result.outcome === 'queued' ? 202 : 200);
+  });
+  app.get('/api/v1/task-migrations/:migrationId', (c) => {
+    const migrationId = c.req.param('migrationId');
+    if (!/^migration-[a-f0-9]{32}$/.test(migrationId)) return c.json({ error: 'Invalid task migration ID' }, 400);
+    const actions = store.migrationActions(migrationId);
+    if (!actions.length) return c.json({ error: 'Task migration not found' }, 404);
+    return c.json({ migration: summarizeTaskMigration(actions, migrationId) });
+  });
   app.put('/api/v1/tasks/:taskId/plan', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
     let body: unknown;
@@ -442,6 +514,9 @@ export function createApp(
     }
     const taskId = c.req.param('taskId');
     if (!taskId || taskId.length > 200) return c.json({ error: 'Invalid task ID' }, 400);
+    if (store.isHermesTaskCoveredByMigration('personal-tasks', taskId)) {
+      return c.json({ error: 'This task is frozen by an approved Google migration.' }, 409);
+    }
     const task = hermes.updateAnnotation(taskId, body);
     return task ? c.json({ task }) : c.json({ error: 'Task not found' }, 404);
   });
@@ -453,6 +528,9 @@ export function createApp(
     if (!isHermesCompletionInput(body)) return c.json({ error: 'Invalid completion approval' }, 400);
     const taskId = c.req.param('taskId');
     if (!taskId || taskId.length > 200) return c.json({ error: 'Invalid task ID' }, 400);
+    if (store.isHermesTaskCoveredByMigration('personal-tasks', taskId)) {
+      return c.json({ error: 'This task is frozen by an approved Google migration.' }, 409);
+    }
     const currentFeed = hermes.feed();
     if (currentFeed.board && adoptedTaskIdForHermes(store.read(), currentFeed.board.slug, taskId)) {
       return c.json({ error: 'This task is owned by Fox Focus and cannot be completed through the legacy Hermes bridge.' }, 409);
@@ -541,6 +619,10 @@ export function createApp(
     if (!isRecord(body) || (body.source !== 'google' && body.source !== 'microsoft' && body.source !== 'hermes')) {
       return c.json({ error: 'Invalid adoption source' }, 400);
     }
+    if (body.source === 'hermes' && typeof body.externalId === 'string' &&
+      store.isHermesTaskCoveredByMigration('personal-tasks', body.externalId)) {
+      return c.json({ error: 'This task is frozen by an approved Google migration.' }, 409);
+    }
     try {
       const request = body.source === 'hermes'
         ? typeof body.externalId === 'string' && body.externalId.length > 0 && body.externalId.length <= 512
@@ -571,6 +653,10 @@ export function createApp(
     const id = c.req.param('id');
     const request = store.getTaskAdoption(id);
     if (!request) return c.json({ error: 'Adoption preview was not found' }, 404);
+    if (request.source === 'hermes' &&
+      store.isHermesTaskCoveredByMigration(request.containerId, request.externalId)) {
+      return c.json({ error: 'This task is frozen by an approved Google migration.' }, 409);
+    }
     if (request.status === 'awaiting_approval' && store.read().revision !== request.workspaceRevision) {
       return c.json({ error: 'The workspace changed after this preview. Preview the adoption again.' }, 409);
     }

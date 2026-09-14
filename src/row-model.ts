@@ -144,14 +144,109 @@ export type EmailSendPayload = {
   payloadHash: string;
 };
 
+export type TaskMigrationSource =
+  | { kind: "fox"; taskId: string; version: number }
+  | { kind: "hermes"; boardSlug: string; taskId: string; version: number };
+
+export type TaskMigrationPlan = {
+  priority: Priority;
+  waiting: boolean;
+  deadlineOn: DateOnly | null;
+  plannedOn: DateOnly | null;
+  plannedAt: Instant | null;
+  estimateMinutes: number | null;
+};
+
+export type TaskMigrationDestination = {
+  accountId: string;
+  listId: string;
+  listName: string;
+};
+
+export type TaskMigrationPreviewItem = {
+  source: TaskMigrationSource;
+  sourceAliases: TaskMigrationSource[];
+  sourceKey: string;
+  sourceSnapshot: Record<string, unknown>;
+  expectedTaskVersion: number | null;
+  expectedPlanVersion: number | null;
+  title: string;
+  status: TaskStatus;
+  localTaskId: string;
+  operation: "bind" | "create";
+  destination: TaskMigrationDestination;
+  existingExternalId: string | null;
+  targetSnapshot: {
+    title: string;
+    status: TaskStatus;
+    doOn: DateOnly | null;
+    etag: string | null;
+    observedAt: Instant | null;
+  } | null;
+  outgoing: { title: string; notes: string; doOn: DateOnly | null } | null;
+  plan: TaskMigrationPlan;
+  reminder: { id: string; fireAt: Instant } | null;
+  preservedReminders: Array<{
+    id: string;
+    version: number;
+    fireAt: Instant;
+    state: ReminderRow['state'];
+  }>;
+  replacesActionId: string | null;
+  resumeMode: "create" | "reconcile" | null;
+  approvalText: string;
+};
+
+export type TaskMigrationBlockerCode =
+  | "google_unavailable"
+  | "hermes_unavailable"
+  | "wrong_board"
+  | "destination_missing"
+  | "source_missing"
+  | "ambiguous_source"
+  | "duplicate_target"
+  | "pending_create"
+  | "status_conflict"
+  | "planning_conflict"
+  | "completed_create";
+
+export type TaskMigrationBlocker = {
+  sourceKey: string | null;
+  code: TaskMigrationBlockerCode;
+  message: string;
+};
+
+export type TaskMigrationPreview = {
+  hash: string;
+  accountId: string | null;
+  connectionGeneration: string | null;
+  generatedAt: Instant;
+  items: TaskMigrationPreviewItem[];
+  blockers: TaskMigrationBlocker[];
+};
+
 export type MigrationPayload = {
   kind: "task-migration";
   migrationId: string;
+  previewHash: string;
+  sourceKey: string;
+  sourceSnapshot: Record<string, unknown>;
+  operation: "bind" | "create";
   taskId: string;
-  source: Record<string, unknown>;
+  source: TaskMigrationSource;
+  sourceAliases: TaskMigrationSource[];
   destination: { accountId: string; listId: string };
+  destinationName: string;
   existingExternalId: string | null;
+  targetSnapshot: TaskMigrationPreviewItem['targetSnapshot'];
   nonce: string | null;
+  title: string;
+  notes: string;
+  doOn: DateOnly | null;
+  plan: TaskMigrationPlan;
+  reminder: { id: string; fireAt: Instant } | null;
+  preservedReminders: TaskMigrationPreviewItem['preservedReminders'];
+  resumedFromActionId: string | null;
 };
 
 export type ActionPayload = TaskCreatePayload | TaskStatusPayload | EmailSendPayload | MigrationPayload;
@@ -270,6 +365,35 @@ export type TaskWithPlan = {
   pendingAction: ActionRow | null;
 };
 
+export type TaskMigrationMapping = {
+  sourceKey: string;
+  source: TaskMigrationSource;
+  localTaskId: string;
+  destination: TaskMigrationDestination;
+  externalId: string | null;
+  actionId: string;
+  state: ActionState;
+};
+
+export type TaskMigrationSummary = {
+  migrationId: string;
+  previewHash: string;
+  state: "queued" | "working" | "needs_review" | "settled";
+  counts: {
+    total: number;
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    conflict: number;
+    unknown: number;
+    superseded?: number;
+    cancelled?: number;
+  };
+  mappings: TaskMigrationMapping[];
+  actions: ActionRow[];
+};
+
 function isShortText(value: unknown, maximum: number, allowEmpty = false): value is string {
   return typeof value === "string" && value.length <= maximum && (allowEmpty || value.trim().length > 0);
 }
@@ -344,6 +468,14 @@ export function isTaskCreateInput(value: unknown): value is TaskCreateInput {
     taskCreateNotes(value.notes, value.nonce).length <= 8_192 &&
     (inbox === undefined || (isRecord(inbox) && isShortText(inbox.id, 200) &&
       typeof inbox.version === "number" && Number.isSafeInteger(inbox.version) && inbox.version >= 1));
+}
+
+export function isTaskMigrationApprovalInput(value: unknown): value is {
+  previewHash: string;
+  idempotencyKey: string;
+} {
+  return isRecord(value) && /^[a-f0-9]{64}$/.test(String(value.previewHash)) &&
+    isOneLineText(value.idempotencyKey, 200) && value.idempotencyKey.length >= 8;
 }
 
 export function isInboxDecisionInput(value: unknown): value is {

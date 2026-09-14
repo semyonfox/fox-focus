@@ -137,7 +137,7 @@ export function createTaskStatusActionWorker(
     const claim = store.claimNextTaskCreateAction(now().toISOString(), leaseMilliseconds);
     if (!claim) return null;
     const { action, mode } = claim;
-    if (action.payload.kind !== 'task-create' || !action.claimId) {
+    if (!action.claimId) {
       throw new Error('Task create worker claimed an invalid action');
     }
 
