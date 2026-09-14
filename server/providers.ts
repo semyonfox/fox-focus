@@ -88,6 +88,8 @@ export interface ProviderWriteFailure {
   readonly httpStatus?: number;
   /** A safe, parsed Retry-After value when the provider supplied one. */
   readonly retryAfterSeconds?: number;
+  /** The fetched provider record when a preflight conflict can show it safely. */
+  readonly currentTask?: ImportedTask;
 }
 
 export interface ProviderWriteSuccess<T> {
@@ -263,7 +265,7 @@ function writeFailure(
   provider: Provider,
   operation: ProviderOperation,
   phase: ProviderWritePhase,
-  extras: Pick<ProviderWriteFailure, "httpStatus" | "retryAfterSeconds"> = {},
+  extras: Pick<ProviderWriteFailure, "httpStatus" | "retryAfterSeconds" | "currentTask"> = {},
 ): ProviderWriteFailure {
   return { status, provider, operation, phase, ...extras };
 }
@@ -925,7 +927,10 @@ export async function updateGoogleTaskStatus(
     });
   }
   if (input.expectedEtag !== undefined && currentTask.version !== input.expectedEtag) {
-    return writeFailure("conflict", "google", operation, "preflight", { httpStatus: 412 });
+    return writeFailure("conflict", "google", operation, "preflight", {
+      httpStatus: 412,
+      currentTask,
+    });
   }
 
   const patchUrl = googleTasksUrl(resourcePath, { fields: "id,status,etag" });
@@ -946,7 +951,31 @@ export async function updateGoogleTaskStatus(
     return writeFailure("network-error", "google", operation, "update");
   }
 
-  if (!patchResponse.ok) return writeHttpFailure("google", operation, "update", patchResponse);
+  if (!patchResponse.ok) {
+    const patchFailure = writeHttpFailure("google", operation, "update", patchResponse);
+    if (patchFailure.status !== "conflict") return patchFailure;
+    try { await patchResponse.body?.cancel(); } catch { /* the readback below is authoritative */ }
+    const changed = await fetchJson(client, "google", operation, readUrl, googleHeaders(client.accessToken));
+    if ("error" in changed) return writeFailure("verification-failed", "google", operation, "readback");
+    const changedTask = parseGoogleTask(input.taskListId, changed.payload);
+    if (changedTask === null || changedTask.externalId !== input.taskId || changedTask.isDeleted || changedTask.version === null) {
+      return writeFailure("verification-failed", "google", operation, "readback");
+    }
+    if (changedTask.state === input.state && (input.state === "completed" || changedTask.completedAt === null)) {
+      return writeSuccess("google", operation, {
+        taskListId: input.taskListId,
+        taskId: input.taskId,
+        requestedState: input.state,
+        etag: changedTask.version,
+        task: changedTask,
+      });
+    }
+    return writeFailure("conflict", "google", operation, "update", {
+      ...(patchFailure.httpStatus === undefined ? {} : { httpStatus: patchFailure.httpStatus }),
+      ...(patchFailure.retryAfterSeconds === undefined ? {} : { retryAfterSeconds: patchFailure.retryAfterSeconds }),
+      currentTask: changedTask,
+    });
+  }
   if (patchResponse.body !== null) {
     try {
       await patchResponse.body.cancel();

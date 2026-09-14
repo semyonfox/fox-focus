@@ -1385,6 +1385,13 @@ textarea:focus-visible {
   color: var(--text);
 }
 
+.field input:read-only,
+.field select:disabled {
+  background: var(--panel-muted);
+  color: var(--muted);
+  cursor: default;
+}
+
 .field input::placeholder,
 .field textarea::placeholder,
 .agent-request textarea::placeholder {
@@ -3784,17 +3791,19 @@ body {
   color: var(--blue-text);
 }
 
-.task-action-state--awaiting_approval,
+.task-action-state--queued,
 .task-action-state--running {
   color: var(--stone-text);
 }
 
+.task-action-state--queued::before,
 .task-action-state--running::before {
   animation: task-action-pulse 1.4s ease-in-out infinite;
 }
 
 .task-action-state--failed,
-.task-action-state--conflict {
+.task-action-state--conflict,
+.task-action-state--unknown {
   border-color: color-mix(in srgb, var(--amber-text) 32%, transparent);
   background: var(--amber-soft);
   color: var(--amber-text);
@@ -3823,7 +3832,7 @@ body {
   font-weight: 720;
 }
 
-.task-action-notice--awaiting_approval,
+.task-action-notice--queued,
 .task-action-notice--running {
   border-color: color-mix(in srgb, var(--blue-text) 24%, transparent);
   background: var(--blue-soft);
@@ -3831,7 +3840,8 @@ body {
 }
 
 .task-action-notice--failed,
-.task-action-notice--conflict {
+.task-action-notice--conflict,
+.task-action-notice--unknown {
   border-color: color-mix(in srgb, var(--amber-text) 34%, transparent);
   background: var(--amber-soft);
   color: var(--amber-text);
@@ -3887,6 +3897,35 @@ body {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.45;
+}
+
+.conflict-next-change {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  margin-top: 9px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--amber-text) 32%, transparent);
+  border-radius: 9px;
+  background: var(--amber-soft);
+  text-align: left;
+}
+
+.conflict-next-change span,
+.conflict-next-change small {
+  color: var(--amber-text);
+  font-size: 9px;
+}
+
+.conflict-next-change span {
+  font-weight: 760;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.conflict-next-change strong {
+  color: var(--text);
+  font-size: 12px;
 }
 
 .editor-dialog--alert:has(.task-action-preview) {
@@ -3975,6 +4014,7 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .task-action-state--queued::before,
   .task-action-state--running::before {
     animation: none;
   }

@@ -82,7 +82,7 @@ function googleOrMicrosoftTask(record: StoredRecord, now: Date): Task {
     origin: 'migration',
     source: `${record.provider === 'google' ? 'Google Tasks' : 'Microsoft To Do'} · ${record.containerName}`,
     createdAt: now.toISOString(),
-    ...(record.dueOn ? { deadlineDate: record.dueOn } : {}),
+    ...(record.provider === 'microsoft' && record.dueOn ? { deadlineDate: record.dueOn } : {}),
     ...(completed && record.completedAt ? { completedAt: record.completedAt } : {}),
     externalLinks: [link],
   };

@@ -913,6 +913,36 @@ export type ProviderScopePublication = {
   fetchedAt: string;
 };
 
+export type TaskStatusRemoteSnapshot = {
+  title: string;
+  notes: string | null;
+  state: 'open' | 'completed';
+  completedAt: string | null;
+  dueOn: string | null;
+  parentId: string | null;
+  position: string | null;
+  sourceUrl: string | null;
+  version: string | null;
+  updatedAt: string | null;
+  completionWritable: boolean;
+};
+
+export type TaskStatusSettlement =
+  | {
+      outcome: 'succeeded';
+      sourceStatus: string;
+      sourceVersion: string;
+      sourceUpdatedAt: string | null;
+      completedAt: string | null;
+      current?: TaskStatusRemoteSnapshot;
+    }
+  | {
+      outcome: 'conflict';
+      notice: string;
+      current: TaskStatusRemoteSnapshot | null;
+    }
+  | { outcome: 'failed'; notice: string; retryable: boolean };
+
 export function createRowStore(db: DatabaseSync) {
   function listTasks(): TaskRow[] {
     return (db.prepare('SELECT * FROM tasks ORDER BY created_at DESC, id').all() as Record<string, unknown>[])
@@ -1492,6 +1522,300 @@ export function createRowStore(db: DatabaseSync) {
     );
   }
 
+  function queueTaskStatusAction(
+    taskId: string,
+    expectedTaskVersion: number,
+    desiredState: 'open' | 'completed',
+    now: string,
+  ):
+    | { outcome: 'queued'; action: ActionRow; task: TaskRow }
+    | { outcome: 'not_found'; task: null }
+    | { outcome: 'read_only'; task: TaskRow }
+    | { outcome: 'conflict'; task: TaskRow } {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = getTask(taskId);
+      if (!task) {
+        db.exec('ROLLBACK');
+        return { outcome: 'not_found', task: null };
+      }
+      if (task.version !== expectedTaskVersion) {
+        db.exec('ROLLBACK');
+        return { outcome: 'conflict', task };
+      }
+      if (task.binding.kind !== 'google' || !task.observed || !task.observed.completionWritable || task.unavailableAt) {
+        db.exec('ROLLBACK');
+        return { outcome: 'read_only', task };
+      }
+
+      const obsoleteRows = db.prepare(`SELECT * FROM actions
+        WHERE task_id=? AND kind='task-status' AND state IN ('queued', 'failed')`).all(taskId) as Record<string, unknown>[];
+      for (const row of obsoleteRows) {
+        const obsolete = actionFromSql(row);
+        if (!obsolete) continue;
+        const version = obsolete.version + 1;
+        db.prepare(`UPDATE actions SET version=?, state='superseded', next_attempt_at=NULL,
+          claim_id=NULL, lease_until=NULL, error=?, updated_at=? WHERE id=?`).run(
+          version, 'A newer owner status intent replaced this action.', now, obsolete.id,
+        );
+        const superseded = getAction(obsolete.id);
+        if (!superseded) throw new Error('Superseded action disappeared');
+        insertChange(db, {
+          actor: 'owner', mutationKey: `owner:action:${obsolete.id}:${version}`, entityKind: 'action',
+          entityId: obsolete.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(superseded),
+          details: { before: obsolete.state, after: 'superseded', replacedByIntent: task.intentVersion + 1 }, at: now,
+        });
+      }
+
+      const intentVersion = task.intentVersion + 1;
+      const nextTaskVersion = task.version + 1;
+      db.prepare('UPDATE tasks SET version=?, intent_version=?, updated_at=? WHERE id=? AND version=?')
+        .run(nextTaskVersion, intentVersion, now, task.id, task.version);
+      const updatedTask = getTask(task.id);
+      if (!updatedTask) throw new Error('Task intent disappeared');
+      const payload: ActionRow['payload'] = {
+        kind: 'task-status',
+        taskId: task.id,
+        target: task.binding.ref,
+        expectedTaskVersion: task.version,
+        intentVersion,
+        expectedEtag: task.observed.etag,
+        before: task.observed.status,
+        after: desiredState,
+      };
+      const action: ActionRow = {
+        id: randomUUID(),
+        version: 1,
+        payload,
+        operationKey: `task-status:${task.id}:${intentVersion}`,
+        requestHash: canonicalHash(payload),
+        approval: {
+          actor: 'owner',
+          at: now,
+          previewText: `${task.observed.status} -> ${desiredState} for "${task.observed.title}" in Google Tasks account ${task.binding.ref.accountId}, list ${task.binding.ref.listId}, task ${task.binding.ref.externalId}`,
+        },
+        state: 'queued',
+        attemptCount: 0,
+        nextAttemptAt: now,
+        claimId: null,
+        leaseUntil: null,
+        receipt: null,
+        error: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      insertApprovedAction(action);
+      insertChange(db, {
+        actor: 'owner', mutationKey: `owner:task-intent:${task.id}:${intentVersion}`, entityKind: 'task',
+        entityId: task.id, entityVersion: updatedTask.version, operation: 'transition', snapshot: taskSnapshot(updatedTask),
+        details: { observed: task.observed.status, intended: desiredState, actionId: action.id }, at: now,
+      });
+      insertChange(db, {
+        actor: 'owner', mutationKey: `owner:action:${action.id}:1`, entityKind: 'action', entityId: action.id,
+        entityVersion: 1, operation: 'upsert', snapshot: actionSnapshot(action), details: { clickApproval: true }, at: now,
+      });
+      db.exec('COMMIT');
+      return { outcome: 'queued', action, task: updatedTask };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function recoverExpiredTaskActions(now: string): number {
+    const rows = db.prepare(`SELECT * FROM actions
+      WHERE kind='task-status' AND state='running' AND lease_until IS NOT NULL AND lease_until<=?`).all(now) as Record<string, unknown>[];
+    let recovered = 0;
+    for (const row of rows) {
+      const action = actionFromSql(row);
+      if (!action) continue;
+      const version = action.version + 1;
+      db.prepare(`UPDATE actions SET version=?, state='queued', next_attempt_at=?, claim_id=NULL,
+        lease_until=NULL, error=?, updated_at=? WHERE id=? AND version=?`).run(
+        version, now, 'The worker stopped before recording a result. Readback will reconcile before another write.',
+        now, action.id, action.version,
+      );
+      const next = getAction(action.id);
+      if (!next) throw new Error('Recovered action disappeared');
+      insertChange(db, {
+        actor: 'system', mutationKey: `system:action:${action.id}:${version}`, entityKind: 'action',
+        entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(next),
+        details: { before: 'running', after: 'queued', recovery: 'expired-lease' }, at: now,
+      });
+      recovered += 1;
+    }
+    return recovered;
+  }
+
+  function claimNextTaskStatusAction(now: string, leaseMilliseconds: number): ActionRow | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      recoverExpiredTaskActions(now);
+      for (let checked = 0; checked < 500; checked += 1) {
+        const row = db.prepare(`SELECT candidate.* FROM actions AS candidate
+          WHERE candidate.kind='task-status'
+            AND (candidate.state='queued' OR (candidate.state='failed' AND candidate.next_attempt_at IS NOT NULL))
+            AND candidate.next_attempt_at IS NOT NULL AND candidate.next_attempt_at<=?
+            AND NOT EXISTS (
+              SELECT 1 FROM actions AS active
+              WHERE active.task_id=candidate.task_id AND active.id<>candidate.id AND active.state='running'
+                AND active.lease_until>?
+            )
+          ORDER BY candidate.created_at, candidate.id LIMIT 1`).get(now, now) as Record<string, unknown> | undefined;
+        const action = row ? actionFromSql(row) : null;
+        if (!action || action.payload.kind !== 'task-status') {
+          db.exec('COMMIT');
+          return null;
+        }
+        const task = getTask(action.payload.taskId);
+        if (!task || task.intentVersion !== action.payload.intentVersion) {
+          const version = action.version + 1;
+          db.prepare(`UPDATE actions SET version=?, state='superseded', next_attempt_at=NULL,
+            claim_id=NULL, lease_until=NULL, error=?, updated_at=? WHERE id=?`).run(
+            version, 'The task has a newer status intent.', now, action.id,
+          );
+          const next = getAction(action.id);
+          if (!next) throw new Error('Superseded action disappeared');
+          insertChange(db, {
+            actor: 'system', mutationKey: `system:action:${action.id}:${version}`, entityKind: 'action',
+            entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(next),
+            details: { before: action.state, after: 'superseded' }, at: now,
+          });
+          continue;
+        }
+        const claimId = randomUUID();
+        const leaseUntil = new Date(Date.parse(now) + leaseMilliseconds).toISOString();
+        const version = action.version + 1;
+        db.prepare(`UPDATE actions SET version=?, state='running', attempt_count=attempt_count+1,
+          next_attempt_at=NULL, claim_id=?, lease_until=?, error=NULL, updated_at=? WHERE id=? AND version=?`).run(
+          version, claimId, leaseUntil, now, action.id, action.version,
+        );
+        const claimed = getAction(action.id);
+        if (!claimed) throw new Error('Claimed action disappeared');
+        insertChange(db, {
+          actor: 'system', mutationKey: `system:action:${action.id}:${version}`, entityKind: 'action',
+          entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(claimed),
+          details: { before: action.state, after: 'running', attempt: claimed.attemptCount }, at: now,
+        });
+        db.exec('COMMIT');
+        return claimed;
+      }
+      db.exec('COMMIT');
+      return null;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function settleTaskStatusAction(
+    id: string,
+    claimId: string,
+    result: TaskStatusSettlement,
+    now: string,
+  ): ActionRow | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const action = getAction(id);
+      if (!action || action.state !== 'running' || action.claimId !== claimId || action.payload.kind !== 'task-status') {
+        db.exec('ROLLBACK');
+        return null;
+      }
+      const task = getTask(action.payload.taskId);
+      let nextTask: TaskRow | null = null;
+      const remote = result.outcome === 'failed' ? null : result.current ?? null;
+      if (task && task.observed && (result.outcome === 'succeeded' || remote)) {
+        const status = result.outcome === 'succeeded'
+          ? action.payload.after
+          : remote?.state ?? task.observed.status;
+        const observed = {
+          ...task.observed,
+          ...(remote ? {
+            title: remote.title,
+            notes: remote.notes,
+            doOn: remote.dueOn,
+            parentId: remote.parentId,
+            position: remote.position,
+            sourceUrl: remote.sourceUrl,
+            completionWritable: remote.completionWritable,
+          } : {}),
+          status,
+          completedAt: remote ? remote.completedAt : result.outcome === 'succeeded' ? result.completedAt : task.observed.completedAt,
+          etag: remote?.version ?? (result.outcome === 'succeeded' ? result.sourceVersion : task.observed.etag),
+          observedAt: remote?.updatedAt ?? (result.outcome === 'succeeded' ? result.sourceUpdatedAt ?? now : now),
+        };
+        const version = task.version + 1;
+        db.prepare(`UPDATE tasks SET version=?, title=?, notes=?, status=?, completed_at=?, do_on=?, parent_id=?,
+          position=?, source_url=?, etag=?, observed_at=?, completion_writable=?, unavailable_at=NULL, updated_at=? WHERE id=?`).run(
+          version, observed.title, observed.notes, observed.status, observed.completedAt, observed.doOn,
+          observed.parentId, observed.position, observed.sourceUrl, observed.etag, observed.observedAt,
+          observed.completionWritable ? 1 : 0, now, task.id,
+        );
+        if (task.binding.kind === 'google') {
+          db.prepare(`UPDATE provider_records SET title=?, status=?, due_on=?, completed_at=?, source_updated_at=?,
+            source_version=?, completion_writable=?, notes=?, parent_id=?, position=?, source_url=?, imported_at=?, deleted_at=NULL
+            WHERE provider='google' AND kind='task' AND connection_id=? AND container_id=? AND external_id=?`).run(
+            observed.title,
+            result.outcome === 'succeeded' ? result.sourceStatus : observed.status === 'completed' ? 'completed' : 'needsAction',
+            observed.doOn,
+            observed.completedAt,
+            observed.observedAt,
+            observed.etag,
+            observed.completionWritable ? 1 : 0,
+            observed.notes,
+            observed.parentId,
+            observed.position,
+            observed.sourceUrl,
+            now,
+            task.binding.ref.accountId,
+            task.binding.ref.listId,
+            task.binding.ref.externalId,
+          );
+        }
+        nextTask = getTask(task.id);
+        if (!nextTask) throw new Error('Settled task disappeared');
+        insertChange(db, {
+          actor: 'provider', mutationKey: `provider:task-readback:${task.id}:${version}`, entityKind: 'task',
+          entityId: task.id, entityVersion: version, operation: 'transition', snapshot: taskSnapshot(nextTask),
+          details: {
+            actionId: action.id,
+            before: task.observed.status,
+            after: nextTask.observed?.status,
+            result: result.outcome,
+          }, at: now,
+        });
+      }
+
+      const version = action.version + 1;
+      const state = result.outcome === 'succeeded' ? 'succeeded' : result.outcome === 'conflict' ? 'conflict' : 'failed';
+      const retryAt = result.outcome === 'failed' && result.retryable && action.attemptCount < 5
+        ? new Date(Date.parse(now) + Math.min(60_000, 1_000 * 2 ** Math.max(0, action.attemptCount - 1))).toISOString()
+        : null;
+      const receipt = result.outcome === 'succeeded'
+        ? { providerId: action.payload.target.externalId, verifiedAt: now, sourceVersion: result.sourceVersion }
+        : result.outcome === 'conflict' && result.current
+          ? { conflict: result.current, verifiedAt: now }
+          : null;
+      const error = result.outcome === 'succeeded' ? null : result.notice;
+      db.prepare(`UPDATE actions SET version=?, state=?, next_attempt_at=?, claim_id=NULL, lease_until=NULL,
+        receipt_json=?, error=?, updated_at=? WHERE id=? AND version=?`).run(
+        version, state, retryAt, receipt ? canonicalJson(receipt) : null, error, now, action.id, action.version,
+      );
+      const settled = getAction(action.id);
+      if (!settled) throw new Error('Settled action disappeared');
+      insertChange(db, {
+        actor: 'system', mutationKey: `system:action:${action.id}:${version}`, entityKind: 'action',
+        entityId: action.id, entityVersion: version, operation: 'transition', snapshot: actionSnapshot(settled),
+        details: { before: 'running', after: state, taskVersion: nextTask?.version ?? task?.version ?? null }, at: now,
+      });
+      db.exec('COMMIT');
+      return settled;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
   return {
     listTasks,
     getTask,
@@ -1513,6 +1837,9 @@ export function createRowStore(db: DatabaseSync) {
     listChanges,
     readContext,
     insertApprovedAction,
+    queueTaskStatusAction,
+    claimNextTaskStatusAction,
+    settleTaskStatusAction,
     insertChange: (input: Parameters<typeof insertChange>[1]) => insertChange(db, input),
   };
 }

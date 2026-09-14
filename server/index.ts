@@ -10,6 +10,7 @@ import { createHermesActionClient, createHermesMirrorService, type HermesActionC
 import webPush from 'web-push';
 import { deliverDuePushNotifications, deliveryKey, subscriptionDeliveryKey } from './push.ts';
 import { adoptedTaskIdForHermes } from './task-management.ts';
+import { createTaskStatusActionWorker } from './action-worker.ts';
 
 const PUSH_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -52,10 +53,19 @@ const hermes = hermesPath
   : undefined;
 const integrationConfig = integrationConfigFromEnvironment();
 const integrations = integrationConfig ? createIntegrationService(store, integrationConfig) : undefined;
+const actionWorker = createTaskStatusActionWorker(store, integrations ?? {
+  updateGoogleTaskCompletion: async () => ({
+    outcome: 'failed',
+    notice: 'Google Tasks is not configured.',
+    retryable: false,
+  }),
+});
 const app = createApp(store, password, hermes, integrations, {
   pushPublicKey: vapid.publicKey,
   taskStatusToken,
+  actionWorker,
 });
+actionWorker.start();
 // Establish a current or explicitly stale mirror before the first reminder
 // tick, so persisted rows from a previous run can never fire unchecked.
 if (hermes) await hermes.poll();
@@ -138,6 +148,7 @@ if (integrations) {
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   clearInterval(pushTimer);
+  actionWorker.stop();
   if (hermesTimer) clearInterval(hermesTimer);
   server.close(() => { store.close(); process.exit(0); });
 });

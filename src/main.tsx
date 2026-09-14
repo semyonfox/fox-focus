@@ -38,8 +38,19 @@ import {
 } from "./calendar-time.ts";
 import { hermesLabels, useHermesFeed } from "./hermes-feed.tsx";
 import { deduplicatedProviderIdentity, type HermesTask, type HermesTaskAnnotationInput } from "./hermes-model.ts";
-import { IntegrationCalendarContext, IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord } from './integrations.tsx';
+import { IntegrationCalendarContext, IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord, type OverviewState } from './integrations.tsx';
 import { areaForList } from './integration-model.ts';
+import {
+  isTaskPlanRow,
+  isTaskRow as isRowTask,
+  isTaskStatusActionRow,
+  loadTaskRows,
+  mergeTaskRows,
+  taskConflictFromAction,
+  type TaskRowsSnapshot,
+  type TaskStatusActionRow,
+} from "./row-client.ts";
+import type { TaskPlanRow, TaskRow } from "./row-model.ts";
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
@@ -116,6 +127,19 @@ function formatCreatedAt(createdAt: string | undefined): string | null {
     month: "short",
     timeZone: "Europe/Dublin",
   }).format(new Date(createdAt));
+}
+
+function formatDublinInstant(value: string | null): string {
+  if (!value) return "Unknown time";
+  const instant = new Date(value);
+  if (Number.isNaN(instant.getTime())) return "Unknown time";
+  return new Intl.DateTimeFormat("en-IE", {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Europe/Dublin",
+  }).format(instant);
 }
 
 function legacyDeadlineDate(due: string, today: string): string {
@@ -242,22 +266,6 @@ function WorkspaceUnavailable() {
   );
 }
 
-type ClientTaskActionStatus = "awaiting_approval" | "running" | "succeeded" | "failed" | "conflict";
-type ClientTaskAction = {
-  id: string;
-  taskId: string;
-  desiredState: "open" | "completed";
-  before: Record<string, unknown>;
-  after: Record<string, unknown>;
-  status: ClientTaskActionStatus;
-  result: Record<string, unknown> | null;
-  lastError: string | null;
-  createdAt: string;
-  expiresAt?: string;
-  leaseExpiresAt?: string | null;
-};
-
-type TaskActionPreview = ClientTaskAction & { status: "awaiting_approval"; expiresAt: string };
 type HermesAdoptionPreview = {
   id: string;
   status: "awaiting_approval";
@@ -265,19 +273,6 @@ type HermesAdoptionPreview = {
   after: Task;
   expiresAt: string;
 };
-
-function isClientTaskAction(value: unknown): value is ClientTaskAction {
-  return isRecord(value) && typeof value.id === "string" && typeof value.taskId === "string" &&
-    (value.desiredState === "open" || value.desiredState === "completed") &&
-    ["awaiting_approval", "running", "succeeded", "failed", "conflict"].includes(String(value.status)) &&
-    isRecord(value.before) && isRecord(value.after) &&
-    (value.result === null || isRecord(value.result)) &&
-    (value.lastError === null || typeof value.lastError === "string") && typeof value.createdAt === "string";
-}
-
-function isTaskActionPreview(value: unknown): value is TaskActionPreview {
-  return isClientTaskAction(value) && value.status === "awaiting_approval" && typeof value.expiresAt === "string";
-}
 
 function isHermesAdoptionPreview(value: unknown): value is HermesAdoptionPreview {
   return isRecord(value) && typeof value.id === "string" && value.status === "awaiting_approval" &&
@@ -289,11 +284,13 @@ function isServerSnapshot(value: unknown): value is ServerSnapshot {
     value.revision >= 0 && isPrototypeData(value.data);
 }
 
-function actionStateLabel(action: ClientTaskAction | undefined): string | null {
+function actionStateLabel(action: TaskStatusActionRow | undefined): string | null {
   if (!action) return null;
-  if (action.status === "awaiting_approval" || action.status === "running") return "Google pending";
-  if (action.status === "failed") return "Google retry needed";
-  if (action.status === "conflict") return "Google changed";
+  if (action.state === "queued" || action.state === "running") return "Google pending";
+  if (action.state === "succeeded") return "Google confirmed";
+  if (action.state === "failed") return "Google failed";
+  if (action.state === "conflict") return "Google changed";
+  if (action.state === "unknown") return "Google unknown";
   return null;
 }
 
@@ -318,7 +315,7 @@ function TaskRow({
   toggleDisabled?: boolean;
   toggleBusy?: boolean;
   dueLabel?: string;
-  latestAction?: ClientTaskAction;
+  latestAction?: TaskStatusActionRow;
 }) {
   const createdAt = formatCreatedAt(task.createdAt);
   const planned = task.scheduledTime && !task.completed
@@ -345,9 +342,8 @@ function TaskRow({
             {task.area} · {task.duration}
             {planned ? <em className="task-sync-chip">{task.completed ? "Calendar done" : `${planned} on calendar`}</em> : null}
             {task.origin === "inbox" ? <em className="source-chip" title={task.source} aria-label={`From ${task.source ?? "Inbox"}`}>{task.source?.replace(/^Inbox · /, "") ?? "Inbox"}</em> : null}
-            {task.externalLinks?.some((link) => link.provider === "google_tasks") ? <em className="source-chip">Google linked</em> : task.origin === "migration" ? <em className="source-chip">Imported</em> : null}
-            {sourceBadge}
-            {actionStateLabel(latestAction) ? <em className={`task-action-state task-action-state--${latestAction?.status}`}>{actionStateLabel(latestAction)}</em> : null}
+            {sourceBadge ?? (task.externalLinks?.some((link) => link.provider === "google_tasks") ? <em className="source-chip">Google linked</em> : task.origin === "migration" ? <em className="source-chip">Imported</em> : null)}
+            {actionStateLabel(latestAction) ? <em className={`task-action-state task-action-state--${latestAction?.state}`}>{actionStateLabel(latestAction)}</em> : null}
             {!compact ? <em className={`task-created${createdAt ? "" : " task-created--unknown"}`}>{createdAt ? `Added ${createdAt}` : "Created date unknown"}</em> : null}
           </span>
         </span>
@@ -503,6 +499,70 @@ function hermesTaskProjection(task: HermesTask, today: string, effectiveArea = t
   };
 }
 
+function rowTaskProjection(
+  row: TaskRow,
+  plan: TaskPlanRow | undefined,
+  legacyTask: Task | undefined,
+  area: Area,
+  today: string,
+): Task | null {
+  if (row.binding.kind === "legacy") {
+    const sourceTask = isTask(row.binding.source) ? row.binding.source : legacyTask;
+    if (!sourceTask) return null;
+    const plannedInstant = plan?.plannedAt ? new Date(plan.plannedAt) : null;
+    const plannedAtIsValid = plannedInstant !== null && !Number.isNaN(plannedInstant.getTime());
+    const scheduledDate = plannedAtIsValid
+      ? dublinDateKey(plannedInstant)
+      : plan?.plannedOn ?? undefined;
+    const scheduledTime = plannedAtIsValid && plan?.plannedAt ? dublinTimeValue(plan.plannedAt) : null;
+    return {
+      ...sourceTask,
+      priority: plan?.priority ?? sourceTask.priority,
+      duration: plan?.estimateMinutes ? `${plan.estimateMinutes} min` : sourceTask.duration,
+      state: sourceTask.completed ? "done" : plan?.waiting ? "waiting" : scheduledDate ? "scheduled" : "up-next",
+      scheduledTime,
+      scheduledDate,
+      deadlineDate: plan?.deadlineOn ?? undefined,
+      linkedEventId: undefined,
+    };
+  }
+  if (!row.observed) return legacyTask ?? null;
+
+  const completed = row.observed.status === "completed";
+  const plannedInstant = plan?.plannedAt ? new Date(plan.plannedAt) : null;
+  const plannedAtIsValid = plannedInstant !== null && !Number.isNaN(plannedInstant.getTime());
+  const scheduledDate = plannedAtIsValid
+    ? dublinDateKey(plannedInstant)
+    : plan?.plannedOn ?? undefined;
+  const scheduledTime = plannedAtIsValid && plan?.plannedAt ? dublinTimeValue(plan.plannedAt) : null;
+  const state: TaskState = completed
+    ? "done"
+    : plan?.waiting
+      ? "waiting"
+      : scheduledDate
+        ? "scheduled"
+        : "up-next";
+
+  return {
+    id: row.id,
+    title: row.observed.title,
+    area,
+    state,
+    duration: plan?.estimateMinutes ? `${plan.estimateMinutes} min` : legacyTask?.duration ?? "30 min",
+    due: row.observed.doOn ? deadlineDateLabel(row.observed.doOn, today) : "No deadline",
+    priority: plan?.priority ?? legacyTask?.priority ?? "medium",
+    completed,
+    scheduledTime,
+    ...(scheduledDate ? { scheduledDate } : {}),
+    origin: legacyTask?.origin ?? (row.originInboxId ? "inbox" : "migration"),
+    source: legacyTask?.source ?? "Google Tasks",
+    createdAt: row.createdAt,
+    ...(plan?.deadlineOn ? { deadlineDate: plan.deadlineOn } : {}),
+    ...(row.observed.completedAt ? { completedAt: row.observed.completedAt } : {}),
+    ...(legacyTask?.externalLinks ? { externalLinks: legacyTask.externalLinks } : {}),
+  };
+}
+
 function App({ initial }: { initial?: ServerSnapshot }) {
   const hermes = useHermesFeed(Boolean(initial));
   const integrations = useOverview(Boolean(initial));
@@ -543,9 +603,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [hermesCompletionApproval, setHermesCompletionApproval] = useState<HermesTask | null>(null);
   const [hermesTaskDraft, setHermesTaskDraft] = useState<TaskDraft>(defaultTaskDraft);
   const [hermesCompletionPending, setHermesCompletionPending] = useState<string | null>(null);
-  const [taskActions, setTaskActions] = useState<ClientTaskAction[]>([]);
-  const [taskActionPreview, setTaskActionPreview] = useState<TaskActionPreview | null>(null);
-  const [taskActionBusy, setTaskActionBusy] = useState(false);
+  const [taskRows, setTaskRows] = useState<TaskRowsSnapshot | null>(null);
+  const [taskRowsError, setTaskRowsError] = useState(false);
+  const [busyTaskIds, setBusyTaskIds] = useState<Set<string>>(() => new Set());
+  const [taskPlanBusy, setTaskPlanBusy] = useState(false);
+  const [taskConflictActionId, setTaskConflictActionId] = useState<string | null>(null);
+  const taskRowsRefresh = useRef<Promise<void> | null>(null);
   const [hermesAdoption, setHermesAdoption] = useState<HermesAdoptionPreview | null>(null);
   const [adoptingHermesId, setAdoptingHermesId] = useState<string | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
@@ -607,10 +670,37 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
   }, [data, initial]);
 
+  const hasUnsettledTaskAction = taskRows?.actions.some((action) =>
+    action.state === "queued" || action.state === "running" ||
+    (action.state === "failed" && action.nextAttemptAt !== null)) === true;
+
   useEffect(() => {
     if (!initial) return;
-    void refreshTaskActions();
-  }, [initial]);
+    const controller = new AbortController();
+    let active = true;
+    const refresh = () => {
+      if (taskRowsRefresh.current) return taskRowsRefresh.current;
+      const request = loadTaskRows(controller.signal).then((rows) => {
+        if (!active) return;
+        setTaskRows((current) => mergeTaskRows(current, rows));
+        setTaskRowsError(false);
+      }).catch((error: unknown) => {
+        if (!active || (error instanceof DOMException && error.name === "AbortError")) return;
+        setTaskRowsError(true);
+      }).finally(() => {
+        if (taskRowsRefresh.current === request) taskRowsRefresh.current = null;
+      });
+      taskRowsRefresh.current = request;
+      return request;
+    };
+    void refresh();
+    const interval = window.setInterval(refresh, hasUnsettledTaskAction ? 800 : 15_000);
+    return () => {
+      active = false;
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [hasUnsettledTaskAction, initial]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -620,7 +710,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || taskActionPreview || hermesAdoption);
+  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || hermesAdoption || taskConflictActionId);
 
   useEffect(() => {
     if (!isOverlayOpen) {
@@ -771,13 +861,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setShowReminderTray(false);
       setActiveReminderId(null);
       setShowIntegrations(false);
-      if (!taskActionBusy) setTaskActionPreview(null);
+      setTaskConflictActionId(null);
       if (!adoptingHermesId) setHermesAdoption(null);
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [adoptingHermesId, taskActionBusy]);
+  }, [adoptingHermesId]);
 
   useEffect(() => {
     if (!completionUndo) return;
@@ -809,13 +899,68 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         }]
       : [];
   }), [data.listAreas, hermesTasks]);
-  const sortedEvents = useMemo(
-    () => [...data.events, ...hermesPlannedEvents].sort((first, second) => compareCalendarEvents(first, second, todayDate)),
-    [data.events, hermesPlannedEvents, todayDate],
-  );
   const calendarDays = useMemo(() => calendarDateWindow(calendarAnchor, 3, 3), [calendarAnchor]);
   const calendarRangeStart = selectedDate;
   const calendarRangeEnd = calendarMode === "day" ? selectedDate : addCalendarDays(selectedDate, 6);
+  const providerTaskRecords = useMemo(
+    () => integrations.overview?.records.filter((record) => record.kind === "task") ?? [],
+    [integrations.overview?.records],
+  );
+  const taskRowById = useMemo(
+    () => new Map((taskRows?.tasks ?? []).map((task) => [task.id, task])),
+    [taskRows?.tasks],
+  );
+  const taskPlanById = useMemo(
+    () => new Map((taskRows?.taskPlans ?? []).map((plan) => [plan.taskId, plan])),
+    [taskRows?.taskPlans],
+  );
+  const displayTasks = useMemo(() => {
+    if (!initial || !taskRows) return data.tasks;
+    const legacyById = new Map(data.tasks.map((task) => [task.id, task]));
+    return taskRows.tasks.flatMap((row) => {
+      const listId = row.binding.kind === "google"
+        ? row.binding.ref.listId
+        : row.binding.kind === "pending"
+          ? row.binding.destination.listId
+          : "";
+      const listName = providerTaskRecords.find((record) =>
+        record.provider === "google" && record.containerId === listId)?.containerName ?? listId;
+      const area = row.binding.kind === "legacy"
+        ? "Personal"
+        : areaForList(data.listAreas, "google", listId, listName);
+      const projected = rowTaskProjection(row, taskPlanById.get(row.id), legacyById.get(row.id), area, todayDate);
+      return projected ? [projected] : [];
+    });
+  }, [data.listAreas, data.tasks, initial, providerTaskRecords, taskPlanById, taskRows, todayDate]);
+  const googleTaskIds = useMemo(() => new Set((taskRows?.tasks ?? [])
+    .filter((task) => task.binding.kind === "google" || task.binding.kind === "pending")
+    .map((task) => task.id)), [taskRows?.tasks]);
+  const taskById = useMemo(() => new Map(displayTasks.map((task) => [task.id, task])), [displayTasks]);
+  const rowTaskIds = useMemo(() => new Set((taskRows?.tasks ?? []).map((task) => task.id)), [taskRows?.tasks]);
+  const rowPlannedEvents = useMemo<TimelineEvent[]>(() => (taskRows?.taskPlans ?? []).flatMap((plan) => {
+    if (!plan.plannedAt) return [];
+    const task = taskById.get(plan.taskId);
+    if (!task) return [];
+    return [{
+      id: `row-plan:${plan.taskId}`,
+      title: task.title,
+      subtitle: `Fox Focus plan · ${task.area}`,
+      area: task.area,
+      startsAt: plan.plannedAt,
+      duration: plan.estimateMinutes ?? 30,
+      editable: true,
+      origin: "task" as const,
+      taskId: task.id,
+      source: "Fox Focus task plan",
+    }];
+  }), [taskById, taskRows?.taskPlans]);
+  const staleRowEventIds = useMemo(() => new Set(data.tasks.flatMap((task) =>
+    rowTaskIds.has(task.id) && task.linkedEventId ? [task.linkedEventId] : [])), [data.tasks, rowTaskIds]);
+  const sortedEvents = useMemo(() => [
+    ...data.events.filter((event) => !staleRowEventIds.has(event.id) && (!event.taskId || !rowTaskIds.has(event.taskId))),
+    ...rowPlannedEvents,
+    ...hermesPlannedEvents,
+  ].sort((first, second) => compareCalendarEvents(first, second, todayDate)), [data.events, hermesPlannedEvents, rowPlannedEvents, rowTaskIds, staleRowEventIds, todayDate]);
   const visibleCalendarEvents = useMemo(
     () => sortedEvents.filter((event) => {
       const date = eventDateKey(event, todayDate);
@@ -823,8 +968,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }),
     [calendarRangeEnd, calendarRangeStart, sortedEvents, todayDate],
   );
-  const taskById = useMemo(() => new Map(data.tasks.map((task) => [task.id, task])), [data.tasks]);
-  const eventById = useMemo(() => new Map(data.events.map((event) => [event.id, event])), [data.events]);
+  const eventById = useMemo(() => new Map(sortedEvents.map((event) => [event.id, event])), [sortedEvents]);
   const selectedEvent = visibleCalendarEvents.find((event) => event.id === selectedEventId) ?? visibleCalendarEvents[0] ?? null;
   const selectedEventTask = selectedEvent?.taskId ? taskById.get(selectedEvent.taskId) : undefined;
   const selectedEventHermesTask = selectedEvent?.taskId?.startsWith("hermes:")
@@ -836,24 +980,38 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   );
   const selectedInbox = reviewItems.find((item) => item.id === selectedInboxId) ?? reviewItems[0] ?? null;
   const selectedInboxIndex = selectedInbox ? reviewItems.findIndex((item) => item.id === selectedInbox.id) : -1;
-  const activeTasks = data.tasks.filter((task) => !task.completed);
+  const activeTasks = displayTasks.filter((task) => !task.completed);
   const activeBlock = visibleCalendarEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
   const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
-  const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
+  const microsoftConfigured = integrations.overview?.providers.some((status) =>
+    status.provider === "microsoft" && status.configured) === true;
+  const importedTasks = (taskRows ? providerTaskRecords.filter((record) => record.provider !== "google") : providerTaskRecords)
+    .filter((record) => record.provider !== "microsoft" || microsoftConfigured);
   const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
     importedTasks.some((task) => task.provider === provider) ||
     integrations.overview?.providers.some((status) => status.provider === provider && status.connection?.state === "connected") === true;
   const googleTasksAvailable = providerIsAvailable("google");
-  const microsoftTasksAvailable = providerIsAvailable("microsoft");
-  const latestActionByTask = new Map<string, ClientTaskAction>();
-  for (const action of taskActions) {
-    if (!latestActionByTask.has(action.taskId)) latestActionByTask.set(action.taskId, action);
+  const microsoftTasksAvailable = microsoftConfigured;
+  const dailyIntegrations: OverviewState = {
+    ...integrations,
+    overview: integrations.overview ? {
+      providers: integrations.overview.providers.filter((status) => status.provider !== "microsoft" || status.configured),
+      records: integrations.overview.records.filter((record) => record.provider !== "microsoft" || microsoftConfigured),
+    } : null,
+  };
+  const latestActionByTask = new Map<string, TaskStatusActionRow>();
+  for (const action of taskRows?.actions ?? []) {
+    const current = latestActionByTask.get(action.payload.taskId);
+    if (!current || action.payload.intentVersion > current.payload.intentVersion ||
+      (action.payload.intentVersion === current.payload.intentVersion && action.version > current.version)) {
+      latestActionByTask.set(action.payload.taskId, action);
+    }
   }
   const categoryLocalTasks = taskCategory === allTaskCategories
-    ? data.tasks
+    ? displayTasks
     : taskCategory === unclassifiedTaskCategory
       ? []
-      : data.tasks.filter((task) => task.area === taskCategory);
+      : displayTasks.filter((task) => task.area === taskCategory);
   const categoryHermesTasks = taskCategory === allTaskCategories
     ? hermesTasks
     : taskCategory === unclassifiedTaskCategory
@@ -873,7 +1031,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const filtered = categoryLocalTasks.filter((task) => {
       if (taskFilter === "all") return true;
       if (taskFilter === "due-today") return (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed;
-      if (taskFilter === "planned") return Boolean(task.scheduledTime) && !task.completed;
+      if (taskFilter === "planned") return Boolean(task.scheduledTime || task.scheduledDate) && !task.completed;
       if (taskFilter === "waiting") return task.state === "waiting" && !task.completed;
       if (taskFilter === "done") return task.completed;
       return !task.completed;
@@ -920,17 +1078,25 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }));
   const combinedImportedTasks = visibleImportedTasks.filter((task) =>
     !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
+  const visibleFoxTasks = visibleTasks.filter((task) => !googleTaskIds.has(task.id));
+  const visibleGoogleTasks = visibleTasks.filter((task) => googleTaskIds.has(task.id));
   const taskSourceOptions: Array<{ id: TaskSource; label: string; count: number }> = [
     { id: allTaskSources, label: "All sources", count: visibleTasks.length + visibleHermesTasks.length + combinedImportedTasks.length },
-    { id: localTaskSource, label: "Fox Focus", count: visibleTasks.length },
+    { id: localTaskSource, label: "Fox Focus", count: visibleFoxTasks.length },
   ];
   if (hermesBoard) taskSourceOptions.push({ id: hermesTaskSource, label: "Hermes", count: visibleHermesTasks.length });
-  if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleImportedTasks.filter((task) => task.provider === "google").length });
+  if (googleTasksAvailable || visibleGoogleTasks.length) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleGoogleTasks.length });
   if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
-  const isExternalOnlyScope = taskSource === googleTaskSource || taskSource === microsoftTaskSource;
+  const isExternalOnlyScope = taskSource === microsoftTaskSource;
   const isHermesOnlyScope = taskSource === hermesTaskSource;
 
-  const shownLocalTasks = taskSource === allTaskSources || taskSource === localTaskSource ? visibleTasks : [];
+  const shownLocalTasks = taskSource === allTaskSources
+    ? visibleTasks
+    : taskSource === localTaskSource
+      ? visibleFoxTasks
+      : taskSource === googleTaskSource
+        ? visibleGoogleTasks
+        : [];
   const shownHermesTasks = taskSource === allTaskSources || taskSource === hermesTaskSource ? visibleHermesTasks : [];
   const shownImportedTasks = taskSource === allTaskSources
     ? combinedImportedTasks
@@ -940,7 +1106,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   const reminderCount = allReminders.length;
   const reviewCount = data.inboxItems.filter((item) => item.status !== "handled").length;
-  const plannedTaskCount = activeTasks.filter((task) => Boolean(task.linkedEventId && eventById.has(task.linkedEventId))).length +
+  const plannedTaskCount = activeTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate ||
+    (task.linkedEventId && eventById.has(task.linkedEventId)))).length +
     hermesTasks.filter(task => task.status !== "done" && Boolean(task.scheduledAt)).length;
   const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
   const activeImportedTaskCount = importedTasks.filter((task) => task.status !== "completed" &&
@@ -952,12 +1119,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     all: categoryLocalTasks.length + categoryHermesTasks.length,
     open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length,
     "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length,
-    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length,
+    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate) && !task.completed).length,
     waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length,
     done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length,
   };
   const activeTaskFilterCount = Number(taskFilter !== "all") + Number(taskSource !== allTaskSources) + Number(taskSort !== "due");
-  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length;
+  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
   const todayEvents = sortedEvents.filter((event) => eventDateKey(event, todayDate) === todayDate);
   const currentTime = timeValueToMinutes(dublinTimeValue(new Date()));
   const currentEvent = todayEvents.find((event) => {
@@ -985,9 +1152,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   useEffect(() => {
     if ((taskSource === hermesTaskSource && !hermesBoard) ||
-      (taskSource === googleTaskSource && !googleTasksAvailable) ||
+      (taskSource === googleTaskSource && !googleTasksAvailable && visibleGoogleTasks.length === 0) ||
       (taskSource === microsoftTaskSource && !microsoftTasksAvailable)) setTaskSource(allTaskSources);
-  }, [googleTasksAvailable, hermesBoard, microsoftTasksAvailable, taskSource]);
+  }, [googleTasksAvailable, hermesBoard, microsoftTasksAvailable, taskSource, visibleGoogleTasks.length]);
 
   useEffect(() => {
     if ((taskFilter === "planned" || taskFilter === "waiting") && isExternalOnlyScope) setTaskSource(allTaskSources);
@@ -1158,74 +1325,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setData(snapshot.data);
   }
 
-  async function refreshTaskActions() {
-    if (!initial) return;
-    try {
-      const response = await fetch("/api/v1/task-actions");
-      const value: unknown = await response.json();
-      if (!response.ok || !isRecord(value) || !Array.isArray(value.actions) || !value.actions.every(isClientTaskAction)) return;
-      setTaskActions(value.actions);
-    } catch {
-      // Task data remains usable when the optional action ledger cannot load.
-    }
-  }
-
-  async function previewLinkedTaskAction(task: Task, desiredState: "open" | "completed" = task.completed ? "open" : "completed") {
-    if (!initial) return;
-    setTaskActionBusy(true);
-    setStatusMessage("");
-    try {
-      await waitForWorkspaceSaves();
-      const response = await fetch("/api/v1/task-actions/preview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ taskId: task.id, desiredState, idempotencyKey: makeId("task-action") }),
-      });
-      const value: unknown = await response.json();
-      if (!response.ok || !isTaskActionPreview(value)) {
-        throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Could not prepare the Google task preview.");
-      }
-      setTaskActionPreview(value);
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : "Could not prepare the Google task preview.");
-    } finally {
-      setTaskActionBusy(false);
-    }
-  }
-
-  async function executeTaskAction(action: ClientTaskAction, retry: boolean) {
-    setTaskActionBusy(true);
-    try {
-      await waitForWorkspaceSaves();
-      const suffix = retry ? "retry" : "approve";
-      const response = await fetch(`/api/v1/task-actions/${encodeURIComponent(action.id)}/${suffix}`, { method: "POST" });
-      const value: unknown = await response.json();
-      const snapshot = isRecord(value) && isServerSnapshot(value.snapshot) ? value.snapshot : null;
-      const resultAction = isRecord(value) && isClientTaskAction(value.action) ? value.action : null;
-      if (snapshot) applyServerSnapshot(snapshot);
-      if (resultAction) {
-        setTaskActions(current => [resultAction, ...current.filter(candidate => candidate.id !== resultAction.id)]);
-      }
-      setTaskActionPreview(null);
-      if (!resultAction) {
-        throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "The linked action could not be recorded.");
-      }
-      if (resultAction.status === "succeeded") {
-        setStatusMessage(resultAction.desiredState === "completed"
-          ? "Completed here and confirmed in Google Tasks."
-          : "Reopened here and confirmed in Google Tasks.");
-      } else {
-        setStatusMessage(resultAction.lastError ?? (response.status === 409
-          ? "Google changed after the preview. Your Fox Focus task was kept."
-          : "Your Fox Focus task was kept, but Google still needs attention."));
-      }
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : "The linked task action did not finish.");
-    } finally {
-      setTaskActionBusy(false);
-    }
-  }
-
   async function previewHermesAdoption(task: HermesTask) {
     if (!initial) return;
     setAdoptingHermesId(task.id);
@@ -1271,20 +1370,26 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function openTaskComposer(task?: Task, inboxItem?: InboxItem) {
+    const row = task ? taskRowById.get(task.id) : undefined;
+    const plan = task ? taskPlanById.get(task.id) : undefined;
     const linkedEvent = task?.linkedEventId
       ? data.events.find((event) => event.id === task.linkedEventId)
       : undefined;
     setTaskDraft({
       title: task?.title ?? inboxItem?.title ?? "",
       area: task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal"),
-      priority: task?.priority ?? "medium",
+      priority: plan?.priority ?? task?.priority ?? "medium",
       due: task?.due ?? "No deadline",
-      deadlineDate: task?.deadlineDate ?? (task ? legacyDeadlineDate(task.due, todayDate) : ""),
-      duration: task?.duration ?? "30 min",
-      state: task && task.state !== "done" ? task.state : "up-next",
-      scheduledDate: linkedEvent ? eventDateKey(linkedEvent, todayDate) : task?.scheduledDate ?? selectedDate,
-      scheduledTime: linkedEvent ? eventTimeValue(linkedEvent) : task?.scheduledTime ?? "",
-      reminderMode: task ? reminderModeFor(data.reminders, task.id) : "none",
+      deadlineDate: plan?.deadlineOn ?? task?.deadlineDate ?? (task ? legacyDeadlineDate(task.due, todayDate) : ""),
+      duration: plan?.estimateMinutes ? `${plan.estimateMinutes} min` : task?.duration ?? "30 min",
+      state: plan?.waiting ? "waiting" : task && task.state !== "done" ? task.state : "up-next",
+      scheduledDate: plan?.plannedAt
+        ? dublinDateKey(new Date(plan.plannedAt))
+        : plan?.plannedOn ?? (linkedEvent ? eventDateKey(linkedEvent, todayDate) : task?.scheduledDate ?? (task ? "" : selectedDate)),
+      scheduledTime: plan?.plannedAt
+        ? dublinTimeValue(plan.plannedAt)
+        : linkedEvent ? eventTimeValue(linkedEvent) : task?.scheduledTime ?? "",
+      reminderMode: row?.binding.kind === "google" ? "none" : task ? reminderModeFor(data.reminders, task.id) : "none",
     });
     setModalError("");
     setShowTaskDetails(Boolean(task || inboxItem));
@@ -1292,6 +1397,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function openEventComposer(event?: TimelineEvent, inboxItem?: InboxItem) {
+    if (event?.taskId && taskRowById.has(event.taskId)) {
+      const task = taskById.get(event.taskId);
+      if (task) openTaskComposer(task);
+      return;
+    }
     if (event && !event.editable) {
       setStatusMessage("Imported calendar context is read-only. Capture a local block if you need to change it.");
       return;
@@ -1310,9 +1420,66 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setModal({ kind: "event", eventId: event?.id, inboxId: inboxItem?.id });
   }
 
+  async function queueTaskStatus(task: Task, row: TaskRow) {
+    const desiredState = task.completed ? "open" : "completed";
+    setBusyTaskIds((current) => new Set(current).add(task.id));
+    setStatusMessage("");
+    try {
+      const response = await fetch(`/api/v1/tasks/${encodeURIComponent(task.id)}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: row.version, state: desiredState }),
+      });
+      const value: unknown = await response.json();
+      const nextTask = isRecord(value) && isRowTask(value.task)
+        ? value.task
+        : isRecord(value) && isRowTask(value.current)
+          ? value.current
+          : null;
+      const action = isRecord(value) && isTaskStatusActionRow(value.action) ? value.action : null;
+      if (nextTask) setTaskRows((current) => current ? mergeTaskRows(current, {
+        tasks: [nextTask],
+        taskPlans: [],
+        actions: action ? [action] : [],
+      }) : current);
+      if (!response.ok || !action) {
+        throw new Error(isRecord(value) && typeof value.error === "string"
+          ? value.error
+          : "Could not record the Google task change.");
+      }
+      setStatusMessage(desiredState === "completed"
+        ? `Completing "${task.title}" in Google Tasks.`
+        : `Reopening "${task.title}" in Google Tasks.`);
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Could not record the Google task change.");
+    } finally {
+      setBusyTaskIds((current) => {
+        const next = new Set(current);
+        next.delete(task.id);
+        return next;
+      });
+    }
+  }
+
   function toggleTask(task: Task) {
-    if (initial && task.externalLinks?.some(link => link.provider === "google_tasks" && link.policy === "completion_only")) {
-      if (!taskActionBusy) void previewLinkedTaskAction(task);
+    const row = taskRowById.get(task.id);
+    if (initial) {
+      if (!row) {
+        setStatusMessage("Task rows are still loading.");
+        return;
+      }
+      if (row.binding.kind === "google") {
+        const action = latestActionByTask.get(task.id);
+        if (action?.state === "queued" || action?.state === "running" || busyTaskIds.has(task.id)) return;
+        if (action?.state === "conflict") {
+          if (taskConflictFromAction(action)) setTaskConflictActionId(action.id);
+          else setStatusMessage("Google changed, but its conflict snapshot is unavailable. Refresh sources before trying again.");
+          return;
+        }
+        void queueTaskStatus(task, row);
+        return;
+      }
+      setStatusMessage("This task stays with its current owner until migration.");
       return;
     }
     const nowCompleted = !task.completed;
@@ -1342,6 +1509,22 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : `Reopened “${task.title}”. Its reminder stays off.`);
   }
 
+  function approveTaskConflict() {
+    if (!taskConflictActionId || !taskRows) return;
+    const action = taskRows.actions.find((candidate) => candidate.id === taskConflictActionId);
+    if (!action || action.state !== "conflict" || !taskConflictFromAction(action)) return;
+    if (latestActionByTask.get(action.payload.taskId)?.id !== action.id) {
+      setTaskConflictActionId(null);
+      setStatusMessage("The task changed again. Review its latest state before approving.");
+      return;
+    }
+    const task = taskById.get(action.payload.taskId);
+    const row = taskRowById.get(action.payload.taskId);
+    if (!task || row?.binding.kind !== "google") return;
+    setTaskConflictActionId(null);
+    void queueTaskStatus(task, row);
+  }
+
   function undoTaskCompletion() {
     if (!completionUndo) return;
     const task = data.tasks.find((candidate) => candidate.id === completionUndo.taskId);
@@ -1368,6 +1551,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function openTaskSchedule(task: Task) {
+    if (taskRowById.has(task.id)) {
+      openTaskComposer(task);
+      return;
+    }
     if (!task.linkedEventId) {
       openTaskComposer(task);
       return;
@@ -1385,7 +1572,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     openWorkspaceView("agenda");
   }
 
-  function saveTask(event: FormEvent<HTMLFormElement>) {
+  async function saveTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!modal || modal.kind !== "task") return;
 
@@ -1412,6 +1599,57 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
 
     const existingTask = modal.taskId ? data.tasks.find((task) => task.id === modal.taskId) : undefined;
+    const displayTask = modal.taskId ? taskById.get(modal.taskId) : undefined;
+    const row = modal.taskId ? taskRowById.get(modal.taskId) : undefined;
+    const plan = modal.taskId ? taskPlanById.get(modal.taskId) : undefined;
+    if (displayTask && row) {
+      if (!plan) {
+        setModalError("The local task plan is unavailable. Reload before saving.");
+        return;
+      }
+      const estimateMinutes = plan.estimateMinutes === null && taskDraft.duration === "30 min"
+        ? null
+        : parseDuration(taskDraft.duration);
+      setTaskPlanBusy(true);
+      setModalError("");
+      try {
+        const response = await fetch(`/api/v1/tasks/${encodeURIComponent(row.id)}/plan`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            version: plan.version,
+            priority: taskDraft.priority,
+            waiting: taskDraft.state === "waiting",
+            deadlineOn: taskDraft.deadlineDate || null,
+            plannedOn: taskDraft.scheduledDate && !plannedStartAt ? taskDraft.scheduledDate : null,
+            plannedAt: plannedStartAt,
+            estimateMinutes,
+          }),
+        });
+        const value: unknown = await response.json();
+        const nextPlan = isRecord(value) && isTaskPlanRow(value.plan)
+          ? value.plan
+          : isRecord(value) && isTaskPlanRow(value.current)
+            ? value.current
+            : null;
+        if (nextPlan) setTaskRows((current) => current ? mergeTaskRows(current, {
+          tasks: [],
+          taskPlans: [nextPlan],
+          actions: [],
+        }) : current);
+        if (!response.ok || !nextPlan) {
+          throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Could not save the task plan.");
+        }
+        setStatusMessage(`Saved the plan for "${displayTask.title}".`);
+        setModal(null);
+      } catch (error) {
+        setModalError(error instanceof Error ? error.message : "Could not save the task plan.");
+      } finally {
+        setTaskPlanBusy(false);
+      }
+      return;
+    }
+
     const inboxItem = modal.inboxId ? data.inboxItems.find((item) => item.id === modal.inboxId) : undefined;
     const taskId = existingTask?.id ?? makeId("task");
     const origin: TaskOrigin = existingTask?.origin ?? (inboxItem ? "inbox" : "manual");
@@ -1496,6 +1734,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     event.preventDefault();
     if (!modal || modal.kind !== "event") return;
 
+    const displayedEvent = modal.eventId ? eventById.get(modal.eventId) : undefined;
+    if (displayedEvent?.taskId && taskRowById.has(displayedEvent.taskId)) {
+      const task = taskById.get(displayedEvent.taskId);
+      if (task) openTaskComposer(task);
+      return;
+    }
+
     const title = eventDraft.title.trim();
     if (!title) {
       setModalError("Give the calendar block a name before saving it.");
@@ -1514,6 +1759,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
 
     const existingEvent = modal.eventId ? data.events.find((candidate) => candidate.id === modal.eventId) : undefined;
+    if (existingEvent?.taskId && taskRowById.has(existingEvent.taskId)) {
+      const task = taskById.get(existingEvent.taskId);
+      if (task) openTaskComposer(task);
+      return;
+    }
     const inboxItem = modal.inboxId ? data.inboxItems.find((item) => item.id === modal.inboxId) : undefined;
     const eventId = existingEvent?.id ?? makeId("event");
     const source = existingEvent?.source ?? (inboxItem ? `Inbox · ${inboxItem.source}` : "Local calendar block");
@@ -1532,7 +1782,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
     setData((current) => ({
       ...current,
-      tasks: existingEvent?.taskId
+      tasks: existingEvent?.taskId && !rowTaskIds.has(existingEvent.taskId)
         ? current.tasks.map((task) =>
             task.id === existingEvent.taskId
               ? {
@@ -1572,11 +1822,16 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (!modal || modal.kind !== "event" || !modal.eventId) return;
     const eventToRemove = data.events.find((event) => event.id === modal.eventId);
     if (!eventToRemove?.editable) return;
+    if (eventToRemove.taskId && taskRowById.has(eventToRemove.taskId)) {
+      const task = taskById.get(eventToRemove.taskId);
+      if (task) openTaskComposer(task);
+      return;
+    }
 
     setData((current) => ({
       ...current,
       tasks: current.tasks.map((task) =>
-        task.linkedEventId === eventToRemove.id
+        task.linkedEventId === eventToRemove.id && !rowTaskIds.has(task.id)
           ? { ...task, linkedEventId: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
           : task,
       ),
@@ -1783,6 +2038,27 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return linkedEvent ? eventDateKey(linkedEvent, todayDate) : task.scheduledDate;
   }
 
+  function renderTaskRow(task: Task, compact = false) {
+    const row = taskRowById.get(task.id);
+    const action = latestActionByTask.get(task.id);
+    const googleOwned = row?.binding.kind === "google";
+    const pending = action?.state === "queued" || action?.state === "running";
+    const unavailable = googleOwned && (row.observed?.completionWritable !== true || row.unavailableAt !== null);
+    return <TaskRow
+      compact={compact}
+      key={task.id}
+      task={task}
+      dueLabel={taskDeadlineLabel(task, todayDate)}
+      latestAction={action}
+      plannedDate={plannedDateForTask(task)}
+      sourceBadge={googleOwned ? <em className="source-chip">Google Tasks</em> : undefined}
+      toggleBusy={busyTaskIds.has(task.id) || pending}
+      toggleDisabled={Boolean(initial && (!googleOwned || unavailable))}
+      onToggle={toggleTask}
+      onEdit={openTaskComposer}
+    />;
+  }
+
   function renderScheduleRow(event: TimelineEvent, showDate = false) {
     const linkedTask = event.taskId ? taskById.get(event.taskId) : undefined;
     const linkedTaskDone = linkedTask?.completed === true;
@@ -1853,7 +2129,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <article className="pane today-card today-card--tasks">
           <PaneHeader eyebrow="Attention" title={attentionTasks.length ? `${attentionTasks.length} task${attentionTasks.length === 1 ? "" : "s"}` : "All clear"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("tasks")}>All tasks <ChevronRight size={12} /></button>} />
           <div className="task-browser-list today-task-list">
-            {attentionTasks.map((task) => <TaskRow compact key={task.id} task={task} dueLabel={taskDeadlineLabel(task, todayDate)} latestAction={latestActionByTask.get(task.id)} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} />)}
+            {attentionTasks.map((task) => renderTaskRow(task, true))}
             {!attentionTasks.length ? <div className="today-empty"><CheckCircle2 size={17} /><span><strong>No open local tasks</strong><small>Add one when something comes up.</small></span></div> : null}
           </div>
         </article>
@@ -1912,7 +2188,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           </div>
           <button className="calendar-step" type="button" onClick={() => moveCalendarDate(1)} aria-label="Next day"><ChevronRight size={16} /></button>
         </div>
-        {initial ? <IntegrationCalendarContext overviewState={integrations} onOpen={() => setShowIntegrations(true)} startDate={calendarRangeStart} endDate={calendarRangeEnd} /> : null}
+        {initial ? <IntegrationCalendarContext overviewState={dailyIntegrations} onOpen={() => setShowIntegrations(true)} startDate={calendarRangeStart} endDate={calendarRangeEnd} /> : null}
         {activeBlock ? <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}><div className="active-block-copy"><span className="live-label"><span /> Local block in this view</span><strong>{activeBlock.title}</strong><small>{eventTimeValue(activeBlock)} · {formatDuration(activeBlock.duration)} · {activeBlock.taskId ? "linked task" : "local block"}</small></div><button className="open-note" type="button" onClick={() => setSelectedEventId(activeBlock.id)}>Inspect <ChevronRight size={12} /></button></div> : null}
         <div className="schedule-list agenda-list" id="calendar-day-panel" role="tabpanel" aria-labelledby={`calendar-date-${selectedDate}`}>
           {calendarMode === "day" ? visibleCalendarEvents.map((event) => renderScheduleRow(event)) : calendarDateWindow(selectedDate, 0, 6).map((date) => {
@@ -1922,7 +2198,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           })}
           {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>{calendarMode === "day" ? "No local blocks on this day." : "No local blocks in these seven days."}</span></div> : null}
         </div>
-        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button> : <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>}</div></div> : null}
+        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEventTask && taskRowById.has(selectedEventTask.id) ? "Task plan" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask && taskRowById.has(selectedEventTask.id) ? <button className="secondary-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={13} /> Edit task plan</button> : <>{selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button> : <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>}</>}</div></div> : null}
       </article>
     </section>;
   }
@@ -1932,17 +2208,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       <header className="workspace-heading"><div><p className="eyebrow">Your work</p><h1 id="tasks-heading">Tasks</h1><p>Everything stays visible here. Complete with the checkbox or open a task to change it.</p></div><button className="page-primary-action" type="button" onClick={() => openTaskComposer()}><Plus size={13} /> Add task</button></header>
       <article className="pane tasks-workspace">
         {initial && hermes.failed ? <p className="task-sync-note task-sync-note--warning"><Bot size={13} /> Hermes could not refresh. Fox Focus tasks are unaffected.</p> : initial && hermes.loading && !hermesBoard ? <p className="task-sync-note"><Bot size={13} /> Checking Hermes tasks…</p> : null}
+        {initial && taskRowsError ? <p className="task-sync-note task-sync-note--warning"><RefreshCw size={13} /> Task rows could not refresh. Showing the last loaded state.</p> : null}
         <nav className="task-category-strip" aria-label="Task categories">{taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}</nav>
         {hermesBoard && (taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory) && taskFilter !== "all" && taskFilter !== "open" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks appear in All, Open, or Done because they do not have Fox Focus deadlines yet.</p> : null}
         <div className="task-compact-toolbar">
-          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
+          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{taskSourceOptions.length > 2 ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
           <span className="task-view-count" role="status" aria-live="polite">{shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
           {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
         </div>
-        <p className="planned-note"><CalendarDays size={13} /> {plannedTaskCount ? `${plannedTaskCount} planned task${plannedTaskCount === 1 ? "" : "s"} on the local calendar.` : "Open a task to give it calendar time."}</p>
+        <p className="planned-note"><CalendarDays size={13} /> {plannedTaskCount ? `${plannedTaskCount} task${plannedTaskCount === 1 ? "" : "s"} planned locally.` : "Open a task to plan it."}</p>
         <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`}>
-          {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} dueLabel={taskDeadlineLabel(task, todayDate)} latestAction={latestActionByTask.get(task.id)} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} />)}
+          {shownLocalTasks.map((task) => renderTaskRow(task))}
           {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} busy={adoptingHermesId === task.id} onAdopt={(candidate) => void previewHermesAdoption(candidate)} />)}
+          {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.containerId}:${task.externalId}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
           {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Change the category or filters, or add a task."}</p></div> : null}
         </div>
       </article>
@@ -1975,19 +2253,23 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const eventModal = modal?.kind === "event" ? modal : null;
   const draftModal = modal?.kind === "draft" ? modal : null;
   const editingHermesTask = hermesTasks.find(task => task.id === editingHermesTaskId) ?? null;
-  const modalTask = taskModal?.taskId ? data.tasks.find((task) => task.id === taskModal.taskId) : null;
+  const modalTask = taskModal?.taskId ? taskById.get(taskModal.taskId) ?? null : null;
+  const modalTaskRow = modalTask ? taskRowById.get(modalTask.id) : undefined;
+  const modalGoogleOwned = modalTaskRow?.binding.kind === "google";
+  const modalRowOwned = Boolean(initial && modalTaskRow);
   const modalTaskAction = modalTask ? latestActionByTask.get(modalTask.id) : undefined;
-  const modalTaskGoogleLink = modalTask?.externalLinks?.find(link => link.provider === "google_tasks");
+  const taskConflictAction = taskConflictActionId
+    ? taskRows?.actions.find((action) => action.id === taskConflictActionId) ?? null
+    : null;
+  const taskConflictCurrent = taskConflictAction ? taskConflictFromAction(taskConflictAction) : null;
+  const taskConflictTask = taskConflictAction ? taskById.get(taskConflictAction.payload.taskId) ?? null : null;
+  const taskConflictRow = taskConflictAction ? taskRowById.get(taskConflictAction.payload.taskId) ?? null : null;
+  const taskConflictDesired = taskConflictTask?.completed ? "open" : "completed";
   const modalInbox = taskModal?.inboxId
     ? data.inboxItems.find((item) => item.id === taskModal.inboxId)
     : eventModal?.inboxId
       ? data.inboxItems.find((item) => item.id === eventModal.inboxId)
       : null;
-  const actionBeforeGoogle = taskActionPreview && isRecord(taskActionPreview.before.google) ? taskActionPreview.before.google : null;
-  const actionAfterGoogle = taskActionPreview && isRecord(taskActionPreview.after.google) ? taskActionPreview.after.google : null;
-  const actionBeforeFox = taskActionPreview && isRecord(taskActionPreview.before.foxFocus) ? taskActionPreview.before.foxFocus : null;
-  const actionAfterFox = taskActionPreview && isRecord(taskActionPreview.after.foxFocus) ? taskActionPreview.after.foxFocus : null;
-
   return (
     <div className="control-room">
       <header className="command-bar" aria-hidden={isOverlayOpen}>
@@ -2059,31 +2341,32 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
       {taskModal ? (
         <DialogFrame title={taskModal.taskId ? "Edit task" : "Add task"} onClose={() => setModal(null)}>
-          <form onSubmit={saveTask}>
+          <form onSubmit={(event) => { void saveTask(event); }}>
             <div className="editor-heading">
               <div className="composer-icon"><ListTodo size={17} /></div>
-              <div><p className="eyebrow">{taskModal.taskId ? "Local task" : "Capture task"}</p><h2>{taskModal.taskId ? "Edit task" : "Add a task"}</h2></div>
+              <div><p className="eyebrow">{modalGoogleOwned ? "Google task" : modalRowOwned ? "Legacy task" : taskModal.taskId ? "Local task" : "Capture task"}</p><h2>{modalRowOwned ? "Plan task" : taskModal.taskId ? "Edit task" : "Add a task"}</h2></div>
               <button className="close-composer" type="button" onClick={() => setModal(null)} aria-label="Close task editor"><X size={17} /></button>
             </div>
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
             {modalInbox ? <div className="source-notice"><Inbox size={14} /> Accepting from <strong>{modalInbox.source}</strong>. It will stay on the created task.</div> : null}
-            {modalTaskGoogleLink ? <div className="source-notice"><Link2 size={14} /> Fox Focus owns this task. Its existing Google task can only be completed or reopened after a preview.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
-            {modalTaskAction && modalTaskAction.status !== "succeeded" ? <div className={`task-action-notice task-action-notice--${modalTaskAction.status}`}><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.lastError ?? "The approved Google update is still being checked."}</span></div> : null}
+            {modalGoogleOwned ? <div className="source-notice"><Link2 size={14} /> Google owns the title, due date, and completion. Planning stays in Fox Focus.</div> : modalRowOwned ? <div className="source-notice"><Bot size={14} /> The current task owner keeps its content and completion until migration. Planning stays in Fox Focus.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
+            {modalTaskAction && actionStateLabel(modalTaskAction) ? <div className={`task-action-notice task-action-notice--${modalTaskAction.state}`}><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.error ?? (modalTaskAction.state === "succeeded" ? "Google readback matched the approved change." : "The approved change is waiting for Google readback.")}</span></div> : null}
             <div className="editor-grid editor-grid--quick-task">
-              <label className="field field--full"><span>Task</span><input autoFocus required value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
-              <label className="field field--full"><span>Deadline</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
+              <label className="field field--full"><span>{modalGoogleOwned ? "Task · managed in Google" : modalRowOwned ? "Task · managed at source" : "Task"}</span><input autoFocus required readOnly={modalRowOwned} value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
+              {modalGoogleOwned ? <label className="field field--full"><span>Google due</span><input type="date" readOnly value={modalTaskRow?.observed?.doOn ?? ""} /></label> : null}
+              <label className="field field--full"><span>{modalGoogleOwned ? "Local deadline" : "Deadline"}</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
             {showTaskDetails ? <div className="editor-grid editor-grid--task-details" id="task-more-options">
-              <label className="field"><span>Area</span><select value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
+              <label className="field"><span>{modalGoogleOwned ? "Area · from list" : modalRowOwned ? "Area · from source" : "Area"}</span><select disabled={modalRowOwned} value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
               <label className="field"><span>Priority</span><select value={taskDraft.priority} onChange={(event) => { const value = event.target.value; if (isOneOf(value, priorities)) setTaskDraft((current) => ({ ...current, priority: value })); }}><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
               <label className="field"><span>Duration</span><select value={taskDraft.duration} onChange={(event) => setTaskDraft((current) => ({ ...current, duration: event.target.value }))}><option value="5 min">5 min</option><option value="10 min">10 min</option><option value="20 min">20 min</option><option value="30 min">30 min</option><option value="40 min">40 min</option><option value="45 min">45 min</option><option value="60 min">60 min</option></select></label>
               <label className="field"><span>Task state</span><select value={taskDraft.state} onChange={(event) => { const value = event.target.value; if (isOneOf(value, activeTaskStates)) setTaskDraft((current) => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="scheduled">Scheduled</option><option value="waiting">Waiting</option></select></label>
               <label className="field"><span>Planned day</span><input type="date" value={taskDraft.scheduledDate} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledDate: event.target.value }))} /></label>
               <label className="field"><span>Planned time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
-              <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
+              {modalRowOwned ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
             </div> : null}
-            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{modalTaskAction?.status === "failed" && modalTaskAction.result?.retryable === true ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Retry Google</button> : null}{modalTaskAction?.status === "running" ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Check Google</button> : null}{modalTask && modalTaskGoogleLink && (modalTaskAction?.status === "failed" || modalTaskAction?.status === "conflict") ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void previewLinkedTaskAction(modalTask, modalTask.completed ? "completed" : "open"); }}><Link2 size={13} /> Send current state</button> : null}{modalTaskAction?.status === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Refresh Google</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
+            <div className="editor-footer"><span>{modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{modalTaskAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -2147,16 +2430,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </DialogFrame>
       ) : null}
 
-      {taskActionPreview ? (
-        <DialogFrame title="Confirm linked task change" onClose={() => { if (!taskActionBusy) setTaskActionPreview(null); }} className="editor-dialog--alert">
-          <div className="editor-heading"><div className="composer-icon"><Link2 size={17} /></div><div><p className="eyebrow">Exact Google change</p><h2>{taskActionPreview.desiredState === "completed" ? "Complete linked task?" : "Reopen linked task?"}</h2></div><button className="close-composer" type="button" disabled={taskActionBusy} onClick={() => setTaskActionPreview(null)} aria-label="Cancel linked task change"><X size={17} /></button></div>
-          <div className="task-action-preview">
-            <div><span>Before</span><strong>{String(actionBeforeGoogle?.title ?? actionBeforeFox?.title ?? "Linked task")}</strong><small>Fox Focus: {String(actionBeforeFox?.state ?? "unknown")} · Google: {String(actionBeforeGoogle?.state ?? "unknown")}</small><small>{String(actionBeforeGoogle?.connection ?? "Current Google connection")} · {String(actionBeforeGoogle?.list ?? "task list")}</small><small>Task {String(actionBeforeGoogle?.taskId ?? "unknown")} · ETag {String(actionBeforeGoogle?.version ?? "unknown")}</small></div>
-            <ChevronRight size={16} aria-hidden="true" />
-            <div><span>After</span><strong>{String(actionAfterGoogle?.title ?? actionAfterFox?.title ?? "Linked task")}</strong><small>Fox Focus: {String(actionAfterFox?.state ?? taskActionPreview.desiredState)} · Google: {String(actionAfterGoogle?.state ?? "unknown")}</small><small>Same connection, list, task ID, and ETag shown at left.</small></div>
-          </div>
-          <p className="draft-context">Fox Focus changes first and keeps that result even if Google is unavailable. This approval cannot create, delete, or clear Google tasks.</p>
-          <div className="alert-actions"><button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => setTaskActionPreview(null)}>Cancel</button><button className="submit-button" type="button" disabled={taskActionBusy} onClick={() => void executeTaskAction(taskActionPreview, false)}>{taskActionBusy ? "Confirming…" : taskActionPreview.desiredState === "completed" ? "Complete both" : "Reopen both"}</button></div>
+      {taskConflictActionId ? (
+        <DialogFrame title="Review Google conflict" onClose={() => setTaskConflictActionId(null)} className="editor-dialog--alert">
+          <div className="editor-heading"><div className="composer-icon"><RefreshCw size={17} /></div><div><p className="eyebrow">Remote conflict</p><h2>Google changed this task</h2></div><button className="close-composer" type="button" onClick={() => setTaskConflictActionId(null)} aria-label="Close conflict review"><X size={17} /></button></div>
+          {taskConflictAction && taskConflictCurrent && taskConflictTask && taskConflictRow?.binding.kind === "google" ? <>
+            <div className="task-action-preview task-conflict-preview">
+              <div><span>Approved {formatDublinInstant(taskConflictAction.approval.at)}</span><strong>{taskConflictAction.payload.before} → {taskConflictAction.payload.after}</strong><small>{taskConflictAction.approval.previewText}</small><small>Expected ETag {taskConflictAction.payload.expectedEtag ?? "none"}</small></div>
+              <ChevronRight size={16} aria-hidden="true" />
+              <div><span>Google at conflict</span><strong>{taskConflictCurrent.title}</strong><small>{taskConflictCurrent.state}{taskConflictCurrent.dueOn ? ` · due ${formatDublinDateKey(taskConflictCurrent.dueOn, { day: "numeric", month: "short" })}` : " · no due day"}</small><small>ETag {taskConflictCurrent.version ?? "none"} · {formatDublinInstant(taskConflictCurrent.updatedAt)}</small></div>
+            </div>
+            <div className="conflict-next-change"><span>New approval</span><strong>{taskConflictRow.observed?.status ?? taskConflictCurrent.state} → {taskConflictDesired}</strong><small>Current ETag {taskConflictRow.observed?.etag ?? "none"}</small></div>
+            <p className="draft-context">The first approval no longer matches Google. Approve this new before-and-after pair to try again.</p>
+            <div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setTaskConflictActionId(null)}>Cancel</button><button className="submit-button" type="button" disabled={busyTaskIds.has(taskConflictTask.id) || taskConflictRow.observed?.completionWritable !== true || taskConflictRow.unavailableAt !== null} onClick={approveTaskConflict}>{taskConflictDesired === "completed" ? "Approve complete" : "Approve reopen"}</button></div>
+          </> : <><p className="draft-context">The stored conflict details are unavailable. Refresh sources before trying again.</p><div className="alert-actions"><button className="secondary-action" type="button" onClick={() => setTaskConflictActionId(null)}>Close</button></div></>}
         </DialogFrame>
       ) : null}
 

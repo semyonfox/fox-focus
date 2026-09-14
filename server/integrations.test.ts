@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setImmediate as waitForImmediate } from 'node:timers/promises';
 import { createIntegrationService, integrationConfigFromEnvironment } from './integrations.ts';
 import { openOAuthTokenSet, sealOAuthTokenSet, serializeOAuthTokenEnvelope } from './oauth.ts';
 import { openStore } from './store.ts';
@@ -264,12 +265,202 @@ test('Google completion write uses the connected write scope and preserves the e
     assert.deepEqual(result, {
       outcome: 'succeeded', sourceStatus: 'completed', sourceVersion: 'etag-2',
       sourceUpdatedAt: '2026-09-13T10:00:00.000Z', completedAt: '2026-09-13T10:00:00.000Z',
+      current: {
+        title: 'Linked task', notes: null, state: 'completed', completedAt: '2026-09-13T10:00:00.000Z',
+        dueOn: null, parentId: null, position: null, sourceUrl: null, version: 'etag-2',
+        updatedAt: '2026-09-13T10:00:00.000Z', completionWritable: true,
+      },
     });
     assert.deepEqual(writes, [
       { method: 'GET', path: '/tasks/v1/lists/list-1/tasks/task-1', body: null, ifMatch: null },
       { method: 'PATCH', path: '/tasks/v1/lists/list-1/tasks/task-1', body: '{"status":"completed"}', ifMatch: 'etag-1' },
       { method: 'GET', path: '/tasks/v1/lists/list-1/tasks/task-1', body: null, ifMatch: null },
     ]);
+  } finally {
+    store.close();
+  }
+});
+
+test('Google task snapshots and status writes serialize within one list', async () => {
+  const store = openStore(':memory:');
+  const connectionId = 'serialized-google-generation';
+  const scopes = ['https://www.googleapis.com/auth/tasks'];
+  let announceSnapshotFetch = () => {};
+  const snapshotFetchStarted = new Promise<void>(resolve => { announceSnapshotFetch = resolve; });
+  let releaseSnapshot = (_response: Response) => {};
+  const snapshotResponse = new Promise<Response>(resolve => { releaseSnapshot = resolve; });
+  let remoteCompleted = false;
+  let taskItemRequests = 0;
+  try {
+    store.saveConnection({
+      provider: 'google', connectionId, state: 'connected', scopes,
+      tokenEnvelope: serializeOAuthTokenEnvelope(sealOAuthTokenSet({
+        accessToken: 'serialized-access', refreshToken: 'serialized-refresh', scopes,
+        expiresAt: '2027-09-14T10:00:00.000Z', tokenType: 'Bearer',
+      }, masterKey, { provider: 'google', connectionId })),
+      connectedAt: '2026-09-14T09:00:00.000Z', updatedAt: '2026-09-14T09:00:00.000Z',
+      lastSyncedAt: null, lastError: null,
+    });
+    store.publishProviderScope({
+      provider: 'google', resourceKind: 'task-list', accountId: connectionId,
+      connectionGeneration: connectionId, containerId: 'list-1', containerName: 'My Tasks',
+      records: [{
+        provider: 'google', kind: 'task', connectionId, containerId: 'list-1', containerName: 'My Tasks',
+        externalId: 'task-1', title: 'Serialized task', status: 'needsAction', startsAt: null, endsAt: null,
+        startsOn: null, endsOn: null, allDay: false, dueOn: '2026-09-20', completedAt: null,
+        sourceUpdatedAt: '2026-09-14T09:00:00.000Z', sourceVersion: 'etag-1', completionWritable: true,
+        notes: null, parentId: null, position: '0001', sourceUrl: null, sourceTimeZone: null,
+      }],
+      coverageFrom: null, coverageTo: null, fetchedAt: '2026-09-14T09:00:00.000Z',
+    });
+    const task = store.listTasks()[0];
+    assert.ok(task);
+    const queued = store.queueTaskStatusAction(task.id, task.version, 'completed', '2026-09-14T10:00:00.000Z');
+    assert.equal(queued.outcome, 'queued');
+    if (queued.outcome !== 'queued') return;
+
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test', tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-14T10:00:00.000Z'),
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        const method = init?.method ?? 'GET';
+        if (url.pathname === '/calendar/v3/users/me/calendarList') return json({ items: [] });
+        if (url.pathname === '/tasks/v1/users/@me/lists') {
+          return json({ items: [{ id: 'list-1', title: 'My Tasks' }] });
+        }
+        if (url.pathname === '/tasks/v1/lists/list-1/tasks') {
+          announceSnapshotFetch();
+          return await snapshotResponse;
+        }
+        if (url.pathname === '/tasks/v1/lists/list-1/tasks/task-1') {
+          taskItemRequests += 1;
+          if (method === 'PATCH') {
+            assert.equal(new Headers(init?.headers).get('If-Match'), 'etag-1');
+            remoteCompleted = true;
+            return json({ id: 'task-1' });
+          }
+          return remoteCompleted
+            ? json({
+                id: 'task-1', title: 'Serialized task', status: 'completed', etag: 'etag-2',
+                due: '2026-09-20T00:00:00.000Z', position: '0001',
+                completed: '2026-09-14T10:00:00.000Z', updated: '2026-09-14T10:00:01.000Z',
+              })
+            : json({
+                id: 'task-1', title: 'Serialized task', status: 'needsAction', etag: 'etag-1',
+                due: '2026-09-20T00:00:00.000Z', position: '0001', updated: '2026-09-14T09:00:00.000Z',
+              });
+        }
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes, additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    const sync = integrations.sync('google');
+    await snapshotFetchStarted;
+    const claimed = store.claimNextTaskStatusAction('2026-09-14T10:00:00.000Z', 120_000);
+    assert.ok(claimed?.claimId);
+    const writeAndSettle = (async () => {
+      const result = await integrations.updateGoogleTaskCompletion({
+        connectionId, containerId: 'list-1', externalId: 'task-1',
+        desiredState: 'completed', expectedVersion: 'etag-1',
+      });
+      assert.equal(result.outcome, 'succeeded');
+      if (result.outcome !== 'succeeded' || !claimed?.claimId) return null;
+      return store.settleTaskStatusAction(
+        claimed.id,
+        claimed.claimId,
+        result,
+        '2026-09-14T10:00:01.000Z',
+      );
+    })();
+
+    await waitForImmediate();
+    const writeStartedBeforeSnapshotFinished = taskItemRequests > 0;
+    releaseSnapshot(json({ items: [{
+      id: 'task-1', title: 'Serialized task', status: 'needsAction', etag: 'etag-1',
+      due: '2026-09-20T00:00:00.000Z', position: '0001', updated: '2026-09-14T09:00:00.000Z',
+    }] }));
+
+    const [syncResult, settled] = await Promise.all([sync, writeAndSettle]);
+    assert.equal(writeStartedBeforeSnapshotFinished, false);
+    assert.deepEqual(syncResult, { outcome: 'synced', recordCount: 1 });
+    assert.equal(settled?.state, 'succeeded');
+    assert.equal(taskItemRequests, 3);
+    const finalTask = store.getTask(task.id);
+    assert.equal(finalTask?.observed?.status, 'completed');
+    assert.equal(finalTask?.observed?.etag, 'etag-2');
+    assert.equal(finalTask?.observed?.observedAt, '2026-09-14T10:00:01.000Z');
+    const finalProviderRecord = store.listProviderRecords(10, 'task')[0];
+    assert.equal(finalProviderRecord?.status, 'completed');
+    assert.equal(finalProviderRecord?.sourceVersion, 'etag-2');
+  } finally {
+    releaseSnapshot(json({ items: [] }));
+    store.close();
+  }
+});
+
+test('Google task ETag conflicts include the exact current task snapshot', async () => {
+  const store = openStore(':memory:');
+  const connectionId = 'conflicted-google-generation';
+  const scopes = ['https://www.googleapis.com/auth/tasks'];
+  const methods: string[] = [];
+  try {
+    store.saveConnection({
+      provider: 'google', connectionId, state: 'connected', scopes,
+      tokenEnvelope: serializeOAuthTokenEnvelope(sealOAuthTokenSet({
+        accessToken: 'conflict-access', refreshToken: 'conflict-refresh', scopes,
+        expiresAt: '2027-09-14T10:00:00.000Z', tokenType: 'Bearer',
+      }, masterKey, { provider: 'google', connectionId })),
+      connectedAt: '2026-09-14T09:00:00.000Z', updatedAt: '2026-09-14T09:00:00.000Z',
+      lastSyncedAt: null, lastError: null,
+    });
+    const integrations = createIntegrationService(store, {
+      appBaseUrl: 'https://focus.example.test', tokenMasterKey: masterKey,
+      now: () => new Date('2026-09-14T10:00:00.000Z'),
+      fetch: async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input.toString());
+        methods.push(init?.method ?? 'GET');
+        if (url.pathname === '/tasks/v1/lists/list-1/tasks/task-1') {
+          return json({
+            id: 'task-1', title: 'Changed upstream', notes: 'Use the new details', parent: 'parent-1',
+            position: '0002', webViewLink: 'https://tasks.google.com/task/task-1', status: 'needsAction',
+            due: '2026-09-22T00:00:00.000Z',
+            updated: '2026-09-14T09:46:00.000Z', etag: 'etag-current',
+          });
+        }
+        return json({ error: 'unexpected request' }, 404);
+      },
+      providers: {
+        google: {
+          clientId: 'client-id', clientSecret: 'client-secret',
+          authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
+          scopes, additionalAuthorizationParameters: {},
+        },
+      },
+    });
+
+    assert.deepEqual(await integrations.updateGoogleTaskCompletion({
+      connectionId, containerId: 'list-1', externalId: 'task-1',
+      desiredState: 'completed', expectedVersion: 'etag-imported',
+    }), {
+      outcome: 'conflict',
+      notice: 'The Google task changed after it was imported. Refresh before trying again.',
+      current: {
+        title: 'Changed upstream', notes: 'Use the new details', state: 'open', completedAt: null,
+        dueOn: '2026-09-22', parentId: 'parent-1', position: '0002',
+        sourceUrl: 'https://tasks.google.com/task/task-1',
+        updatedAt: '2026-09-14T09:46:00.000Z', version: 'etag-current',
+        completionWritable: true,
+      },
+    });
+    assert.deepEqual(methods, ['GET']);
   } finally {
     store.close();
   }

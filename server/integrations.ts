@@ -107,6 +107,20 @@ export type SyncResult =
   | { outcome: 'synced'; recordCount: number }
   | { outcome: 'failed'; notice: string };
 
+export type GoogleTaskSnapshot = {
+  title: string;
+  notes: string | null;
+  state: 'open' | 'completed';
+  completedAt: string | null;
+  dueOn: string | null;
+  parentId: string | null;
+  position: string | null;
+  sourceUrl: string | null;
+  version: string | null;
+  updatedAt: string | null;
+  completionWritable: boolean;
+};
+
 export type GoogleTaskWriteResult =
   | {
       outcome: 'succeeded';
@@ -114,8 +128,13 @@ export type GoogleTaskWriteResult =
       sourceVersion: string;
       sourceUpdatedAt: string | null;
       completedAt: string | null;
+      current?: GoogleTaskSnapshot;
     }
-  | { outcome: 'conflict'; notice: string }
+  | {
+      outcome: 'conflict';
+      notice: string;
+      current?: GoogleTaskSnapshot;
+    }
   | { outcome: 'failed'; notice: string; retryable: boolean };
 
 type TokenExchangeResult =
@@ -483,6 +502,22 @@ function taskRecord(
   };
 }
 
+function googleTaskSnapshot(task: ImportedTask): GoogleTaskSnapshot {
+  return {
+    title: task.title,
+    notes: task.notes,
+    state: task.state,
+    completedAt: task.completedAt,
+    dueOn: task.dueDate,
+    parentId: task.parentId,
+    position: task.position,
+    sourceUrl: task.sourceUrl,
+    version: task.version,
+    updatedAt: task.updatedAt,
+    completionWritable: task.completionWritable !== false,
+  };
+}
+
 function windowFor(config: RuntimeConfig): { timeMin: string; timeMax: string } {
   const now = config.now().getTime();
   return {
@@ -501,6 +536,7 @@ async function syncGoogle(
   config: RuntimeConfig,
   accessToken: string,
   connectionId: string,
+  withTaskScope: <T>(connectionId: string, listId: string, work: () => Promise<T>) => Promise<T>,
 ): Promise<ScopedSyncResult> {
   const range = windowFor(config);
   const failures: ProviderReadFailure[] = [];
@@ -597,28 +633,30 @@ async function syncGoogle(
   } else {
     const discovered = new Set(taskListResult.value.records.map(list => list.externalId));
     for (const list of taskListResult.value.records) {
-      const tasks = await listGoogleTasks(providerClient(config, accessToken), { taskListId: list.externalId });
-      if (tasks.status !== 'ok') {
-        failures.push(tasks);
-        markFailed('task-list', list.externalId, list.title, tasks);
-        continue;
-      }
-      const records = tasks.value.records.flatMap(task => {
-        const record = taskRecord('google', list.externalId, list.title, task);
-        return record ? [{ ...record, connectionId }] : [];
-      });
-      assertCurrentConnection();
-      recordCount += store.publishProviderScope({
-        provider: 'google',
-        resourceKind: 'task-list',
-        accountId: connectionId,
-        connectionGeneration: connectionId,
-        containerId: list.externalId,
-        containerName: list.title,
-        records,
-        coverageFrom: null,
-        coverageTo: null,
-        fetchedAt: config.now().toISOString(),
+      await withTaskScope(connectionId, list.externalId, async () => {
+        const tasks = await listGoogleTasks(providerClient(config, accessToken), { taskListId: list.externalId });
+        if (tasks.status !== 'ok') {
+          failures.push(tasks);
+          markFailed('task-list', list.externalId, list.title, tasks);
+          return;
+        }
+        const records = tasks.value.records.flatMap(task => {
+          const record = taskRecord('google', list.externalId, list.title, task);
+          return record ? [{ ...record, connectionId }] : [];
+        });
+        assertCurrentConnection();
+        recordCount += store.publishProviderScope({
+          provider: 'google',
+          resourceKind: 'task-list',
+          accountId: connectionId,
+          connectionGeneration: connectionId,
+          containerId: list.externalId,
+          containerName: list.title,
+          records,
+          coverageFrom: null,
+          coverageTo: null,
+          fetchedAt: config.now().toISOString(),
+        });
       });
     }
     for (const state of store.listSyncStates()) {
@@ -627,11 +665,13 @@ async function syncGoogle(
         state.accountId !== connectionId || state.connectionGeneration !== connectionId ||
         discovered.has(state.containerId)
       ) continue;
-      assertCurrentConnection();
-      store.publishProviderScope({
-        provider: 'google', resourceKind: 'task-list', accountId: connectionId,
-        connectionGeneration: connectionId, containerId: state.containerId, containerName: state.containerName,
-        records: [], coverageFrom: null, coverageTo: null, fetchedAt: config.now().toISOString(),
+      await withTaskScope(connectionId, state.containerId, async () => {
+        assertCurrentConnection();
+        store.publishProviderScope({
+          provider: 'google', resourceKind: 'task-list', accountId: connectionId,
+          connectionGeneration: connectionId, containerId: state.containerId, containerName: state.containerName,
+          records: [], coverageFrom: null, coverageTo: null, fetchedAt: config.now().toISOString(),
+        });
       });
     }
   }
@@ -684,6 +724,27 @@ export type IntegrationService = {
 export function createIntegrationService(store: Store, input: IntegrationConfig): IntegrationService {
   const config = normalizeConfig(input);
   const activeSyncs = new Map<string, Promise<SyncResult>>();
+  const taskScopeTails = new Map<string, Promise<void>>();
+
+  async function withTaskScope<T>(
+    connectionId: string,
+    listId: string,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const key = JSON.stringify([connectionId, listId]);
+    const previous = taskScopeTails.get(key) ?? Promise.resolve();
+    let release = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const tail = previous.then(() => gate);
+    taskScopeTails.set(key, tail);
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+      if (taskScopeTails.get(key) === tail) taskScopeTails.delete(key);
+    }
+  }
 
   function overview(): IntegrationOverview {
     const records = [
@@ -826,7 +887,7 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
         AbortSignal.timeout(config.providerReadTimeoutMs),
       );
       if (provider === 'google') {
-        const result = await syncGoogle(store, config, grant.accessToken, grant.connectionId);
+        const result = await syncGoogle(store, config, grant.accessToken, grant.connectionId, withTaskScope);
         if (store.getConnection(provider)?.connectionId !== grant.connectionId) throw new ConnectionChanged();
         if (result.failures.length > 0) {
           const needsReconnect = result.failures.some(failure =>
@@ -918,61 +979,69 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
       store.markConnectionNeedsReconnect('google', 'Reconnect Google to approve task completion updates.');
       return { outcome: 'failed', notice: 'Reconnect Google before updating this linked task.', retryable: false };
     }
-    try {
-      const signal = AbortSignal.timeout(config.taskActionTimeoutMs);
-      const grant = await freshAccessToken('google', input.connectionId, signal);
-      if (store.getConnection('google')?.connectionId !== input.connectionId) {
-        return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
-      }
-      const result = await updateGoogleTaskStatus(
-        { accessToken: grant.accessToken, fetch: config.fetch, signal },
-        {
-          taskListId: input.containerId,
-          taskId: input.externalId,
-          state: input.desiredState,
-          ...(input.expectedVersion ? { expectedEtag: input.expectedVersion } : {}),
-        },
-      );
-      if (store.getConnection('google')?.connectionId !== input.connectionId) {
-        return { outcome: 'conflict', notice: 'The Google connection changed while the approved update was running. Refresh and reconcile this task.' };
-      }
-      if (result.status === 'ok') {
+    return withTaskScope(input.connectionId, input.containerId, async () => {
+      try {
+        const signal = AbortSignal.timeout(config.taskActionTimeoutMs);
+        const grant = await freshAccessToken('google', input.connectionId, signal);
+        if (store.getConnection('google')?.connectionId !== input.connectionId) {
+          return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
+        }
+        const result = await updateGoogleTaskStatus(
+          { accessToken: grant.accessToken, fetch: config.fetch, signal },
+          {
+            taskListId: input.containerId,
+            taskId: input.externalId,
+            state: input.desiredState,
+            ...(input.expectedVersion ? { expectedEtag: input.expectedVersion } : {}),
+          },
+        );
+        if (store.getConnection('google')?.connectionId !== input.connectionId) {
+          return { outcome: 'conflict', notice: 'The Google connection changed while the approved update was running. Refresh and reconcile this task.' };
+        }
+        if (result.status === 'ok') {
+          return {
+            outcome: 'succeeded',
+            sourceStatus: result.value.task.sourceState,
+            sourceVersion: result.value.etag,
+            sourceUpdatedAt: result.value.task.updatedAt,
+            completedAt: result.value.task.completedAt,
+            current: googleTaskSnapshot(result.value.task),
+          };
+        }
+        if (result.status === 'conflict') {
+          const current = result.currentTask;
+          return {
+            outcome: 'conflict',
+            notice: 'The Google task changed after it was imported. Refresh before trying again.',
+            ...(current ? { current: googleTaskSnapshot(current) } : {}),
+          };
+        }
+        const needsReconnect = result.status === 'reauthorization-required' || result.status === 'permission-denied';
+        if (needsReconnect) store.markConnectionNeedsReconnect('google', 'Reconnect Google to update linked tasks.');
+        const retryable = ['network-error', 'rate-limited', 'remote-error'].includes(result.status);
         return {
-          outcome: 'succeeded',
-          sourceStatus: result.value.task.sourceState,
-          sourceVersion: result.value.etag,
-          sourceUpdatedAt: result.value.task.updatedAt,
-          completedAt: result.value.task.completedAt,
+          outcome: 'failed',
+          notice: needsReconnect
+            ? 'Reconnect Google before updating this linked task.'
+            : result.status === 'verification-failed'
+              ? 'Google accepted the change but the readback did not match. Refresh before retrying.'
+              : 'The Google task was not confirmed. Your Fox Focus task was kept.',
+          retryable,
+        };
+      } catch (error) {
+        if (error instanceof ConnectionChanged) {
+          return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
+        }
+        const needsReconnect = error instanceof SyncFailure && error.needsReconnect;
+        return {
+          outcome: 'failed',
+          notice: needsReconnect
+            ? 'Reconnect Google before updating this linked task.'
+            : 'Google could not be reached. Your Fox Focus task was kept.',
+          retryable: !needsReconnect,
         };
       }
-      if (result.status === 'conflict') {
-        return { outcome: 'conflict', notice: 'The Google task changed after it was imported. Refresh before trying again.' };
-      }
-      const needsReconnect = result.status === 'reauthorization-required' || result.status === 'permission-denied';
-      if (needsReconnect) store.markConnectionNeedsReconnect('google', 'Reconnect Google to update linked tasks.');
-      const retryable = ['network-error', 'rate-limited', 'remote-error'].includes(result.status);
-      return {
-        outcome: 'failed',
-        notice: needsReconnect
-          ? 'Reconnect Google before updating this linked task.'
-          : result.status === 'verification-failed'
-            ? 'Google accepted the change but the readback did not match. Refresh before retrying.'
-            : 'The Google task was not confirmed. Your Fox Focus task was kept.',
-        retryable,
-      };
-    } catch (error) {
-      if (error instanceof ConnectionChanged) {
-        return { outcome: 'conflict', notice: 'The Google connection changed. Reconcile this task before updating it.' };
-      }
-      const needsReconnect = error instanceof SyncFailure && error.needsReconnect;
-      return {
-        outcome: 'failed',
-        notice: needsReconnect
-          ? 'Reconnect Google before updating this linked task.'
-          : 'Google could not be reached. Your Fox Focus task was kept.',
-        retryable: !needsReconnect,
-      };
-    }
+    });
   }
 
   return { overview, startAuthorization, completeAuthorization, sync, syncConnected, updateGoogleTaskCompletion };

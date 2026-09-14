@@ -1266,6 +1266,18 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
         if (!action) throw new Error('Task action disappeared');
         return { outcome: 'conflict' as const, action, snapshot: read() };
       };
+      if (retry) {
+        const actionRow = db.prepare('SELECT rowid AS ordinal FROM task_action_requests WHERE id=?')
+          .get(current.id) as Record<string, unknown> | undefined;
+        const newerIntent = typeof actionRow?.ordinal === 'number'
+          ? db.prepare(`SELECT 1 AS present FROM task_action_requests
+              WHERE task_id=? AND rowid>? AND status<>'awaiting_approval' LIMIT 1`)
+            .get(current.taskId, actionRow.ordinal) as Record<string, unknown> | undefined
+          : undefined;
+        if (newerIntent?.present === 1) {
+          return rejectPreview('A newer task status intent replaced this failed update. Use the current checkbox state.');
+        }
+      }
       if (current.status === 'awaiting_approval' && current.expiresAt <= now) {
         return rejectPreview('The approval preview expired. Create and review a new preview.');
       }
@@ -1293,6 +1305,9 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
           : 'The exact linked Google task is no longer available. Refresh and review the link.');
       }
       const completed = current.desiredState === 'completed';
+      if (retry && task.completed !== completed) {
+        return rejectPreview('A newer task status intent replaced this failed update. Use the current checkbox state.');
+      }
       const nextTask: Task = {
         ...task,
         completed,

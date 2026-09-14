@@ -7,7 +7,7 @@ import { HTTPException } from 'hono/http-exception';
 import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
 import { isDateKey } from '../src/calendar-time.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
-import { isInboxDecisionInput, isTaskPlanInput } from '../src/row-model.ts';
+import { isInboxDecisionInput, isTaskPlanInput, isTaskStatusInput } from '../src/row-model.ts';
 import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
 import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
@@ -44,6 +44,7 @@ export type AppOptions = {
   pushPublicKey?: string;
   taskStatusToken?: string;
   now?: () => Date;
+  actionWorker?: { kick: () => void };
 };
 
 function tokenMatches(value: string, expected: string): boolean {
@@ -158,6 +159,18 @@ export function createApp(
     return updated ? c.json({ plan: updated }) : current
       ? c.json({ error: 'Task plan changed', current }, 409)
       : c.json({ error: 'Task not found' }, 404);
+  });
+  app.post('/api/v1/tasks/:taskId/status', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isTaskStatusInput(body)) return c.json({ error: 'Invalid task status' }, 400);
+    const result = store.queueTaskStatusAction(c.req.param('taskId'), body.version, body.state, now().toISOString());
+    if (result.outcome === 'not_found') return c.json({ error: 'Task not found' }, 404);
+    if (result.outcome === 'read_only') return c.json({ error: 'This task cannot be changed in Google Tasks', task: result.task }, 422);
+    if (result.outcome === 'conflict') return c.json({ error: 'Task changed', current: result.task }, 409);
+    options.actionWorker?.kick();
+    return c.json({ action: result.action, task: result.task }, 202);
   });
   app.put('/api/v1/inbox-items/:inboxId', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);

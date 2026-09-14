@@ -503,8 +503,56 @@ test("Google task status update reports an ETag conflict before writing", async 
     operation: "google.task-status-update",
     phase: "preflight",
     httpStatus: 412,
+    currentTask: {
+      provider: "google",
+      taskListId: "list-1",
+      externalId: "task-1",
+      title: "Changed upstream",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
+      state: "open",
+      sourceState: "needsAction",
+      dueDate: null,
+      completedAt: null,
+      updatedAt: "2026-09-13T09:00:00.000Z",
+      version: '"fresh"',
+      isDeleted: false,
+    },
   });
   assert.equal(transport.requests.length, 1);
+});
+
+test("Google reads the current task after a conditional PATCH conflict", async () => {
+  const transport = queuedFetch(
+    json({
+      id: "task-1", etag: '"imported"', title: "Before race", status: "needsAction",
+      updated: "2026-09-13T09:00:00Z",
+    }),
+    new Response(null, { status: 412 }),
+    json({
+      id: "task-1", etag: '"phone-edit"', title: "Changed on phone", notes: "Current notes",
+      status: "needsAction", due: "2026-09-16T00:00:00.000Z", updated: "2026-09-13T09:01:00Z",
+    }),
+  );
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "completed",
+    expectedEtag: '"imported"',
+  });
+
+  assert.equal(result.status, "conflict");
+  if (result.status !== "conflict") return;
+  assert.equal(result.phase, "update");
+  assert.equal(result.httpStatus, 412);
+  assert.equal(result.currentTask?.title, "Changed on phone");
+  assert.equal(result.currentTask?.notes, "Current notes");
+  assert.equal(result.currentTask?.dueDate, "2026-09-16");
+  assert.equal(result.currentTask?.version, '"phone-edit"');
+  assert.deepEqual(transport.requests.map(request => request.init.method), ["GET", "PATCH", "GET"]);
 });
 
 test("Google task status update fails verification when readback does not match", async () => {

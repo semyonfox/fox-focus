@@ -112,6 +112,7 @@ export type TaskStatusPayload = {
   kind: "task-status";
   taskId: string;
   target: GoogleTaskRef;
+  expectedTaskVersion: number;
   intentVersion: number;
   expectedEtag: string | null;
   before: TaskStatus;
@@ -282,6 +283,11 @@ export function isTaskPlanInput(value: unknown): value is Omit<TaskPlanRow, "tas
       Number.isSafeInteger(value.estimateMinutes) && typeof value.estimateMinutes === "number" &&
       value.estimateMinutes >= 1 && value.estimateMinutes <= 24 * 60
     )) && !(value.plannedOn !== null && value.plannedAt !== null);
+}
+
+export function isTaskStatusInput(value: unknown): value is { version: number; state: TaskStatus } {
+  return isRecord(value) && Number.isSafeInteger(value.version) && typeof value.version === "number" &&
+    value.version >= 1 && (value.state === "open" || value.state === "completed");
 }
 
 export function isInboxDecisionInput(value: unknown): value is {
