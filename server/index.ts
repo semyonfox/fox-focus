@@ -60,6 +60,7 @@ const app = createApp(store, password, hermes, integrations, {
 // tick, so persisted rows from a previous run can never fire unchecked.
 if (hermes) await hermes.poll();
 app.get('/assets/*', serveStatic({ root: './dist' }));
+app.get('/favicon.svg', serveStatic({ path: './dist/favicon.svg' }));
 // both files come from public/ via the vite build; read once so a missing file is a clean 404
 function readDistFile(name: string): string | null {
   try { return readFileSync(join('./dist', name), 'utf8'); } catch { return null; }
