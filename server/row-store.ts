@@ -3510,6 +3510,7 @@ export function createRowStore(db: DatabaseSync) {
     | { outcome: 'created'; job: Job }
     | { outcome: 'replayed'; job: Job }
     | { outcome: 'idempotency_conflict'; job: Job }
+    | { outcome: 'active_job'; job: Job }
     | { outcome: 'missing_task' | 'missing_inbox'; job: null } {
     const requestHash = canonicalHash(input);
     const mutationKey = `owner:job-create:${createHash('sha256').update(idempotencyKey).digest('base64url')}`;
@@ -3532,6 +3533,18 @@ export function createRowStore(db: DatabaseSync) {
       if (input.inboxId && !getInboxItem(input.inboxId)) {
         db.exec('COMMIT');
         return { outcome: 'missing_inbox', job: null };
+      }
+      if (input.taskId || input.inboxId) {
+        const activeRow = db.prepare(`SELECT * FROM jobs
+          WHERE state!='settled' AND ((? IS NOT NULL AND task_id=?) OR (? IS NOT NULL AND inbox_id=?))
+          ORDER BY created_at DESC, id DESC LIMIT 1`).get(
+          input.taskId, input.taskId, input.inboxId, input.inboxId,
+        ) as Record<string, unknown> | undefined;
+        const activeJob = activeRow ? jobFromSql(activeRow) : null;
+        if (activeJob) {
+          db.exec('COMMIT');
+          return { outcome: 'active_job', job: activeJob };
+        }
       }
       const job: Job = {
         id: `job-${randomUUID()}`,
@@ -3568,7 +3581,7 @@ export function createRowStore(db: DatabaseSync) {
     }
   }
 
-  function claimJob(id: string, now: string, leaseMilliseconds: number):
+  function claimJob(id: string, now: string, leaseMilliseconds: number, claimRequestKey?: string):
     | { outcome: 'claimed'; job: Job; claimId: string }
     | { outcome: 'not_found'; job: null }
     | { outcome: 'unavailable'; job: Job } {
@@ -3578,6 +3591,25 @@ export function createRowStore(db: DatabaseSync) {
       if (!current) {
         db.exec('COMMIT');
         return { outcome: 'not_found', job: null };
+      }
+      const claimRequestMutationKey = claimRequestKey
+        ? `hermes:job-claim-request:${id}:${createHash('sha256').update(claimRequestKey).digest('base64url')}`
+        : null;
+      if (claimRequestMutationKey) {
+        const replay = db.prepare('SELECT details_json FROM changes WHERE mutation_key=?')
+          .get(claimRequestMutationKey) as Record<string, unknown> | undefined;
+        if (replay) {
+          const details = jsonRecord(replay.details_json);
+          const priorClaimId = typeof details?.claimId === 'string' ? details.claimId : null;
+          if (!priorClaimId) throw new Error('Job claim replay is missing its claim ID');
+          if (current.state === 'working' && current.claimId === priorClaimId &&
+            current.leaseUntil !== null && current.leaseUntil > now) {
+            db.exec('COMMIT');
+            return { outcome: 'claimed', job: current, claimId: priorClaimId };
+          }
+          db.exec('COMMIT');
+          return { outcome: 'unavailable', job: current };
+        }
       }
       const reclaimable = current.state === 'working' && (
         current.claimId === null || current.leaseUntil === null || current.leaseUntil <= now
@@ -3594,9 +3626,10 @@ export function createRowStore(db: DatabaseSync) {
       const job = getJob(id);
       if (!job) throw new Error('Claimed job disappeared');
       insertChange(db, {
-        actor: 'hermes', mutationKey: `hermes:job-claim:${id}:${claimId}`, entityKind: 'job', entityId: id,
+        actor: 'hermes', mutationKey: claimRequestMutationKey ?? `hermes:job-claim:${id}:${claimId}:${version}`,
+        entityKind: 'job', entityId: id,
         entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
-        details: { before: current.state, after: 'working', reclaimed: reclaimable }, at: now,
+        details: { before: current.state, after: 'working', reclaimed: reclaimable, claimId }, at: now,
       });
       db.exec('COMMIT');
       return { outcome: 'claimed', job, claimId };
@@ -3785,13 +3818,9 @@ export function createRowStore(db: DatabaseSync) {
           db.exec('COMMIT');
           return { outcome: 'task_not_found', job: current };
         }
-        const runningReopen = (db.prepare(`SELECT * FROM actions
-          WHERE task_id=? AND kind='task-status' AND state='running'`).all(task.id) as Record<string, unknown>[])
-          .some(row => {
-            const running = actionFromSql(row);
-            return running?.payload.kind === 'task-status' && running.payload.after === 'open';
-          });
-        if (runningReopen) {
+        const runningTaskAction = db.prepare(`SELECT 1 FROM actions
+          WHERE task_id=? AND kind='task-status' AND state='running' LIMIT 1`).get(task.id);
+        if (runningTaskAction) {
           db.exec('COMMIT');
           return { outcome: 'task_conflict', job: current, task };
         }

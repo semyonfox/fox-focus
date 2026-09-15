@@ -67,7 +67,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     return () => { cancelled = true; };
   }, [load]);
 
-  const inFlight = rows.actions.some(action => action.state === "queued" || action.state === "running");
+  const inFlight = rows.actions.some(action => action.state === "queued" || action.state === "running") ||
+    rows.jobs.some(job => job.state === "queued" || job.state === "working");
 
   useEffect(() => {
     if (!connection) return;

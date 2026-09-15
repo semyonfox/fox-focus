@@ -965,6 +965,31 @@ test('jobs support claims, questions, answers, retry-safe results, send back, an
   } finally { store.close(); }
 });
 
+test('only one active job can be linked to an Inbox item', () => {
+  const store = openStore(':memory:', workspaceFixture());
+  try {
+    const inbox = store.listInboxItems()[0];
+    assert.ok(inbox);
+    if (!inbox) return;
+    const first = store.createJob({
+      title: 'First request', instruction: 'Handle this.', taskId: null, inboxId: inbox.id,
+    }, '2026-09-14T10:00:00.000Z', 'first-request');
+    assert.equal(first.outcome, 'created');
+    if (first.outcome !== 'created') return;
+    const replay = store.createJob({
+      title: 'First request', instruction: 'Handle this.', taskId: null, inboxId: inbox.id,
+    }, '2026-09-14T10:00:01.000Z', 'first-request');
+    assert.equal(replay.outcome, 'replayed');
+    const duplicate = store.createJob({
+      title: 'Second request', instruction: 'Do something else.', taskId: null, inboxId: inbox.id,
+    }, '2026-09-14T10:00:02.000Z', 'second-request');
+    assert.equal(duplicate.outcome, 'active_job');
+    assert.equal(duplicate.job.id, first.job.id);
+  } finally {
+    store.close();
+  }
+});
+
 test('an expired job lease rejects the old claim and can be reclaimed', () => {
   const store = openStore(':memory:', workspaceFixture());
   try {
@@ -972,13 +997,23 @@ test('an expired job lease rejects the old claim and can be reclaimed', () => {
       '2026-09-14T10:00:00.000Z');
     assert.equal(created.outcome, 'created');
     if (created.outcome !== 'created') return;
-    const first = store.claimJob(created.job.id, '2026-09-14T10:00:01.000Z', 1_000);
+    const requestedClaimKey = 'a'.repeat(43);
+    const first = store.claimJob(created.job.id, '2026-09-14T10:00:01.000Z', 1_000, requestedClaimKey);
     assert.equal(first.outcome, 'claimed');
     if (first.outcome !== 'claimed') return;
+    assert.notEqual(first.claimId, requestedClaimKey);
+    const replay = store.claimJob(created.job.id, '2026-09-14T10:00:01.500Z', 1_000, requestedClaimKey);
+    assert.equal(replay.outcome, 'claimed');
+    if (replay.outcome === 'claimed') {
+      assert.equal(replay.claimId, first.claimId);
+      assert.equal(replay.job.version, first.job.version);
+    }
     assert.equal(store.postJobResult(created.job.id, first.claimId, {
       kind: 'result', text: 'Too late.', url: null,
     }, '2026-09-14T10:00:03.000Z', 1_000).outcome, 'invalid_claim');
-    const second = store.claimJob(created.job.id, '2026-09-14T10:00:03.000Z', 1_000);
+    const staleReplay = store.claimJob(created.job.id, '2026-09-14T10:00:03.000Z', 1_000, requestedClaimKey);
+    assert.equal(staleReplay.outcome, 'unavailable');
+    const second = store.claimJob(created.job.id, '2026-09-14T10:00:03.000Z', 1_000, 'b'.repeat(43));
     assert.equal(second.outcome, 'claimed');
     if (second.outcome === 'claimed') assert.notEqual(second.claimId, first.claimId);
   } finally { store.close(); }
@@ -1039,12 +1074,18 @@ test('accepting a linked job atomically queues its normal Google completion acti
   } finally { store.close(); }
 });
 
-test('accepting completed linked work replaces queued and failed reopens but rejects a running reopen', () => {
-  for (const priorState of ['queued', 'failed', 'running'] as const) {
+test('accepting linked work replaces queued and failed reopens but waits for any running status action', () => {
+  const cases = [
+    { label: 'queued reopen', priorState: 'queued', sourceStatus: 'completed', desiredState: 'open' },
+    { label: 'failed reopen', priorState: 'failed', sourceStatus: 'completed', desiredState: 'open' },
+    { label: 'running reopen', priorState: 'running', sourceStatus: 'completed', desiredState: 'open' },
+    { label: 'running completion', priorState: 'running', sourceStatus: 'needsAction', desiredState: 'completed' },
+  ] as const;
+  for (const { label, priorState, sourceStatus, desiredState } of cases) {
     const data = workspaceFixture();
     data.tasks[0].externalLinks = [{
       provider: 'google_tasks', connectionId: 'google-generation', containerId: 'uni-list', containerName: 'Study',
-      externalId: `google-task-${priorState}`, policy: 'completion_only', sourceStatus: 'completed', sourceVersion: 'etag-old',
+      externalId: `google-task-${label}`, policy: 'completion_only', sourceStatus, sourceVersion: 'etag-old',
       linkedAt: '2026-09-01T08:00:00.000Z',
     }];
     const store = openStore(':memory:', data);
@@ -1055,25 +1096,26 @@ test('accepting completed linked work replaces queued and failed reopens but rej
         fetchedAt: '2026-09-14T10:00:00.000Z',
         records: [{
           provider: 'google', kind: 'task', connectionId: 'google-generation', containerId: 'uni-list', containerName: 'Study',
-          externalId: `google-task-${priorState}`, title: 'Plan autumn term', status: 'completed', startsAt: null, endsAt: null,
-          startsOn: null, endsOn: null, allDay: false, dueOn: null, completedAt: '2026-09-14T09:00:00.000Z',
+          externalId: `google-task-${label}`, title: 'Plan autumn term', status: sourceStatus, startsAt: null, endsAt: null,
+          startsOn: null, endsOn: null, allDay: false, dueOn: null,
+          completedAt: sourceStatus === 'completed' ? '2026-09-14T09:00:00.000Z' : null,
           sourceUpdatedAt: '2026-09-14T09:00:00.000Z', sourceVersion: 'etag-current', completionWritable: true,
           notes: null, parentId: null, position: null, sourceUrl: null, sourceTimeZone: null,
         }],
       });
       const task = store.getTask('legacy-open');
       assert.ok(task);
-      assert.equal(task.observed?.status, 'completed');
-      const reopen = store.queueTaskStatusAction(task.id, task.version, 'open', '2026-09-14T10:00:01.000Z');
-      assert.equal(reopen.outcome, 'queued');
-      if (reopen.outcome !== 'queued') continue;
+      assert.equal(task.observed?.status, sourceStatus === 'completed' ? 'completed' : 'open');
+      const priorAction = store.queueTaskStatusAction(task.id, task.version, desiredState, '2026-09-14T10:00:01.000Z');
+      assert.equal(priorAction.outcome, 'queued');
+      if (priorAction.outcome !== 'queued') continue;
 
       if (priorState !== 'queued') {
         const claimed = store.claimNextTaskStatusAction('2026-09-14T10:00:02.000Z', 120_000);
-        assert.equal(claimed?.id, reopen.action.id);
+        assert.equal(claimed?.id, priorAction.action.id);
         assert.ok(claimed?.claimId);
         if (priorState === 'failed') {
-          const failed = store.settleTaskStatusAction(reopen.action.id, claimed.claimId, {
+          const failed = store.settleTaskStatusAction(priorAction.action.id, claimed.claimId, {
             outcome: 'failed', notice: 'Temporary provider failure.', retryable: true,
           }, '2026-09-14T10:00:03.000Z');
           assert.equal(failed?.state, 'failed');
@@ -1102,15 +1144,15 @@ test('accepting completed linked work replaces queued and failed reopens but rej
       if (priorState === 'running') {
         assert.equal(accepted.outcome, 'task_conflict');
         assert.equal(store.getJob(created.job.id)?.state, 'review');
-        assert.equal(store.getAction(reopen.action.id)?.state, 'running');
+        assert.equal(store.getAction(priorAction.action.id)?.state, 'running');
         assert.equal(store.listActions().length, 1);
         continue;
       }
-      assert.equal(accepted.outcome, 'settled', priorState);
+      assert.equal(accepted.outcome, 'settled', label);
       if (accepted.outcome !== 'settled') continue;
       assert.equal(accepted.action?.payload.kind, 'task-status');
       if (accepted.action?.payload.kind === 'task-status') assert.equal(accepted.action.payload.after, 'completed');
-      assert.equal(store.getAction(reopen.action.id)?.state, 'superseded');
+      assert.equal(store.getAction(priorAction.action.id)?.state, 'superseded');
       assert.equal(store.getTask(task.id)?.intentVersion, currentTask.intentVersion + 1);
     } finally { store.close(); }
   }

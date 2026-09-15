@@ -426,12 +426,23 @@ test('Hermes can upsert email Inbox rows and run a claim-bound job through the s
       }),
     });
     assert.equal(conflictingJob.status, 409);
+    const claimKey = 'a'.repeat(43);
     const claim = await app.request(`/api/v1/requests/${job.id}/claim`, {
-      method: 'POST', headers: { authorization: bearer },
+      method: 'POST', headers: {
+        authorization: bearer, 'X-Request-Kind': 'job', 'X-Claim-Key': claimKey,
+      },
     });
     assert.equal(claim.status, 200);
     const claimBody = await claim.json() as { kind: string; claimId: string };
     assert.equal(claimBody.kind, 'job');
+    assert.notEqual(claimBody.claimId, claimKey);
+    const claimReplay = await app.request(`/api/v1/requests/${job.id}/claim`, {
+      method: 'POST', headers: {
+        authorization: bearer, 'X-Request-Kind': 'job', 'X-Claim-Key': claimKey,
+      },
+    });
+    assert.equal(claimReplay.status, 200);
+    assert.equal((await claimReplay.json() as { claimId: string }).claimId, claimBody.claimId);
     const multiline = await app.request(`/api/v1/requests/${job.id}/result`, {
       method: 'POST',
       headers: { authorization: bearer, 'Content-Type': 'application/json', 'X-Claim-Id': claimBody.claimId },
@@ -649,6 +660,14 @@ test('email sending is default-off and Hermes settles only the owner-approved en
     assert.equal(approvalReplayBody.outcome, 'replayed');
     assert.equal(approvalReplayBody.action.id, approvalBody.action.id);
     assert.equal(store.listActions().filter(action => action.payload.kind === 'email-send').length, 1);
+
+    const jobOnlyClaim = await app.request(`/api/v1/requests/${approvalBody.action.id}/claim`, {
+      method: 'POST', headers: {
+        authorization: bearer, 'X-Request-Kind': 'job', 'X-Claim-Key': 'b'.repeat(43),
+      },
+    });
+    assert.equal(jobOnlyClaim.status, 404);
+    assert.equal(store.getAction(approvalBody.action.id)?.state, 'queued');
 
     const disabledClaim = await disabled.request(`/api/v1/requests/${approvalBody.action.id}/claim`, {
       method: 'POST', headers: { authorization: bearer },

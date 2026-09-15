@@ -4,7 +4,9 @@ import {
   DUBLIN_TIME_ZONE,
   addCalendarDays,
   calendarDateWindow,
+  currentEventProgress,
   dublinDateKey,
+  dublinDayBounds,
   dublinDateTimeToInstant,
   dublinTimeValue,
   formatDublinDateKey,
@@ -66,4 +68,29 @@ test("does not guess between duplicate fall-back times", () => {
 test("rejects malformed wall times without creating an instant", () => {
   assert.equal(dublinDateTimeToInstant("2026-02-29", "09:00"), null);
   assert.equal(dublinDateTimeToInstant("2026-09-11", "24:00"), null);
+});
+
+test("returns exact Dublin day bounds across DST changes", () => {
+  const spring = dublinDayBounds("2026-03-29");
+  const autumn = dublinDayBounds("2026-10-25");
+  assert.ok(spring);
+  assert.ok(autumn);
+  assert.equal(Date.parse(spring.end) - Date.parse(spring.start), 23 * 60 * 60 * 1000);
+  assert.equal(Date.parse(autumn.end) - Date.parse(autumn.start), 25 * 60 * 60 * 1000);
+  assert.equal(dublinDayBounds("2026-02-29"), null);
+});
+
+test("current events include their start and exclude their end", () => {
+  const start = "2026-09-15T09:00:00.000Z";
+  assert.equal(currentEventProgress(start, 60, new Date("2026-09-15T08:59:59.999Z")), null);
+  assert.equal(currentEventProgress(start, 60, new Date(start)), 0);
+  assert.equal(currentEventProgress(start, 60, new Date("2026-09-15T09:30:00.000Z")), 0.5);
+  assert.equal(currentEventProgress(start, 60, new Date("2026-09-15T10:00:00.000Z")), null);
+  assert.equal(currentEventProgress("invalid", 60, new Date(start)), null);
+  assert.equal(currentEventProgress(start, 0, new Date(start)), null);
+});
+
+test("current event progress uses elapsed instants through Dublin DST transitions", () => {
+  assert.equal(currentEventProgress("2026-03-29T00:30:00.000Z", 120, new Date("2026-03-29T01:30:00.000Z")), 0.5);
+  assert.equal(currentEventProgress("2026-10-25T00:30:00.000Z", 120, new Date("2026-10-25T01:30:00.000Z")), 0.5);
 });
