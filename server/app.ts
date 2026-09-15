@@ -241,7 +241,8 @@ export function createApp(
     const provider = providerFrom(c.req.param('provider'));
     if (!provider || !integrations) return c.redirect('/?integration=unavailable', 303);
     const result = await integrations.completeAuthorization(provider, new URL(c.req.url).searchParams);
-    return c.redirect(`/?integration=${provider}&result=${result.outcome}`, 303);
+    const params = new URLSearchParams({ integration: provider, result: result.outcome, notice: result.notice });
+    return c.redirect(`/?${params}`, 303);
   });
   app.post('/api/v1/integrations/:provider/sync', async (c) => {
     const provider = providerFrom(c.req.param('provider'));

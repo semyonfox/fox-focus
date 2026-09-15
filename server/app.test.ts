@@ -262,7 +262,7 @@ test('integration routes keep browser OAuth callbacks authenticated and expose n
     assert.equal((await app.request('/api/v1/integrations/microsoft/connect', { headers: { authorization } })).status, 404);
     const callback = await app.request('/api/v1/integrations/google/callback?state=opaque&code=one-time', { headers: { authorization }, redirect: 'manual' });
     assert.equal(callback.status, 303);
-    assert.equal(callback.headers.get('location'), '/?integration=google&result=connected');
+    assert.equal(callback.headers.get('location'), '/?integration=google&result=connected&notice=Connected.');
     assert.equal(callbackQuery, 'state=opaque&code=one-time');
     const sync = await app.request('/api/v1/integrations/google/sync', { method: 'POST', headers: { authorization } });
     assert.equal(sync.status, 200);

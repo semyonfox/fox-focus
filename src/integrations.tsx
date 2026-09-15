@@ -156,7 +156,7 @@ function connectionCopy(provider: ProviderStatus): string {
     : 'Read-only calendar and task context is ready to connect.';
   if (provider.connection.state === 'needs_reconnect') return 'The saved authorization needs to be renewed.';
   if (provider.provider === 'google' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks')) {
-    return 'Reconnect once to enable approved completion updates. Calendar import still works.';
+    return 'Enable task updates to approve completions and reopens from Fox Focus. Your current imports still work.';
   }
   if (provider.sync.state === 'syncing') return 'Refreshing your read-only context…';
   if (provider.sync.state === 'failed') return provider.sync.lastError ?? 'The last refresh did not finish.';
@@ -210,6 +210,27 @@ export function IntegrationsDrawer({
   const nativeTasks = localTasks ?? [];
   const [syncing, setSyncing] = useState<Provider | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [connectionResult, setConnectionResult] = useState<{ text: string; failed: boolean } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    const provider = params.get('integration');
+    if (provider === 'unavailable') return { text: 'This connection is unavailable. Check the provider setup and try again.', failed: true };
+    if (provider !== 'google' && provider !== 'microsoft') return null;
+    const result = params.get('result');
+    if (result !== 'connected' && result !== 'failed' && result !== 'declined') return null;
+    const fallback = result === 'connected'
+      ? `${providerLabel(provider)} connected.`
+      : result === 'declined' ? 'Connection was not approved. You can try again when ready.'
+        : 'Connection failed. Try connecting again.';
+    return { text: params.get('notice')?.slice(0, 500) || fallback, failed: result !== 'connected' };
+  });
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has('integration')) return;
+    for (const key of ['integration', 'result', 'notice']) url.searchParams.delete(key);
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+  }, []);
+
   const [adoption, setAdoption] = useState<AdoptionPreview | null>(null);
   const [adoptionSourceRecord, setAdoptionSourceRecord] = useState<ImportedRecord | null>(null);
   const [adopting, setAdopting] = useState<number | null>(null);
@@ -220,6 +241,7 @@ export function IntegrationsDrawer({
     setAdoptionSourceRecord(null);
     setLinkTargetId('');
     setMessage(null);
+    setConnectionResult(null);
   }, [open]);
   if (!open) return null;
 
@@ -324,6 +346,7 @@ export function IntegrationsDrawer({
         </div>
         <p className="drawer-intro">Calendar context stays read-only. You can adopt a legacy task into Fox Focus, then approve each completion or reopen sent to that exact Google task.</p>
         <div className="integration-security"><ShieldCheck size={15} /><span>New Fox Focus tasks never appear in Google. Delete and clear actions are not available.</span></div>
+        {connectionResult ? <p className={`integration-message${connectionResult.failed ? ' integration-message--error' : ''}`} role="status">{connectionResult.text}</p> : null}
         {message ? <p className="integration-message" role="status">{message}</p> : null}
         {failed ? <p className="integration-message integration-message--error" role="status">Could not load connection status. Your provider data was not changed.</p> : null}
         {adoptionSourceRecord && !adoption ? <section className="saved-draft" aria-label="Choose task adoption destination">
@@ -361,8 +384,8 @@ export function IntegrationsDrawer({
               <div className="integration-provider-actions">
                 {!provider.configured ? <span className="connection-state connection-state--muted">Setup needed</span> : null}
                 {provider.configured && !provider.connection ? <a className="submit-button" href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> Connect</a> : null}
-                {provider.configured && (provider.connection?.state === 'needs_reconnect' || (provider.provider === 'google' && provider.connection?.state === 'connected' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks'))) ? <a className="submit-button" href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> Reconnect</a> : null}
-                {provider.configured && provider.connection?.state === 'connected' && !(provider.provider === 'google' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks')) ? <button className="secondary-action" type="button" disabled={syncing === provider.provider || provider.sync.state === 'syncing'} onClick={() => void sync(provider.provider)}><RefreshCw size={13} /> Refresh</button> : null}
+                {provider.configured && (provider.connection?.state === 'needs_reconnect' || (provider.provider === 'google' && provider.connection?.state === 'connected' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks'))) ? <a className="submit-button" href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> {provider.connection?.state === 'needs_reconnect' ? 'Reconnect' : 'Enable task updates'}</a> : null}
+                {provider.configured && provider.connection?.state === 'connected' ? <button className="secondary-action" type="button" disabled={syncing === provider.provider || provider.sync.state === 'syncing'} onClick={() => void sync(provider.provider)}><RefreshCw size={13} /> Refresh</button> : null}
               </div>
             </article>
           ))}
