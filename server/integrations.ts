@@ -54,7 +54,7 @@ const googleScopes = [
   'openid',
   'email',
   'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
-  'https://www.googleapis.com/auth/calendar.events.readonly',
+  'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/tasks',
 ] as const;
 
@@ -356,11 +356,16 @@ function scopesStayWithinRequest(
 ): boolean {
   if (granted === undefined) return true;
   const allowed = new Set(requested);
-  // Google can return a previously granted narrower Tasks scope alongside the
-  // requested full Tasks scope on reconnect. It does not add a capability that
-  // the full scope has not already granted, so retain it for compatibility.
-  if (provider === 'google' && requested.includes('https://www.googleapis.com/auth/tasks')) {
-    allowed.add('https://www.googleapis.com/auth/tasks.readonly');
+  // Google can return previously granted narrower scopes alongside the newer
+  // requested write scopes on reconnect. Each exception below is strictly
+  // narrower than a requested scope, so it adds no capability.
+  if (provider === 'google') {
+    if (requested.includes('https://www.googleapis.com/auth/tasks')) {
+      allowed.add('https://www.googleapis.com/auth/tasks.readonly');
+    }
+    if (requested.includes('https://www.googleapis.com/auth/calendar.events')) {
+      allowed.add('https://www.googleapis.com/auth/calendar.events.readonly');
+    }
   }
   return granted.every(scope => allowed.has(scope));
 }
