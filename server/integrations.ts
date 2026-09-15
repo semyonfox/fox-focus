@@ -349,8 +349,20 @@ function providerConfig(config: RuntimeConfig, provider: Provider): ProviderOAut
   return config.providers[provider] ?? null;
 }
 
-function scopesStayWithinRequest(granted: readonly string[] | undefined, requested: readonly string[]): boolean {
-  return granted === undefined || granted.every(scope => requested.includes(scope));
+function scopesStayWithinRequest(
+  provider: Provider,
+  granted: readonly string[] | undefined,
+  requested: readonly string[],
+): boolean {
+  if (granted === undefined) return true;
+  const allowed = new Set(requested);
+  // Google can return a previously granted narrower Tasks scope alongside the
+  // requested full Tasks scope on reconnect. It does not add a capability that
+  // the full scope has not already granted, so retain it for compatibility.
+  if (provider === 'google' && requested.includes('https://www.googleapis.com/auth/tasks')) {
+    allowed.add('https://www.googleapis.com/auth/tasks.readonly');
+  }
+  return granted.every(scope => allowed.has(scope));
 }
 
 function connectionToken(
@@ -931,7 +943,7 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
         code_verifier: verifier,
       });
       if (exchanged.kind !== 'ok') return { outcome: 'failed', notice: 'The provider did not complete the connection. Try again.' };
-      if (!scopesStayWithinRequest(exchanged.tokens.scopes, settings.scopes)) {
+      if (!scopesStayWithinRequest(provider, exchanged.tokens.scopes, settings.scopes)) {
         return { outcome: 'failed', notice: 'The provider returned more access than Fox Focus requested. Review consent and try again.' };
       }
       // A new authorization-code grant can represent a different account. Do
@@ -998,7 +1010,7 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
       throw new SyncFailure(refreshed.needsReconnect);
     }
     const settings = providerConfig(config, provider);
-    if (!settings || !scopesStayWithinRequest(refreshed.tokens.scopes, settings.scopes)) {
+    if (!settings || !scopesStayWithinRequest(provider, refreshed.tokens.scopes, settings.scopes)) {
       store.markConnectionNeedsReconnect(provider, 'Provider authorization needs reconnection.');
       throw new SyncFailure(true);
     }
