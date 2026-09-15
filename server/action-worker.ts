@@ -160,6 +160,28 @@ export function createTaskStatusActionWorker(
             ...(candidate === undefined ? {} : { candidateExternalId: candidate }),
           });
       result = normalizeTaskCreateResult(executed);
+      if (action.payload.kind === 'task-migration' && action.payload.completeAfterCreate && result.outcome === 'succeeded') {
+        const completed = await executor.updateGoogleTaskCompletion({
+          accountId: action.payload.destination.accountId,
+          containerId: action.payload.destination.listId,
+          externalId: result.externalId,
+          desiredState: 'completed',
+          expectedVersion: result.current.version,
+        });
+        if (completed.outcome === 'succeeded' && completed.current?.state === 'completed' && completed.current.version) {
+          result = {
+            outcome: 'succeeded',
+            externalId: result.externalId,
+            current: { ...completed.current, version: completed.current.version },
+          };
+        } else {
+          result = {
+            outcome: 'unknown',
+            notice: 'Google creation was verified, but its approved completion needs reconciliation before this migration can settle.',
+            candidateExternalId: result.externalId,
+          };
+        }
+      }
     } catch {
       result = {
         outcome: 'unknown',

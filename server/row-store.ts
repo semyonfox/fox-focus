@@ -382,18 +382,22 @@ function migrationPayloadFromJson(value: Record<string, unknown>): MigrationPayl
         (value.targetSnapshot.observedAt === null || isUtcInstant(value.targetSnapshot.observedAt))
       ? value.targetSnapshot as MigrationPayload['targetSnapshot']
       : undefined;
+  const completeAfterCreate = value.completeAfterCreate === undefined
+    ? undefined
+    : typeof value.completeAfterCreate === 'boolean' ? value.completeAfterCreate : null;
   if (
     value.kind !== 'task-migration' || typeof value.migrationId !== 'string' ||
     typeof value.previewHash !== 'string' || typeof value.sourceKey !== 'string' ||
     !isRecord(value.sourceSnapshot) || (value.operation !== 'bind' && value.operation !== 'create') ||
     typeof value.taskId !== 'string' || !source || !aliases || aliases.some(alias => alias === null) ||
-    !destination || typeof value.destinationName !== 'string' || !isNullableString(value.existingExternalId) ||
+    !destination || typeof value.destinationName !== 'string' || completeAfterCreate === null || !isNullableString(value.existingExternalId) ||
     targetSnapshot === undefined || !isNullableString(value.nonce) || typeof value.title !== 'string' ||
     typeof value.notes !== 'string' || !(value.doOn === null || isDateKey(value.doOn)) || !plan ||
     reminder === undefined || !preservedReminders || !isNullableString(value.resumedFromActionId)
   ) return null;
   return {
     ...value,
+    completeAfterCreate,
     source,
     sourceAliases: aliases as MigrationPayload['sourceAliases'],
     destination,
@@ -2039,14 +2043,7 @@ export function createRowStore(db: DatabaseSync) {
       details: { actionId: action.id, externalId, via, destinationUnavailable }, at: now,
     });
 
-    let completionError: string | null = null;
-    if (action.payload.kind === 'task-migration' && action.payload.completeAfterCreate) {
-      const queued = queueTaskStatusActionInTransaction(task.id, bound.version, 'completed', now);
-      if (queued.outcome !== 'queued') {
-        completionError = 'The created Google task could not be queued for its approved completion transition.';
-      }
-    }
-    const conflict = forceConflict ?? completionError ?? (destinationUnavailable
+    const conflict = forceConflict ?? (destinationUnavailable
       ? 'The destination list disappeared while Google task creation was being confirmed.'
       : null);
     const migrationMapping = action.payload.kind === 'task-migration' ? {
@@ -4073,9 +4070,13 @@ export function createRowStore(db: DatabaseSync) {
 
       let settled: ActionRow;
       if (result.outcome === 'succeeded') {
+        const desiredState = action.payload.kind === 'task-migration' && action.payload.completeAfterCreate
+          ? 'completed' as const
+          : 'open' as const;
         const invalid = !result.externalId || !result.current.version || !result.current.completionWritable ||
-          (result.current.state === 'open' && result.current.completedAt !== null);
-        const changed = result.current.state !== 'open' || result.current.completedAt !== null ||
+          result.current.state !== desiredState || (desiredState === 'open' && result.current.completedAt !== null);
+        const changed = result.current.state !== desiredState ||
+          (desiredState === 'open' && result.current.completedAt !== null) ||
           result.current.title !== action.payload.title || result.current.notes !== action.payload.notes ||
           result.current.dueOn !== action.payload.doOn;
         settled = invalid
