@@ -54,7 +54,7 @@ const googleScopes = [
   'openid',
   'email',
   'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
-  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/tasks',
 ] as const;
 
@@ -363,7 +363,11 @@ function scopesStayWithinRequest(
     if (requested.includes('https://www.googleapis.com/auth/tasks')) {
       allowed.add('https://www.googleapis.com/auth/tasks.readonly');
     }
-    if (requested.includes('https://www.googleapis.com/auth/calendar.events')) {
+    if (requested.includes('https://www.googleapis.com/auth/calendar')) {
+      allowed.add('https://www.googleapis.com/auth/calendar.events');
+      allowed.add('https://www.googleapis.com/auth/calendar.events.readonly');
+      allowed.add('https://www.googleapis.com/auth/calendar.calendarlist.readonly');
+    } else if (requested.includes('https://www.googleapis.com/auth/calendar.events')) {
       allowed.add('https://www.googleapis.com/auth/calendar.events.readonly');
     }
   }

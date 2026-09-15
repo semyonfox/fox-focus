@@ -1268,7 +1268,7 @@ test('provider reads abort at their configured deadline without blocking other s
   }
 });
 
-test('Google callback retains a legacy narrower Tasks grant beside the requested full scope', async () => {
+test('Google callback retains legacy narrower Calendar and Tasks grants beside the requested full scopes', async () => {
   let currentTime = new Date('2026-09-11T10:00:00.000Z');
   const calls: Array<{ url: URL; method: string }> = [];
   const fakeFetch: typeof fetch = async (input, init) => {
@@ -1282,7 +1282,7 @@ test('Google callback retains a legacy narrower Tasks grant beside the requested
         refresh_token: 'test-refresh-token',
         token_type: 'Bearer',
         expires_in: 3_600,
-        scope: 'openid email https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/tasks https://www.googleapis.com/auth/tasks.readonly',
+        scope: 'openid email https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/tasks https://www.googleapis.com/auth/tasks.readonly',
       });
     }
     if (url.origin === 'https://openidconnect.googleapis.com') return json({ sub: 'google-account-callback' });
@@ -1330,7 +1330,7 @@ test('Google callback retains a legacy narrower Tasks grant beside the requested
             'openid',
             'email',
             'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
-            'https://www.googleapis.com/auth/calendar.events',
+            'https://www.googleapis.com/auth/calendar',
             'https://www.googleapis.com/auth/tasks',
           ],
           additionalAuthorizationParameters: { access_type: 'offline', prompt: 'consent' },

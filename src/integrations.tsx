@@ -286,7 +286,7 @@ function recordWhen(record: ImportedRecord): string {
 function connectionCopy(provider: ProviderStatus): string {
   if (!provider.configured) return 'Server credentials have not been mounted.';
   if (!provider.connection) return provider.provider === 'google'
-    ? 'Calendar context stays read-only. Adopted tasks can mirror completion or reopen after approval.'
+    ? 'Full Google Calendar and Tasks access is ready to connect. Calendar changes will still require an explicit approval flow in Fox Focus.'
     : 'Read-only calendar and task context is ready to connect.';
   if (provider.connection.state === 'needs_reconnect') return 'The saved authorization needs to be renewed.';
   if (provider.provider === 'google' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks')) {
@@ -599,7 +599,7 @@ export function IntegrationsDrawer({
           <div><p className="eyebrow">Connections</p><h2>Calendars &amp; tasks</h2></div>
           <button className="close-composer" type="button" onClick={onClose} aria-label="Close connections"><X size={17} /></button>
         </div>
-        <p className="drawer-intro">Calendar context stays read-only. Google Tasks owns task content and completion; Fox Focus keeps planning and reminders.</p>
+        <p className="drawer-intro">Google Calendar and Tasks are connected through explicit approval boundaries. Fox Focus keeps planning and reminders; calendar changes need a dedicated owner-approved action flow.</p>
         <div className="integration-security"><ShieldCheck size={15} /><span>Only the exact task create or status change you approve can be written. Delete and clear actions are not available.</span></div>
         {connectionResult ? <p className={`integration-message${connectionResult.failed ? ' integration-message--error' : ''}`} role="status">{connectionResult.text}</p> : null}
         {message ? <p className="integration-message" role="status">{message}</p> : null}

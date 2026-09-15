@@ -33,11 +33,11 @@ Enable Google Calendar API and Google Tasks API. Fox Focus requests identity plu
 openid
 email
 https://www.googleapis.com/auth/calendar.calendarlist.readonly
-https://www.googleapis.com/auth/calendar.events
+https://www.googleapis.com/auth/calendar
 https://www.googleapis.com/auth/tasks
 ```
 
-The Google Tasks scope permits the two narrow write paths enforced by Fox Focus: create an approved task and complete or reopen an approved task. The Google Calendar Events scope permits reading and creating/updating event records, but this release has no calendar-write endpoint or executor: a future calendar write still needs an exact owner-approved action flow. A connection that has only `tasks.readonly` or `calendar.events.readonly` must reconnect. The server does not expose title edits, task moves, list clears, task deletes, or bulk completion.
+The Google Tasks scope permits the two narrow write paths enforced by Fox Focus: create an approved task and complete or reopen an approved task. The Google Calendar scope permits reading and writing all calendars available to this Google account, including calendar configuration and sharing. This release still has no calendar-write endpoint or executor: a future calendar write needs an exact owner-approved action flow. A connection that has only `tasks.readonly`, `calendar.events`, or `calendar.events.readonly` must reconnect. The server does not expose title edits, task moves, list clears, task deletes, or bulk completion.
 
 For a private Google app with an external consent screen, use the production publishing state when appropriate for the account. Refresh tokens from an external app left in Testing can expire after seven days. Public distribution would require a separate consent and verification review.
 
