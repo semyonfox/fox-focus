@@ -863,7 +863,9 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
     if (!providerConfig(config, 'google') || !connection || connection.state !== 'connected') {
       return { accountId: null, connectionGeneration: null, destinations: [], fallbackListId: null };
     }
-    const listAreas = store.read().data.listAreas;
+    // Older workspaces predate list-area mappings. Treat them as unassigned
+    // rather than crashing the migration preview after a successful reconnect.
+    const listAreas = store.read().data.listAreas ?? {};
     const states = store.listSyncStates().filter(state =>
       state.provider === 'google' && state.resourceKind === 'task-list' &&
       state.accountId === connection.accountId && state.connectionGeneration === connection.connectionId &&
