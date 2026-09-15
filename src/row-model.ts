@@ -133,6 +133,7 @@ export type TaskStatusPayload = {
   expectedTaskVersion: number;
   intentVersion: number;
   expectedEtag: string | null;
+  expectedContentHash?: string;
   before: TaskStatus;
   after: TaskStatus;
 };

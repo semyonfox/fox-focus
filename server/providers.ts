@@ -1,3 +1,4 @@
+import { taskCompletionFingerprint } from './task-completion-fingerprint.ts';
 /**
  * Narrow provider adapters.
  *
@@ -197,8 +198,10 @@ export interface GoogleTaskStatusUpdateInput {
   readonly taskListId: string;
   readonly taskId: string;
   readonly state: "open" | "completed";
-  /** The task ETag captured during import. Sent as If-Match when present. */
+  /** The task ETag captured at approval. Content matching can reconcile metadata-only changes. */
   readonly expectedEtag?: string;
+  /** Persisted at owner approval; legacy approvals remain strict about ETags. */
+  readonly expectedContentHash?: string;
 }
 
 export interface GoogleTaskCreateInput {
@@ -1170,8 +1173,9 @@ export async function reconcileGoogleTaskCreate(
  * Changes only the completion state of one already-existing Google Task.
  *
  * The caller must perform and persist user approval before invoking this. An
- * imported ETag should be supplied whenever available so a changed upstream
- * task fails safely instead of being overwritten. A successful PATCH is never
+ * imported ETag should be supplied whenever available. With an approved
+ * content fingerprint, metadata-only version changes use the fresh ETag.
+ * Changed content still requires a new approval. A successful PATCH is never
  * trusted on its own: the exact task is fetched and verified before success is
  * returned.
  */
@@ -1185,6 +1189,7 @@ export async function updateGoogleTaskStatus(
     || !isNonEmptyText(input.taskId)
     || (input.state !== "open" && input.state !== "completed")
     || (input.expectedEtag !== undefined && optionalVersion(input.expectedEtag) === INVALID)
+    || (input.expectedContentHash !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(input.expectedContentHash))
   ) return writeFailure("invalid-request", "google", operation, "update");
 
   const clientError = validateClient(client, "google", operation);
@@ -1216,7 +1221,15 @@ export async function updateGoogleTaskStatus(
       task: currentTask,
     });
   }
-  if (input.expectedEtag !== undefined && currentTask.version !== input.expectedEtag) {
+  const contentStillMatches = input.expectedContentHash !== undefined &&
+    taskCompletionFingerprint({
+      title: currentTask.title, notes: currentTask.notes, state: currentTask.state,
+      dueOn: currentTask.dueDate, parentId: currentTask.parentId,
+    }) === input.expectedContentHash;
+  // Use the fresh ETag only when the persisted approval still describes this
+  // task. If-Match below catches any edit between this read and the PATCH.
+  if ((input.expectedContentHash !== undefined && !contentStillMatches) ||
+      (input.expectedEtag !== undefined && currentTask.version !== input.expectedEtag && !contentStillMatches)) {
     return writeFailure("conflict", "google", operation, "preflight", {
       httpStatus: 412,
       currentTask,

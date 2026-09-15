@@ -21,6 +21,7 @@ export type TaskStatusExecutor = {
     externalId: string;
     desiredState: 'open' | 'completed';
     expectedVersion?: string;
+    expectedContentHash?: string;
   }) => Promise<TaskStatusExecutionResult>;
 };
 
@@ -110,6 +111,7 @@ export function createTaskStatusActionWorker(
         containerId: action.payload.target.listId,
         externalId: action.payload.target.externalId,
         desiredState: action.payload.after,
+        ...(action.payload.expectedContentHash ? { expectedContentHash: action.payload.expectedContentHash } : {}),
         ...(action.payload.expectedEtag ? { expectedVersion: action.payload.expectedEtag } : {}),
       });
       result = executed.outcome === 'conflict'

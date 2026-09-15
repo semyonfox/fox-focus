@@ -1,3 +1,4 @@
+import { taskCompletionFingerprint } from './task-completion-fingerprint.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { dublinDateTimeToInstant, isDateKey } from '../src/calendar-time.ts';
@@ -432,6 +433,7 @@ function actionPayloadFromJson(
       typeof value.target.listId !== 'string' || typeof value.target.externalId !== 'string' ||
       !isPositiveInteger(value.expectedTaskVersion) || !isPositiveInteger(value.intentVersion) ||
       !isNullableString(value.expectedEtag) ||
+      (value.expectedContentHash !== undefined && (typeof value.expectedContentHash !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.expectedContentHash))) ||
       (value.before !== 'open' && value.before !== 'completed') ||
       (value.after !== 'open' && value.after !== 'completed')
     ) return null;
@@ -3886,6 +3888,10 @@ export function createRowStore(db: DatabaseSync) {
       expectedTaskVersion: task.version,
       intentVersion,
       expectedEtag: task.observed.etag,
+      expectedContentHash: taskCompletionFingerprint({
+        title: task.observed.title, notes: task.observed.notes, state: task.observed.status,
+        dueOn: task.observed.doOn, parentId: task.observed.parentId,
+      }),
       before: task.observed.status,
       after: desiredState,
     };

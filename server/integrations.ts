@@ -797,6 +797,7 @@ export type IntegrationService = {
     externalId: string;
     desiredState: 'open' | 'completed';
     expectedVersion?: string;
+    expectedContentHash?: string;
   }) => Promise<GoogleTaskWriteResult>;
   createGoogleTask: (input: {
     accountId: string;
@@ -1132,6 +1133,7 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
     externalId: string;
     desiredState: 'open' | 'completed';
     expectedVersion?: string;
+    expectedContentHash?: string;
   }): Promise<GoogleTaskWriteResult> {
     const connection = store.getConnection('google');
     if (!providerConfig(config, 'google') || !connection || connection.state !== 'connected') {
@@ -1158,6 +1160,7 @@ export function createIntegrationService(store: Store, input: IntegrationConfig)
             taskListId: input.containerId,
             taskId: input.externalId,
             state: input.desiredState,
+            ...(input.expectedContentHash ? { expectedContentHash: input.expectedContentHash } : {}),
             ...(input.expectedVersion ? { expectedEtag: input.expectedVersion } : {}),
           },
         );

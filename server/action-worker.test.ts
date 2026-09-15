@@ -1,3 +1,4 @@
+import { taskCompletionFingerprint } from './task-completion-fingerprint.ts';
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { test } from 'node:test';
@@ -186,6 +187,7 @@ test('an owner checkbox click stores approval and queues the row action without 
       expectedTaskVersion: task.version,
       intentVersion: 1,
       expectedEtag: 'etag-1',
+      expectedContentHash: taskCompletionFingerprint({ title: 'Book dentist', notes: 'Call in the morning', state: 'open', dueOn: '2026-09-21', parentId: null }),
       before: 'open',
       after: 'completed',
     });
@@ -245,6 +247,7 @@ test('task status worker passes the imported ETag and stores the verified readba
       externalId: 'google-task-1',
       desiredState: 'completed',
       expectedVersion: 'etag-1',
+      expectedContentHash: taskCompletionFingerprint({ title: 'Book dentist', notes: 'Call in the morning', state: 'open', dueOn: '2026-09-21', parentId: null }),
     }]);
     assert.equal(settled?.state, 'succeeded');
     assert.equal(settled?.attemptCount, 1);
