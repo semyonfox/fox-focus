@@ -1,3 +1,4 @@
+import { taskCompletionFingerprint } from './task-completion-fingerprint.ts';
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
@@ -1081,4 +1082,49 @@ test("malformed provider records fail the whole response instead of being silent
     provider: "google",
     operation: "google.calendar-events",
   });
+});
+
+test('Google completion tolerates an ETag-only change and uses the fresh conditional version', async () => {
+  const baseline = { title: 'Review project', notes: 'Check references', state: 'open' as const, dueOn: '2026-09-21', parentId: null };
+  const transport = queuedFetch(
+    json({ id: 'task-1', title: baseline.title, notes: baseline.notes, status: 'needsAction', due: '2026-09-21T00:00:00.000Z', etag: '"fresh"', position: 'changed-position' }),
+    json({ id: 'task-1', status: 'completed', etag: '"done"' }),
+    json({ id: 'task-1', title: baseline.title, notes: baseline.notes, status: 'completed', due: '2026-09-21T00:00:00.000Z', etag: '"done"', completed: '2026-09-15T20:00:00Z' }),
+  );
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: 'list-1', taskId: 'task-1', state: 'completed', expectedEtag: '"stale"',
+    expectedContentHash: taskCompletionFingerprint(baseline),
+  });
+  assert.equal(result.status, 'ok');
+  assert.deepEqual(transport.requests.map(request => request.init.method), ['GET', 'PATCH', 'GET']);
+  assert.equal(new Headers(transport.requests[1].init.headers).get('If-Match'), '"fresh"');
+  assert.equal(transport.requests[1].init.body, '{"status":"completed"}');
+});
+
+for (const [field, changed] of Object.entries({ title: 'Renamed task', notes: 'Different instructions', due: '2026-09-22T00:00:00.000Z', parent: 'new-parent' })) {
+  test(`Google completion still rejects a changed ${field} after approval`, async () => {
+    const baseline = { title: 'Review project', notes: 'Check references', state: 'open' as const, dueOn: '2026-09-21', parentId: null };
+    const transport = queuedFetch(json({ id: 'task-1', title: baseline.title, notes: baseline.notes, status: 'needsAction', due: '2026-09-21T00:00:00.000Z', etag: '"fresh"', [field]: changed }));
+    const result = await updateGoogleTaskStatus(client(transport.fetch), {
+      taskListId: 'list-1', taskId: 'task-1', state: 'completed', expectedEtag: '"stale"',
+      expectedContentHash: taskCompletionFingerprint(baseline),
+    });
+    assert.equal(result.status, 'conflict');
+    assert.equal(transport.requests.length, 1, 'a meaningful edit must not be overwritten');
+  });
+}
+
+test('Google completion still rejects an edit racing the rebased conditional write', async () => {
+  const baseline = { title: 'Review project', notes: null, state: 'open' as const, dueOn: null, parentId: null };
+  const transport = queuedFetch(
+    json({ id: 'task-1', title: baseline.title, status: 'needsAction', etag: '"fresh"' }),
+    new Response(null, { status: 412 }),
+    json({ id: 'task-1', title: 'Changed during write', status: 'needsAction', etag: '"raced"' }),
+  );
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: 'list-1', taskId: 'task-1', state: 'completed', expectedEtag: '"stale"',
+    expectedContentHash: taskCompletionFingerprint(baseline),
+  });
+  assert.equal(result.status, 'conflict');
+  assert.equal(transport.requests.filter(request => request.init.method === 'PATCH').length, 1);
 });

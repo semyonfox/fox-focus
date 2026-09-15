@@ -1,3 +1,4 @@
+import { taskCompletionFingerprint } from './task-completion-fingerprint.ts';
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -213,7 +214,8 @@ test('Google task writes abort before their action lease can be recovered', asyn
   }
 });
 
-test('Google completion write uses the connected write scope and preserves the exact linked IDs and ETag', async () => {
+for (const metadataChanged of [false, true]) {
+test(`Google completion preserves linked IDs and fresh If-Match, metadata changed: ${metadataChanged}`, async () => {
   const store = openStore(':memory:');
   const writes: Array<{ method: string; path: string; body: string | null; ifMatch: string | null }> = [];
   let upstreamCompleted = false;
@@ -271,7 +273,8 @@ test('Google completion write uses the connected write scope and preserves the e
     const accountId = store.getConnection('google')?.accountId;
     assert.ok(accountId);
     const result = await integrations.updateGoogleTaskCompletion({
-      accountId, containerId: 'list-1', externalId: 'task-1', desiredState: 'completed', expectedVersion: 'etag-1',
+      accountId, containerId: 'list-1', externalId: 'task-1', desiredState: 'completed', expectedVersion: metadataChanged ? 'stale-import-etag' : 'etag-1',
+      ...(metadataChanged ? { expectedContentHash: taskCompletionFingerprint({ title: 'Linked task', notes: null, state: 'open', dueOn: null, parentId: null }) } : {}),
     });
     assert.deepEqual(result, {
       outcome: 'succeeded', sourceStatus: 'completed', sourceVersion: 'etag-2',
@@ -291,6 +294,7 @@ test('Google completion write uses the connected write scope and preserves the e
     store.close();
   }
 });
+}
 
 test('Google task snapshots and status writes serialize within one list', async () => {
   const store = openStore(':memory:');

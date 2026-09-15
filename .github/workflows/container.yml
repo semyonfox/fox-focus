@@ -43,6 +43,7 @@ jobs:
               "push.ts",
               "row-store.ts",
               "store.ts",
+              "task-completion-fingerprint.ts",
               "task-management.ts",
               "task-migration.ts",
             ]);
