@@ -79,36 +79,48 @@ export function buildWorkThreads(
   now = Date.now(),
 ): WorkThread[] {
   const inboxById = new Map(inbox.map((item) => [item.id, item]));
+  const activeJobByInboxId = new Map<string, Job>();
+  for (const job of jobs) {
+    if (!job.inboxId || job.taskId || job.state === "settled" || !inboxById.has(job.inboxId)) continue;
+    const current = activeJobByInboxId.get(job.inboxId);
+    if (!current || job.updatedAt > current.updatedAt ||
+      (job.updatedAt === current.updatedAt && job.id > current.id)) activeJobByInboxId.set(job.inboxId, job);
+  }
   const inboxThreads = inbox.map<WorkThread>((item) => {
     const stillSnoozed = item.state === "waiting" &&
       (item.snoozedUntil === null || Date.parse(item.snoozedUntil) > now);
     const sendAction = sendActions.get(item.id);
     const sending = sendAction?.state === "queued" || sendAction?.state === "running";
     const sendProblem = sendAction?.state === "failed" || sendAction?.state === "conflict" || sendAction?.state === "unknown";
+    const activeJob = activeJobByInboxId.get(item.id) ?? null;
+    const latestItemUpdate = sendAction && sendAction.updatedAt > item.updatedAt ? sendAction.updatedAt : item.updatedAt;
     return {
       key: `inbox:${item.id}`,
-      kind: "inbox",
-      title: item.title,
-      source: inboxSourceLabel(item),
-      updatedAt: sendAction && sendAction.updatedAt > item.updatedAt ? sendAction.updatedAt : item.updatedAt,
+      kind: activeJob ? "job" : "inbox",
+      title: activeJob?.title ?? item.title,
+      source: activeJob ? `${inboxSourceLabel(item)} · Hermes` : inboxSourceLabel(item),
+      updatedAt: activeJob && activeJob.updatedAt > latestItemUpdate ? activeJob.updatedAt : latestItemUpdate,
       group: sending
         ? "working"
         : sendProblem
           ? "needs_you"
-          : item.likelyNoise
-            ? "noise"
-            : item.state === "resolved"
-              ? "settled"
-              : stillSnoozed
-                ? "working"
-                : "needs_you",
+          : activeJob
+            ? activeJob.state === "queued" || activeJob.state === "working" ? "working" : "needs_you"
+            : item.likelyNoise
+              ? "noise"
+              : item.state === "resolved"
+                ? "settled"
+                : stillSnoozed
+                  ? "working"
+                  : "needs_you",
       item,
-      job: null,
+      job: activeJob,
     };
   });
-  const jobThreads = jobs.map<WorkThread>((job) => {
+  const jobThreads = jobs.flatMap<WorkThread>((job) => {
     const item = job.inboxId ? inboxById.get(job.inboxId) ?? null : null;
-    return {
+    if (item && !job.taskId && (job.state === "settled" || activeJobByInboxId.get(item.id)?.id === job.id)) return [];
+    return [{
       key: `job:${job.id}`,
       kind: "job",
       title: job.title,
@@ -121,7 +133,7 @@ export function buildWorkThreads(
           : "needs_you",
       item,
       job,
-    };
+    }];
   });
   return [...inboxThreads, ...jobThreads]
     .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt) || first.key.localeCompare(second.key));

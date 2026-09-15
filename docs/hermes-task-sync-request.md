@@ -1,6 +1,6 @@
 # Hermes integration contract
 
-Status: implemented on the Fox Focus side and tested with fixtures. The live `personal-tasks` migration and the real mail executor have not been run or verified.
+Status: the live job bridge is verified end to end. The `personal-tasks` migration and real mail executor have not been run or verified.
 
 Hermes reads work, proposes Inbox items, carries short jobs forward and back, publishes briefings, and executes an email only after the owner approves its exact envelope. It cannot settle a job, approve a write, complete a task directly, access SQLite directly, or write the Hermes database.
 
@@ -82,7 +82,7 @@ Do not send raw MIME, credentials, or unrelated message bodies in this request.
 
 ## Jobs
 
-The owner creates a job, optionally linked to a task or Inbox item. Its states are:
+The owner creates a job, optionally linked to a task or Inbox item. Fox Focus allows one unsettled job per linked task or Inbox item. Its states are:
 
 ```text
 queued -> working -> needs_you -> working -> review
@@ -96,6 +96,8 @@ Claim it with:
 ```http
 POST /api/v1/requests/<job-id>/claim
 Authorization: Bearer <token>
+X-Request-Kind: job
+X-Claim-Key: <stable key for this job version>
 ```
 
 A job claim returns:
@@ -105,9 +107,11 @@ A job claim returns:
   "kind": "job",
   "job": { "id": "job-id", "state": "working" },
   "claimId": "opaque-claim-id",
-  "leaseUntil": "2026-09-14T10:02:00.000Z"
+  "leaseUntil": "2026-09-14T10:10:00.000Z"
 }
 ```
+
+The worker generates `X-Claim-Key` before the request and reuses it only to recover a lost response for that job version. Fox Focus maps it to a fresh opaque `claimId`; the request key is never the lease credential. Repeating the request while that lease is active returns the same `claimId`. After the lease ends, the worker must refresh the job and use a key for its new version. `X-Request-Kind: job` prevents a mistaken action ID from claiming an approved email send.
 
 Post updates with the returned claim in `X-Claim-Id`:
 
@@ -115,11 +119,11 @@ Post updates with the returned claim in `X-Claim-Id`:
 { "kind": "progress", "text": "Checking the published timetable.", "url": null }
 ```
 
-`kind` is `progress`, `question`, or `result`. Text is one plain-text line of at most 280 characters. URL is `null` or a safe HTTPS URL. Progress keeps the job working and renews the lease. A question moves it to `needs_you` and releases the claim. A result moves it to `review` and releases the claim.
+`kind` is `progress`, `question`, or `result`. Text is one plain-text line of at most 280 characters. URL is `null` or a safe HTTPS URL. A new progress update keeps the job working and renews the ten-minute lease. A question moves it to `needs_you` and releases the claim. A result moves it to `review` and releases the claim.
 
 The owner answers a question in one line, accepts, drops, or sends the job back with one line. Hermes cannot call those owner routes. Accepting a job linked to a task is also the owner's completion click; Fox Focus queues the normal ETag-guarded Google action.
 
-Hermes may post several progress bodies while the claim is active. Replaying the exact body under the same claim returns the same update.
+Hermes may post several distinct progress bodies while the claim is active. Replaying the exact body under the same claim returns the same update without extending the lease.
 
 ## Email send actions
 

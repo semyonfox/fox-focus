@@ -1,5 +1,5 @@
 import { CalendarDays, CheckCircle2, Link2, ListTodo, RefreshCw, ShieldCheck, X } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { dublinDateKey, isDateKey } from './calendar-time.ts';
 import { areaForList, filterCalendarContextByDateRange, listAreaKey } from './integration-model.ts';
 import {
@@ -47,7 +47,9 @@ export type ImportedRecord = {
   title: string;
   status: string | null;
   startsAt: string | null;
+  endsAt: string | null;
   startsOn: string | null;
+  endsOn: string | null;
   dueOn: string | null;
   allDay: boolean;
   adoptedTaskId: string | null;
@@ -129,7 +131,9 @@ function isImportedRecord(value: unknown): value is ImportedRecord {
     typeof value.externalId === 'string' && typeof value.title === 'string' &&
     (value.status === null || typeof value.status === 'string') &&
     (value.startsAt === null || typeof value.startsAt === 'string') &&
+    (value.endsAt === null || typeof value.endsAt === 'string') &&
     (value.startsOn === null || typeof value.startsOn === 'string') &&
+    (value.endsOn === null || typeof value.endsOn === 'string') &&
     (value.dueOn === null || typeof value.dueOn === 'string') && typeof value.allDay === 'boolean' &&
     (value.adoptedTaskId === null || typeof value.adoptedTaskId === 'string');
 }
@@ -302,21 +306,44 @@ export function useOverview(open: boolean): OverviewState {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
-  const refresh = useCallback(async () => {
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+  const refresh = useCallback(() => {
+    if (refreshInFlight.current) return refreshInFlight.current;
     setLoading(true);
-    try {
-      const response = await fetch('/api/v1/integrations');
-      const value: unknown = await response.json();
-      if (!response.ok || !isOverview(value)) throw new Error('Invalid integrations response');
-      setOverview(value);
-      setFailed(false);
-    } catch {
-      setFailed(true);
-    } finally {
-      setLoading(false);
-    }
+    const pending = (async () => {
+      try {
+        const response = await fetch('/api/v1/integrations');
+        const value: unknown = await response.json();
+        if (!response.ok || !isOverview(value)) throw new Error('Invalid integrations response');
+        setOverview(value);
+        setFailed(false);
+      } catch {
+        setFailed(true);
+      } finally {
+        setLoading(false);
+      }
+    })();
+    refreshInFlight.current = pending;
+    void pending.finally(() => {
+      if (refreshInFlight.current === pending) refreshInFlight.current = null;
+    });
+    return pending;
   }, []);
-  useEffect(() => { if (open) void refresh(); }, [open, refresh]);
+  useEffect(() => {
+    if (!open) return;
+    void refresh();
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void refresh();
+    };
+    const interval = window.setInterval(refreshWhenVisible, 60_000);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('focus', refreshWhenVisible);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('focus', refreshWhenVisible);
+    };
+  }, [open, refresh]);
   return { overview, loading, failed, refresh };
 }
 
@@ -770,7 +797,11 @@ export function IntegrationCalendarContext({
 }) {
   const { overview, loading, failed } = overviewState;
   const connected = overview?.providers.some(provider => provider.connection?.state === 'connected') ?? false;
-  const importedEvents = (overview?.records ?? []).filter(record => record.kind === 'calendar_event');
+  // Timed imports render in the primary calendar. Keep all-day and malformed
+  // source records here so they remain visible without appearing twice.
+  const allImportedEvents = (overview?.records ?? []).filter(record => record.kind === 'calendar_event');
+  const importedEvents = allImportedEvents.filter(record =>
+    record.allDay || !record.startsAt || !record.endsAt || Date.parse(record.endsAt) <= Date.parse(record.startsAt));
   const matchingEvents = filterCalendarContextByDateRange(importedEvents, startDate, endDate);
   const events = matchingEvents.slice(0, 8);
   const today = dublinDateKey(new Date());
@@ -778,10 +809,11 @@ export function IntegrationCalendarContext({
   if (loading && !overview) return <p className="source-boundary">Checking calendar connections…</p>;
   if (failed && !overview) return <p className="source-boundary source-boundary--warning">Calendar connections could not be checked. <button className="inline-action" type="button" onClick={onOpen}>Open sources</button></p>;
   if (!connected) return null;
+  if (!matchingEvents.length && allImportedEvents.length > 0) return null;
   return <div className="provider-calendar-context">
     <div><span>{calendarContextHeading(startDate, endDate, today)} · read-only</span><button className="inline-action" type="button" onClick={onOpen}>Open sources</button></div>
     {events.map(record => <p key={record.id}><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {recordWhen(record)}</small></p>)}
     {matchingEvents.length > events.length ? <p className="provider-calendar-context-empty">{matchingEvents.length - events.length} more imported item{matchingEvents.length - events.length === 1 ? '' : 's'} in this range. Open sources to review them.</p> : null}
-    {!matchingEvents.length ? <p className="provider-calendar-context-empty">{emptyCalendarContextCopy(startDate, endDate, today, importedEvents.length > 0)}</p> : null}
+    {!matchingEvents.length && !allImportedEvents.length ? <p className="provider-calendar-context-empty">{emptyCalendarContextCopy(startDate, endDate, today, false)}</p> : null}
   </div>;
 }

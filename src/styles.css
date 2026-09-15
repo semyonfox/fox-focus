@@ -25,6 +25,8 @@
   --blue-text: #b9c2d0;
   --amber-soft: #342d22;
   --amber-text: #d8b477;
+  --now: #ff747c;
+  --now-soft: rgba(255, 78, 91, 0.11);
   --shadow: rgba(0, 0, 0, 0.34);
   color: var(--text);
   background: var(--page);
@@ -62,6 +64,8 @@
   --blue-text: #24558c;
   --amber-soft: #fff1d8;
   --amber-text: #805800;
+  --now: #c92f3d;
+  --now-soft: rgba(201, 47, 61, 0.09);
   --shadow: rgba(18, 35, 51, 0.14);
   color-scheme: light;
 }
@@ -93,6 +97,8 @@
   --blue-text: #b7bfce;
   --amber-soft: #30291f;
   --amber-text: #d6b176;
+  --now: #ff747c;
+  --now-soft: rgba(255, 78, 91, 0.12);
   --shadow: rgba(0, 0, 0, 0.48);
   color-scheme: dark;
 }
@@ -5184,5 +5190,210 @@ body {
   .job-response > div {
     align-items: stretch;
     flex-direction: column;
+  }
+}
+
+/* Live calendar position */
+
+.schedule-row--now,
+.today-event-row--now {
+  background: var(--now-soft);
+  box-shadow: inset 3px 0 var(--now);
+}
+
+.schedule-row--now:hover,
+.today-event-row--now:hover {
+  background: color-mix(in srgb, var(--now) 15%, var(--panel));
+}
+
+.schedule-row--now.schedule-row--selected {
+  box-shadow: inset 3px 0 var(--now), inset 0 0 0 1px var(--focus);
+}
+
+.schedule-row--now > time,
+.today-event-row--now > time,
+.today-event-row--now > time span {
+  color: var(--now);
+}
+
+.event-now-label,
+.event-next-label {
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 780;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.event-now-label {
+  color: var(--now);
+}
+
+.event-next-label {
+  color: var(--blue-text);
+}
+
+.calendar-now-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 27px;
+  padding: 4px 9px;
+  color: var(--now);
+  font-size: 9.5px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.calendar-now-line i {
+  position: relative;
+  height: 1px;
+  flex: 1;
+  background: currentColor;
+}
+
+.calendar-now-line i::before {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+/* Hermes request composer */
+
+.job-composer-context {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel-muted);
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.job-prompt-presets {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.job-prompt-presets button {
+  min-height: 31px;
+  padding-inline: 10px;
+}
+
+/* Inbox list/detail navigation */
+
+.review-queue-nav .work-inbox-back {
+  display: none;
+  width: auto;
+  padding: 0 10px;
+}
+
+.review-queue-nav button b {
+  display: none;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+@media (max-width: 820px) {
+  .workspace-page--review .review-workbench:not(.review-workbench--detail) > .work-thread-detail {
+    display: none;
+  }
+
+  .workspace-page--review .review-workbench--detail > .work-thread-list {
+    display: none;
+  }
+
+  .workspace-page--review .work-inbox .review-workbench {
+    display: block;
+  }
+
+  .workspace-page--review .work-thread-detail {
+    max-height: calc(100dvh - 190px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scroll-padding-top: 62px;
+  }
+
+  .work-thread-heading h2 {
+    scroll-margin-top: 62px;
+  }
+
+  .work-thread-list {
+    padding: 8px;
+    border-bottom: 0;
+  }
+
+  .work-thread {
+    min-height: 58px;
+    padding: 8px 9px;
+  }
+
+  .review-queue-nav {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    margin: -12px -12px 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line-soft);
+    background: color-mix(in srgb, var(--panel-solid) 94%, transparent);
+    backdrop-filter: blur(12px);
+  }
+
+  .review-queue-nav .work-inbox-back {
+    display: inline-flex;
+  }
+
+  .review-queue-nav > span {
+    margin-left: auto;
+  }
+
+  .review-queue-nav button {
+    display: inline-flex;
+    width: auto;
+    min-width: 44px;
+    height: 44px;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 0 10px;
+  }
+
+  .review-queue-nav button b {
+    display: inline;
+  }
+
+  .work-thread-actions button,
+  .job-response button,
+  .job-prompt-presets button {
+    min-height: 44px;
+  }
+
+  .job-response input {
+    height: 44px;
+  }
+}
+
+@media (max-width: 520px) {
+  .review-queue-nav {
+    flex-wrap: wrap;
+  }
+
+  .review-queue-nav > div {
+    width: 100%;
+  }
+
+  .review-queue-nav > div button {
+    flex: 1;
   }
 }

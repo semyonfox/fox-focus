@@ -35,8 +35,10 @@ import "./styles.css";
 import {
   addCalendarDays,
   calendarDateWindow,
+  currentEventProgress,
   dublinDateKey,
   dublinDateTimeToInstant,
+  dublinDayBounds,
   dublinTimeValue,
   formatDublinDateKey,
   isDateKey,
@@ -121,7 +123,8 @@ function loadTheme(): ResolvedTheme {
 }
 
 function makeId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const randomPart = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2, 10);
+  return `${prefix}-${Date.now()}-${randomPart}`;
 }
 
 function areaClass(area: Area): string {
@@ -140,11 +143,6 @@ function parseDuration(value: string, fallback = 30): number {
 
 function isValidTime(value: string): boolean {
   return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
-}
-
-function timeValueToMinutes(value: string): number {
-  const [hours, minutes] = value.split(":").map(Number);
-  return hours * 60 + minutes;
 }
 
 function formatStatus(status: InboxStatus): string {
@@ -228,6 +226,45 @@ function compareCalendarEvents(first: TimelineEvent, second: TimelineEvent, lega
   return eventDateKey(first, legacyDate).localeCompare(eventDateKey(second, legacyDate)) ||
     eventTimeValue(first).localeCompare(eventTimeValue(second)) ||
     first.title.localeCompare(second.title);
+}
+
+function eventStartInstant(event: TimelineEvent, legacyDate: string): string | null {
+  if (typeof event.startsAt === "string") {
+    return Number.isFinite(Date.parse(event.startsAt)) ? event.startsAt : null;
+  }
+  return dublinDateTimeToInstant(eventDateKey(event, legacyDate), eventTimeValue(event));
+}
+
+function eventIsCurrentAt(event: TimelineEvent, now: Date, legacyDate: string): boolean {
+  const start = eventStartInstant(event, legacyDate);
+  return start !== null && currentEventProgress(start, event.duration, now) !== null;
+}
+
+function eventOccursOnDate(event: TimelineEvent, date: string, legacyDate: string): boolean {
+  const start = eventStartInstant(event, legacyDate);
+  const bounds = dublinDayBounds(date);
+  // Legacy wall times can be ambiguous during the repeated Dublin hour.
+  // Keep those rows on their stored day even though they cannot be labelled
+  // as current until the owner saves an exact instant.
+  if (!start) return eventDateKey(event, legacyDate) === date;
+  if (!bounds) return false;
+  const startTime = Date.parse(start);
+  const endTime = startTime + event.duration * 60_000;
+  return startTime < Date.parse(bounds.end) && endTime > Date.parse(bounds.start);
+}
+
+function eventOverlapsDateRange(event: TimelineEvent, startDate: string, endDate: string, legacyDate: string): boolean {
+  const start = eventStartInstant(event, legacyDate);
+  const firstDay = dublinDayBounds(startDate);
+  const lastDay = dublinDayBounds(endDate);
+  if (!start) {
+    const date = eventDateKey(event, legacyDate);
+    return date >= startDate && date <= endDate;
+  }
+  if (!firstDay || !lastDay) return false;
+  const startTime = Date.parse(start);
+  const endTime = startTime + event.duration * 60_000;
+  return startTime < Date.parse(lastDay.end) && endTime > Date.parse(firstDay.start);
 }
 
 type CalendarMode = "day" | "upcoming";
@@ -670,6 +707,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [modal, setModal] = useState<Modal>(null);
   const [taskDraft, setTaskDraft] = useState<TaskDraft>(defaultTaskDraft);
   const [eventDraft, setEventDraft] = useState<EventDraft>(defaultEventDraft);
+  const [now, setNow] = useState(() => new Date());
   const [draftText, setDraftText] = useState("");
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
@@ -700,10 +738,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [workRows, setWorkRows] = useState<WorkRowsSnapshot | null>(null);
   const [workRowsError, setWorkRowsError] = useState(false);
   const [selectedWorkKey, setSelectedWorkKey] = useState<string | null>(null);
+  const [workDetailOpen, setWorkDetailOpen] = useState(false);
+  const workDetailHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const workThreadListRef = useRef<HTMLElement | null>(null);
+  const workThreadRefs = useRef(new Map<string, HTMLButtonElement>());
+  const workDetailWasOpen = useRef(false);
   const [settledOpen, setSettledOpen] = useState(false);
   const [noiseOpen, setNoiseOpen] = useState(false);
   const [workBusyKey, setWorkBusyKey] = useState<string | null>(null);
-  const [jobComposer, setJobComposer] = useState<{ idempotencyKey: string; title: string; taskId?: string; inboxId?: string } | null>(null);
+  const [jobComposer, setJobComposer] = useState<{ idempotencyKey: string; title: string; taskId?: string; inboxId?: string; context?: string } | null>(null);
   const [jobInstruction, setJobInstruction] = useState("");
   const [jobReply, setJobReply] = useState("");
   const [editingReply, setEditingReply] = useState<{ inboxId: string; inboxVersion: number; reply: ReplyEnvelope } | null>(null);
@@ -922,6 +965,39 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
+  useEffect(() => {
+    const updateClock = () => setNow(new Date());
+    const updateVisibleClock = () => {
+      if (document.visibilityState === "visible") updateClock();
+    };
+    const interval = window.setInterval(updateClock, 30_000);
+    window.addEventListener("focus", updateClock);
+    document.addEventListener("visibilitychange", updateVisibleClock);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", updateClock);
+      document.removeEventListener("visibilitychange", updateVisibleClock);
+    };
+  }, []);
+
+  useEffect(() => {
+    const wasOpen = workDetailWasOpen.current;
+    workDetailWasOpen.current = workDetailOpen;
+    if (activeSection !== "review" || !window.matchMedia("(max-width: 820px)").matches) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (workDetailOpen) {
+        workDetailHeadingRef.current?.focus({ preventScroll: true });
+        workDetailHeadingRef.current?.scrollIntoView({ block: "start" });
+      } else if (wasOpen) {
+        const selected = selectedWorkKey ? workThreadRefs.current.get(selectedWorkKey) : null;
+        const target = selected ?? workThreadListRef.current;
+        target?.focus({ preventScroll: true });
+        target?.scrollIntoView({ block: "nearest" });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeSection, selectedWorkKey, workDetailOpen]);
+
   const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || hermesAdoption || taskConflictActionId || taskCreateConflictActionId || jobComposer || editingReply);
 
   useEffect(() => {
@@ -1095,7 +1171,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => window.clearTimeout(timeout);
   }, [reviewUndo]);
 
-  const todayDate = dublinDateKey(new Date());
+  const todayDate = dublinDateKey(now);
   const hermesPlannedEvents = useMemo<TimelineEvent[]>(() => hermesTasks.flatMap(task => {
     const area = hermesTaskArea(task, data.listAreas) ?? "Personal";
     return task.scheduledAt && task.status !== "done"
@@ -1179,20 +1255,42 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }), [taskById, taskRows?.taskPlans]);
   const staleRowEventIds = useMemo(() => new Set(data.tasks.flatMap((task) =>
     rowTaskIds.has(task.id) && task.linkedEventId ? [task.linkedEventId] : [])), [data.tasks, rowTaskIds]);
+  const importedCalendarEvents = useMemo<TimelineEvent[]>(() => (integrations.overview?.records ?? []).flatMap((record) => {
+    if (record.kind !== "calendar_event" || record.allDay || !record.startsAt || !record.endsAt || record.status === "cancelled") return [];
+    const duration = (Date.parse(record.endsAt) - Date.parse(record.startsAt)) / 60_000;
+    if (!Number.isFinite(duration) || duration <= 0) return [];
+    const source = `${providerLabel(record.provider)} · ${record.containerName || "Calendar"}`;
+    return [{
+      id: `imported:${record.provider}:${record.connectionId ?? "connection"}:${record.containerId}:${record.externalId}`,
+      title: record.title,
+      subtitle: source,
+      area: areaForList(data.listAreas, record.provider, record.containerId, record.containerName),
+      startsAt: record.startsAt,
+      duration,
+      editable: false,
+      origin: "imported" as const,
+      source,
+    }];
+  }), [data.listAreas, integrations.overview?.records]);
   const sortedEvents = useMemo(() => [
     ...data.events.filter((event) => !staleRowEventIds.has(event.id) && (!event.taskId || !rowTaskIds.has(event.taskId))),
     ...rowPlannedEvents,
     ...hermesPlannedEvents,
-  ].sort((first, second) => compareCalendarEvents(first, second, todayDate)), [data.events, hermesPlannedEvents, rowPlannedEvents, rowTaskIds, staleRowEventIds, todayDate]);
+    ...importedCalendarEvents,
+  ].sort((first, second) => compareCalendarEvents(first, second, todayDate)), [data.events, hermesPlannedEvents, importedCalendarEvents, rowPlannedEvents, rowTaskIds, staleRowEventIds, todayDate]);
   const visibleCalendarEvents = useMemo(
-    () => sortedEvents.filter((event) => {
-      const date = eventDateKey(event, todayDate);
-      return date >= calendarRangeStart && date <= calendarRangeEnd;
-    }),
+    () => sortedEvents.filter((event) => eventOverlapsDateRange(event, calendarRangeStart, calendarRangeEnd, todayDate)),
     [calendarRangeEnd, calendarRangeStart, sortedEvents, todayDate],
   );
   const eventById = useMemo(() => new Map(sortedEvents.map((event) => [event.id, event])), [sortedEvents]);
-  const selectedEvent = visibleCalendarEvents.find((event) => event.id === selectedEventId) ?? visibleCalendarEvents[0] ?? null;
+  const isCurrentCalendarEvent = (event: TimelineEvent) =>
+    taskById.get(event.taskId ?? "")?.completed !== true && eventIsCurrentAt(event, now, todayDate);
+  const selectedEvent = visibleCalendarEvents.find((event) => event.id === selectedEventId) ??
+    visibleCalendarEvents.find(isCurrentCalendarEvent) ??
+    visibleCalendarEvents.find((event) => {
+      const start = eventStartInstant(event, todayDate);
+      return start !== null && Date.parse(start) > now.getTime();
+    }) ?? visibleCalendarEvents[0] ?? null;
   const selectedEventTask = selectedEvent?.taskId ? taskById.get(selectedEvent.taskId) : undefined;
   const selectedEventHermesTask = selectedEvent?.taskId?.startsWith("hermes:")
     ? hermesTasks.find(task => `hermes:${task.id}` === selectedEvent.taskId)
@@ -1251,7 +1349,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         .sort((first, second) => first.at.localeCompare(second.at) || first.seq - second.seq)
       : [];
   const activeTasks = displayTasks.filter((task) => !task.completed);
-  const activeBlock = visibleCalendarEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
+  const activeBlock = selectedDate === todayDate
+    ? visibleCalendarEvents.find(isCurrentCalendarEvent) ?? null
+    : null;
   const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
   const microsoftConfigured = integrations.overview?.providers.some((status) =>
     status.provider === "microsoft" && status.configured) === true;
@@ -1399,14 +1499,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     briefing.day === todayDate && Date.parse(briefing.expiresAt) > Date.now()) ?? null;
   const briefingNewsCount = todayBriefing?.entries.filter((entry) => entry.kind === "news").length ?? 0;
   const briefingEventCount = todayBriefing?.entries.filter((entry) => entry.kind === "event").length ?? 0;
-  const todayEvents = sortedEvents.filter((event) => eventDateKey(event, todayDate) === todayDate);
-  const currentTime = timeValueToMinutes(dublinTimeValue(new Date()));
-  const currentEvent = todayEvents.find((event) => {
-    const startsAt = timeValueToMinutes(eventTimeValue(event));
-    return startsAt <= currentTime && startsAt + event.duration > currentTime;
+  const todayEvents = sortedEvents.filter((event) => eventOccursOnDate(event, todayDate, todayDate));
+  const currentEvents = todayEvents.filter(isCurrentCalendarEvent);
+  const currentEvent = currentEvents[0];
+  const nextEvents = todayEvents.filter((event) => {
+    const start = eventStartInstant(event, todayDate);
+    return start !== null && Date.parse(start) > now.getTime();
   });
-  const nextEvents = todayEvents.filter((event) => timeValueToMinutes(eventTimeValue(event)) >= currentTime && event.id !== currentEvent?.id);
-  const todayFocusEvents = [...(currentEvent ? [currentEvent] : []), ...nextEvents].slice(0, 3);
+  const todayFocusEvents = [...currentEvents, ...nextEvents].slice(0, 3);
   const priorityOrder: Record<Priority, number> = { high: 0, medium: 1, low: 2 };
   const attentionDueOrder: Record<string, number> = { Today: 0, Tomorrow: 1, Friday: 2, Waiting: 4, "No deadline": 5 };
   const attentionTasks = [...activeTasks]
@@ -2236,6 +2336,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function selectWorkThread(thread: WorkThread) {
     setSelectedWorkKey(thread.key);
+    setWorkDetailOpen(true);
     setJobReply("");
   }
 
@@ -2245,8 +2346,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (next) selectWorkThread(next);
   }
 
-  async function runWorkMutation(key: string, operation: () => Promise<unknown>, message: string) {
-    if (workBusyKey) return;
+  async function runWorkMutation(key: string, operation: () => Promise<unknown>, message: string): Promise<boolean> {
+    if (workBusyKey) return false;
     setWorkBusyKey(key);
     setStatusMessage("");
     try {
@@ -2258,7 +2359,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         setWorkRowsError(true);
       }
       setStatusMessage(error instanceof Error ? error.message : "The Inbox change could not be saved.");
-      return;
+      return false;
     } finally {
       setWorkBusyKey(null);
     }
@@ -2266,6 +2367,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setTaskRowsError(true);
       setWorkRowsError(true);
     }
+    return true;
   }
 
   function sendWorkItem(item: InboxItemRow) {
@@ -2295,30 +2397,25 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     );
   }
 
-  function chooseNextWorkThread(currentKey: string) {
+  function chooseNextWorkThread(currentKey: string): boolean {
     const next = [...needsYouThreads, ...workingThreads].find((thread) => thread.key !== currentKey);
-    if (next) setSelectedWorkKey(next.key);
+    if (next) {
+      setSelectedWorkKey(next.key);
+      return true;
+    }
+    setSelectedWorkKey(null);
+    setWorkDetailOpen(false);
+    return false;
   }
 
-  function decideWorkItem(item: InboxItemRow, outcome: "read" | "dismissed" | "noise") {
+  function dismissWorkItem(item: InboxItemRow) {
     const key = `inbox:${item.id}`;
     chooseNextWorkThread(key);
     void runWorkMutation(key, () => decideInboxItem(item, {
       state: "resolved",
-      outcome,
+      outcome: "dismissed",
       snoozedUntil: null,
-    }), outcome === "noise" ? "Marked as noise." : outcome === "dismissed" ? "Marked not interested." : "Marked done.");
-  }
-
-  function snoozeWorkItem(item: InboxItemRow) {
-    const key = `inbox:${item.id}`;
-    const until = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
-    chooseNextWorkThread(key);
-    void runWorkMutation(key, () => decideInboxItem(item, {
-      state: "waiting",
-      outcome: null,
-      snoozedUntil: until,
-    }), `Snoozed until ${formatDublinInstant(until)}.`);
+    }), "Dismissed from the Inbox.");
   }
 
   function canMutateInboxItem(item: InboxItemRow): boolean {
@@ -2384,11 +2481,47 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
   }
 
-  function openJobComposer(input: { title: string; taskId?: string; inboxId?: string }) {
-    setJobComposer({ ...input, idempotencyKey: crypto.randomUUID() });
-    setJobInstruction("");
+  function openJobComposer(
+    input: { title: string; taskId?: string; inboxId?: string; context?: string },
+    initialInstruction = "",
+  ) {
+    const existing = (workRows?.jobs ?? []).find((job) => job.state !== "settled" && (
+      (input.inboxId !== undefined && job.inboxId === input.inboxId) ||
+      (input.taskId !== undefined && job.taskId === input.taskId)
+    ));
+    if (existing) {
+      setModal(null);
+      setSelectedWorkKey(existing.inboxId && !existing.taskId ? `inbox:${existing.inboxId}` : `job:${existing.id}`);
+      setWorkDetailOpen(true);
+      openWorkspaceView("review");
+      setStatusMessage("Hermes already has an active request for this item.");
+      return;
+    }
+    setEditingHermesTaskId(null);
+    setJobComposer({ ...input, idempotencyKey: makeId("job-request") });
+    setJobInstruction(initialInstruction);
     setModalError("");
     setModal(null);
+  }
+
+  function openTaskJobComposer(task: Task, initialInstruction = "") {
+    const row = taskRowById.get(task.id);
+    const canCompleteFromResult = row?.binding.kind === "google" && row.observed !== null &&
+      row.unavailableAt === null && (row.observed.completionWritable || row.observed.status === "completed");
+    const plannedDate = plannedDateForTask(task);
+    const context = [
+      `Task: ${task.title}`,
+      `Area: ${task.area}`,
+      `State: ${task.completed ? "completed" : task.state}`,
+      task.deadlineDate ? `Deadline: ${task.deadlineDate}` : task.due ? `Due: ${task.due}` : "",
+      plannedDate ? `Planned: ${plannedDate}${task.scheduledTime ? ` at ${task.scheduledTime}` : ""}` : "",
+      task.duration ? `Estimate: ${task.duration}` : "",
+    ].filter(Boolean).join(" · ");
+    openJobComposer({
+      title: task.title,
+      ...(canCompleteFromResult ? { taskId: task.id } : {}),
+      context,
+    }, initialInstruction);
   }
 
   async function submitJob(event: FormEvent<HTMLFormElement>) {
@@ -2397,10 +2530,22 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setModalError("Add a one-line title and short instruction for Hermes.");
       return;
     }
+    const context = jobComposer.context?.trim();
+    const instruction = `${jobInstruction.trim()}${context ? `\n\nContext: ${context}` : ""}`;
+    if (instruction.length > 2_000) {
+      setModalError("Shorten the request so its context fits within 2,000 characters.");
+      return;
+    }
     setWorkBusyKey("job:create");
     setModalError("");
     try {
-      const job = await createJob({ ...jobComposer, title: jobComposer.title.trim(), instruction: jobInstruction.trim() });
+      const job = await createJob({
+        idempotencyKey: jobComposer.idempotencyKey,
+        title: jobComposer.title.trim(),
+        instruction,
+        taskId: jobComposer.taskId,
+        inboxId: jobComposer.inboxId,
+      });
       setWorkRows((current) => mergeWorkRows(current, {
         inbox: [],
         drafts: [],
@@ -2412,7 +2557,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         capabilities: current?.capabilities ?? { emailSendEnabled: false },
       }));
       setJobComposer(null);
-      setStatusMessage("Handed to Hermes.");
+      setStatusMessage("Queued for Hermes. It will show as Working when claimed.");
       try { await refreshRowSnapshots(); } catch { setWorkRowsError(true); }
     } catch (error) {
       setModalError(error instanceof Error ? error.message : "The job could not be queued.");
@@ -2447,14 +2592,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setStatusMessage("The linked Google task is not ready for completion.");
       return;
     }
-    void runWorkMutation(`job:${job.id}`, () => settleJob(job, outcome, outcome === "accepted" ? task?.version : undefined),
-      outcome === "accepted" ? "Accepted the result." : "Dropped the job.");
+    const threadKey = selectedWorkThread?.job?.id === job.id
+      ? selectedWorkThread.key
+      : job.inboxId && !job.taskId && inboxRowById.has(job.inboxId)
+        ? `inbox:${job.inboxId}`
+        : `job:${job.id}`;
+    void runWorkMutation(threadKey, () => settleJob(job, outcome, outcome === "accepted" ? task?.version : undefined),
+      outcome === "accepted" ? "Accepted the result." : "Dropped the job.").then((settled) => {
+      if (settled) chooseNextWorkThread(threadKey);
+    });
   }
 
   function canAcceptJob(job: Job): boolean {
     if (!job.taskId) return true;
     const task = taskRowById.get(job.taskId);
     if (!task?.observed) return false;
+    const runningStatusAction = (taskRows?.actions ?? []).some((action) => action.state === "running" &&
+      action.payload.kind === "task-status" && action.payload.taskId === task.id);
+    if (runningStatusAction) return false;
     const queuedReopen = (taskRows?.actions ?? []).some((action) => action.payload.taskId === task.id &&
       action.payload.after === "open" && (action.state === "queued" || action.state === "failed"));
     if (task.observed.status === "completed" && !queuedReopen) return true;
@@ -2551,7 +2706,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   useEffect(() => {
     const onInboxKeyDown = (event: KeyboardEvent) => {
       if (activeSection !== "review" || isOverlayOpen || event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
+      if (!(event.target instanceof HTMLElement) || !event.target.closest(".work-inbox") || event.target.isContentEditable ||
+        event.target.closest("input, textarea, select, [contenteditable='true']")) return;
       const thread = selectedWorkThread;
       if (event.key === "j" || event.key === "k") {
         event.preventDefault();
@@ -2562,31 +2718,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const item = thread.kind === "inbox" ? thread.item : null;
       const job = thread.job;
       const canAct = item ? canMutateInboxItem(item) : false;
-      const canAskHermes = Boolean(item && item.state !== "resolved" && workBusyKey === null);
-      if (event.key === "s" && item?.source.kind === "email") {
-        event.preventDefault();
-        sendWorkItem(item);
-      } else if (event.key === "d" && canAct && item?.source.kind === "email" && draftByInboxId.has(item.id)) {
-        event.preventDefault();
-        openReplyEditor(item);
-      } else if (event.key === "h" && canAskHermes && item) {
+      const canAskHermes = Boolean(item && !job && canAct);
+      if (event.key === "h" && canAskHermes && item) {
         event.preventDefault();
         openJobComposer({ title: item.title, inboxId: item.id });
-      } else if (event.key === "t" && canAct && item && !item.taskId) {
-        event.preventDefault();
-        openTaskComposer(undefined, undefined, item);
-      } else if (event.key === "z" && canAct && item) {
-        event.preventDefault();
-        snoozeWorkItem(item);
-      } else if (event.key === "e" && canAct && item) {
-        event.preventDefault();
-        decideWorkItem(item, "read");
       } else if (event.key === "x" && canAct && item) {
         event.preventDefault();
-        decideWorkItem(item, "dismissed");
-      } else if (event.key === "n" && canAct && item) {
-        event.preventDefault();
-        decideWorkItem(item, "noise");
+        dismissWorkItem(item);
       } else if (event.key === "a" && job?.state === "review" && workBusyKey === null) {
         event.preventDefault();
         settleSelectedJob(job, "accepted");
@@ -2732,32 +2870,57 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     />;
   }
 
-  function renderScheduleRow(event: TimelineEvent, showDate = false) {
+  function renderScheduleRow(event: TimelineEvent, displayDate: string, showDate = false, isNext = false) {
     const linkedTask = event.taskId ? taskById.get(event.taskId) : undefined;
     const linkedTaskDone = linkedTask?.completed === true;
     const date = eventDateKey(event, todayDate);
     const time = eventTimeValue(event);
+    const continuesFromEarlierDay = displayDate !== date;
+    const isCurrent = isCurrentCalendarEvent(event);
 
     return (
       <button
-        className={`schedule-row${showDate ? " schedule-row--dated" : ""}${event.id === selectedEvent?.id ? " schedule-row--selected" : ""}${linkedTaskDone ? " schedule-row--done" : ""}${event.editable ? "" : " schedule-row--imported"}`}
+        className={`schedule-row${showDate ? " schedule-row--dated" : ""}${event.id === selectedEvent?.id ? " schedule-row--selected" : ""}${isCurrent ? " schedule-row--now" : ""}${linkedTaskDone ? " schedule-row--done" : ""}${event.editable ? "" : " schedule-row--imported"}`}
         key={event.id}
         type="button"
         aria-pressed={event.id === selectedEvent?.id}
+        aria-current={isCurrent ? "time" : undefined}
         onClick={() => setSelectedEventId(event.id)}
       >
         <time dateTime={event.startsAt ?? time}>
-          {showDate ? <><span>{formatDublinDateKey(date, { weekday: "short", day: "numeric" })}</span><small>{time}</small></> : time}
+          {showDate
+            ? <><span>{formatDublinDateKey(displayDate, { weekday: "short", day: "numeric" })}</span><small>{continuesFromEarlierDay ? "Continues" : time}</small></>
+            : continuesFromEarlierDay ? "Continues" : time}
         </time>
         <i className={`area-dot area-dot--${areaClass(event.area)}`} />
         <span className="schedule-row-copy">
-          <strong>{event.title}</strong>
+          <strong>{isCurrent ? <em className="event-now-label">Now</em> : isNext ? <em className="event-next-label">Next</em> : null}{event.title}</strong>
           <small>{!event.editable ? <em className="agenda-origin agenda-origin--imported">Imported</em> : null}{event.subtitle}</small>
         </span>
         <span className="schedule-duration">{formatDuration(event.duration)}</span>
         <ChevronRight className="schedule-arrow" size={14} />
       </button>
     );
+  }
+
+  function renderDaySchedule(events: TimelineEvent[], date: string, showDate = false): ReactNode[] {
+    const nextIndex = date === todayDate
+      ? events.findIndex((event) => {
+          const start = eventStartInstant(event, todayDate);
+          return start !== null && Date.parse(start) > now.getTime();
+        })
+      : -1;
+    const rows: ReactNode[] = events.map((event, index) => renderScheduleRow(event, date, showDate, index === nextIndex));
+    if (date !== todayDate) return rows;
+    const lineIndex = nextIndex === -1 ? rows.length : nextIndex;
+    rows.splice(lineIndex, 0, <div className="calendar-now-line" role="separator" aria-label={`Now ${dublinTimeValue(now)}`} key={`now:${date}`}><span>Now {dublinTimeValue(now)}</span><i /></div>);
+    return rows;
+  }
+
+  function askHermesAboutEvent(event: TimelineEvent) {
+    const date = eventDateKey(event, todayDate);
+    const context = `${event.title} · ${formatDublinDateKey(date, { weekday: "long", day: "numeric", month: "long" })} at ${eventTimeValue(event)} · ${formatDuration(event.duration)} · ${event.source ?? event.subtitle}`;
+    openJobComposer({ title: `Review ${event.title}`, context }, "Review this calendar event and tell me the useful next step.");
   }
 
   function openTodayEvent(event: TimelineEvent) {
@@ -2773,6 +2936,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function openTodayWorkThread(thread: WorkThread) {
     selectWorkThread(thread);
+    setWorkDetailOpen(true);
     openWorkspaceView("review");
   }
 
@@ -2821,8 +2985,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <article className="pane today-card today-card--schedule">
           <PaneHeader eyebrow="Calendar" title={currentEvent ? "Now and next" : "Next today"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("agenda")}>Full calendar <ChevronRight size={12} /></button>} />
           <div className="today-event-list">
-            {todayFocusEvents.map((event, index) => <button className="today-event-row" type="button" key={event.id} onClick={() => openTodayEvent(event)}>
-              <time dateTime={event.startsAt ?? eventTimeValue(event)}><span>{event.id === currentEvent?.id ? "Now" : index === 0 ? "Next" : "Then"}</span><strong>{eventTimeValue(event)}</strong></time>
+            {todayFocusEvents.map((event) => <button className={`today-event-row${isCurrentCalendarEvent(event) ? " today-event-row--now" : ""}`} type="button" key={event.id} onClick={() => openTodayEvent(event)}>
+              <time dateTime={event.startsAt ?? eventTimeValue(event)}><span>{isCurrentCalendarEvent(event) ? "Now" : event.id === nextEvents[0]?.id ? "Next" : "Then"}</span><strong>{eventDateKey(event, todayDate) === todayDate ? eventTimeValue(event) : "Continues"}</strong></time>
               <i className={`calendar-event-mark calendar-event-mark--${areaClass(event.area)}`} />
               <span><strong>{event.title}</strong><small>{event.subtitle || `${formatDuration(event.duration)} · ${event.area}`}</small></span>
               <ChevronRight size={14} />
@@ -2849,7 +3013,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </article>
 
         <article className="pane today-card today-card--inbox">
-          <PaneHeader eyebrow="Inbox" title={reviewCount ? `${reviewCount} decision${reviewCount === 1 ? "" : "s"}` : "Nothing waiting"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("review")}>Open Inbox <ChevronRight size={12} /></button>} />
+          <PaneHeader eyebrow="Inbox" title={reviewCount ? `${reviewCount} decision${reviewCount === 1 ? "" : "s"}` : "Nothing waiting"} action={<button className="pane-link" type="button" onClick={() => { setWorkDetailOpen(false); openWorkspaceView("review"); }}>Open Inbox <ChevronRight size={12} /></button>} />
           <div className="today-inbox-list">
             {initial ? todayWorkThreads.map((thread) => <button type="button" key={thread.key} onClick={() => openTodayWorkThread(thread)}><i className={`inbox-thread-dot inbox-thread-dot--${thread.group}`} /><span><strong>{thread.title}</strong><small>{thread.source}</small></span><ChevronRight size={14} /></button>) : openReviewItems.map((item) => <button type="button" key={item.id} onClick={() => openTodayInbox(item)}><i className={`area-dot area-dot--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><ChevronRight size={14} /></button>)}
             {!(initial ? todayWorkThreads.length : openReviewItems.length) ? <div className="today-empty"><Inbox size={17} /><span><strong>Inbox is clear</strong><small>New proposals will appear here.</small></span></div> : null}
@@ -2878,32 +3042,32 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             <button className={calendarMode === "upcoming" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "upcoming"} onClick={() => setCalendarMode("upcoming")}><CalendarRange size={13} /> Upcoming</button>
           </div>
           <button className="calendar-today-action" type="button" onClick={returnCalendarToToday} disabled={selectedDate === todayDate && calendarMode === "day"}>Today</button>
-          <span className="calendar-range-copy">{calendarMode === "day" ? `${visibleCalendarEvents.length} local block${visibleCalendarEvents.length === 1 ? "" : "s"}` : `${formatDublinDateKey(calendarRangeStart, { day: "numeric", month: "short" })} to ${formatDublinDateKey(calendarRangeEnd, { day: "numeric", month: "short" })}`}</span>
+          <span className="calendar-range-copy">{calendarMode === "day" ? `${visibleCalendarEvents.length} event${visibleCalendarEvents.length === 1 ? "" : "s"}` : `${formatDublinDateKey(calendarRangeStart, { day: "numeric", month: "short" })} to ${formatDublinDateKey(calendarRangeEnd, { day: "numeric", month: "short" })}`}</span>
         </div>
         <div className="calendar-date-shell">
           <button className="calendar-step" type="button" onClick={() => moveCalendarDate(-1)} aria-label="Previous day"><ChevronLeft size={16} /></button>
           <div className="calendar-date-strip" role="tablist" aria-label="Choose a day">
             {calendarDays.map((date, index) => {
-              const localCount = sortedEvents.filter((event) => eventDateKey(event, todayDate) === date).length;
+              const eventCount = sortedEvents.filter((event) => eventOccursOnDate(event, date, todayDate)).length;
               const fullLabel = formatDublinDateKey(date, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
-              return <button className={`calendar-date-tab${date === selectedDate ? " calendar-date-tab--selected" : ""}${date === todayDate ? " calendar-date-tab--today" : ""}`} id={`calendar-date-${date}`} key={date} type="button" role="tab" aria-controls="calendar-day-panel" aria-current={date === todayDate ? "date" : undefined} aria-label={`${fullLabel}${date === todayDate ? ", today" : ""}, ${localCount} local ${localCount === 1 ? "block" : "blocks"}`} aria-selected={date === selectedDate} tabIndex={date === selectedDate ? 0 : -1} ref={(element) => { calendarTabRefs.current[index] = element; }} onClick={() => selectCalendarDate(date)} onKeyDown={(event) => handleCalendarTabKeyDown(event, index)}>
-                <span>{formatDublinDateKey(date, { weekday: "short" })}</span><strong>{formatDublinDateKey(date, { day: "numeric" })}</strong><small>{date === todayDate ? "Today" : localCount ? `${localCount} local` : "No local"}</small>
+              return <button className={`calendar-date-tab${date === selectedDate ? " calendar-date-tab--selected" : ""}${date === todayDate ? " calendar-date-tab--today" : ""}`} id={`calendar-date-${date}`} key={date} type="button" role="tab" aria-controls="calendar-day-panel" aria-current={date === todayDate ? "date" : undefined} aria-label={`${fullLabel}${date === todayDate ? ", today" : ""}, ${eventCount} ${eventCount === 1 ? "event" : "events"}`} aria-selected={date === selectedDate} tabIndex={date === selectedDate ? 0 : -1} ref={(element) => { calendarTabRefs.current[index] = element; }} onClick={() => selectCalendarDate(date)} onKeyDown={(event) => handleCalendarTabKeyDown(event, index)}>
+                <span>{formatDublinDateKey(date, { weekday: "short" })}</span><strong>{formatDublinDateKey(date, { day: "numeric" })}</strong><small>{date === todayDate ? "Today" : eventCount ? `${eventCount} event${eventCount === 1 ? "" : "s"}` : "Clear"}</small>
               </button>;
             })}
           </div>
           <button className="calendar-step" type="button" onClick={() => moveCalendarDate(1)} aria-label="Next day"><ChevronRight size={16} /></button>
         </div>
         {initial ? <IntegrationCalendarContext overviewState={dailyIntegrations} onOpen={() => setShowIntegrations(true)} startDate={calendarRangeStart} endDate={calendarRangeEnd} /> : null}
-        {activeBlock ? <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}><div className="active-block-copy"><span className="live-label"><span /> Local block in this view</span><strong>{activeBlock.title}</strong><small>{eventTimeValue(activeBlock)} · {formatDuration(activeBlock.duration)} · {activeBlock.taskId ? "linked task" : "local block"}</small></div><button className="open-note" type="button" onClick={() => setSelectedEventId(activeBlock.id)}>Inspect <ChevronRight size={12} /></button></div> : null}
+        {activeBlock ? <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}><div className="active-block-copy"><span className="live-label"><span /> Happening now</span><strong>{activeBlock.title}</strong><small>{eventTimeValue(activeBlock)} · {formatDuration(activeBlock.duration)} · {activeBlock.source ?? activeBlock.area}</small></div><button className="open-note" type="button" onClick={() => setSelectedEventId(activeBlock.id)}>Open <ChevronRight size={12} /></button></div> : null}
         <div className="schedule-list agenda-list" id="calendar-day-panel" role="tabpanel" aria-labelledby={`calendar-date-${selectedDate}`}>
-          {calendarMode === "day" ? visibleCalendarEvents.map((event) => renderScheduleRow(event)) : calendarDateWindow(selectedDate, 0, 6).map((date) => {
-            const dayEvents = visibleCalendarEvents.filter((event) => eventDateKey(event, todayDate) === date);
+          {calendarMode === "day" ? renderDaySchedule(visibleCalendarEvents, selectedDate) : calendarDateWindow(selectedDate, 0, 6).map((date) => {
+            const dayEvents = visibleCalendarEvents.filter((event) => eventOccursOnDate(event, date, todayDate));
             if (!dayEvents.length) return null;
-            return <section className="agenda-day-group" key={date}><button className="agenda-day-heading" type="button" onClick={() => selectCalendarDate(date)}><span>{date === todayDate ? "Today" : formatDublinDateKey(date, { weekday: "long" })}</span><strong>{formatDublinDateKey(date, { day: "numeric", month: "long" })}</strong><ChevronRight size={13} /></button>{dayEvents.map((event) => renderScheduleRow(event, true))}</section>;
+            return <section className="agenda-day-group" key={date}><button className="agenda-day-heading" type="button" onClick={() => selectCalendarDate(date)}><span>{date === todayDate ? "Today" : formatDublinDateKey(date, { weekday: "long" })}</span><strong>{formatDublinDateKey(date, { day: "numeric", month: "long" })}</strong><ChevronRight size={13} /></button>{renderDaySchedule(dayEvents, date, true)}</section>;
           })}
-          {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>{calendarMode === "day" ? "No local blocks on this day." : "No local blocks in these seven days."}</span></div> : null}
+          {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>{calendarMode === "day" ? "No events on this day." : "No events in these seven days."}</span></div> : null}
         </div>
-        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEventTask && taskRowById.has(selectedEventTask.id) ? "Task plan" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask && taskRowById.has(selectedEventTask.id) ? <button className="secondary-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={13} /> Edit task plan</button> : <>{selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button> : <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>}</>}</div></div> : null}
+        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEventTask && taskRowById.has(selectedEventTask.id) ? "Task plan" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.source ?? selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask && taskRowById.has(selectedEventTask.id) ? <><button className="page-primary-action" type="button" onClick={() => openTaskJobComposer(selectedEventTask, "Help me plan or update this task.")}><MessageSquare size={13} /> Ask Hermes</button><button className="secondary-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={13} /> Edit task plan</button></> : <>{selectedEventTask ? <button className="secondary-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit block</button> : <button className="page-primary-action" type="button" onClick={() => askHermesAboutEvent(selectedEvent)}><MessageSquare size={13} /> Ask Hermes</button>}</>}</div></div> : null}
       </article>
     </section>;
   }
@@ -2960,6 +3124,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const state = thread.job ? jobStateLabel(thread.job) : thread.item ? inboxStateLabel(thread.item, sendState) : "";
       return <button
         className={`work-thread${selectedWorkThread?.key === thread.key ? " work-thread--selected" : ""}`}
+        data-thread-key={thread.key}
+        ref={(element) => {
+          if (element) workThreadRefs.current.set(thread.key, element);
+          else workThreadRefs.current.delete(thread.key);
+        }}
         type="button"
         aria-pressed={selectedWorkThread?.key === thread.key}
         key={thread.key}
@@ -2989,12 +3158,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
 
     const actionItem = selectedWorkThread?.kind === "inbox" ? selectedWorkItem : null;
-    const problemSend = actionItem ? problemSendInboxIds.has(actionItem.id) : false;
-    const sendState = actionItem
+    const problemSend = selectedWorkItem ? problemSendInboxIds.has(selectedWorkItem.id) : false;
+    const sendState = selectedWorkItem
       ? emailSendUiState(
-          actionItem,
+          selectedWorkItem,
           selectedWorkDraft,
-          latestSendActionByInbox.get(actionItem.id),
+          latestSendActionByInbox.get(selectedWorkItem.id),
           workRows?.capabilities.emailSendEnabled ?? false,
         )
       : "disabled";
@@ -3005,7 +3174,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         : "";
     const itemCanAct = actionItem ? canMutateInboxItem(actionItem) : false;
     const jobBusy = workBusyKey !== null;
-    const itemCanAskHermes = Boolean(actionItem && actionItem.state !== "resolved" && !jobBusy);
+    const itemCanAskHermes = Boolean(actionItem && !selectedWorkJob && itemCanAct);
+    const itemShowsSendAction = Boolean(actionItem?.source.kind === "email" && selectedWorkDraft && sendState !== "disabled");
     const sendButtonLabel = sendState === "sending"
       ? "Sending"
       : sendState === "reconciling"
@@ -3021,8 +3191,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       <header className="workspace-heading"><div><p className="eyebrow">Forward and back</p><h1 id="review-heading">Inbox</h1></div><span className="review-page-count">{reviewCount ? `${reviewCount} ${reviewCount === 1 ? "needs" : "need"} you` : "Clear"}</span></header>
       <article className="pane review-workspace work-inbox">
         {workRowsError ? <p className="task-sync-note task-sync-note--warning"><RefreshCw size={13} /> Inbox rows could not refresh.</p> : null}
-        <div className="review-workbench">
-          <aside className="work-thread-list" aria-label="Inbox threads">
+        <div className={`review-workbench${workDetailOpen ? " review-workbench--detail" : ""}`}>
+          <aside className="work-thread-list" aria-label="Inbox threads" ref={workThreadListRef} tabIndex={-1}>
             {renderAlwaysOpenGroup("Needs you", needsYouThreads)}
             {renderAlwaysOpenGroup("Working", workingThreads)}
             {renderCollapsibleGroup("Likely noise", noiseThreads, noiseOpen, setNoiseOpen)}
@@ -3032,12 +3202,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           </aside>
           {selectedWorkThread ? <section className="work-thread-detail" aria-label={selectedWorkThread.title}>
             <div className="review-queue-nav">
+              <button className="work-inbox-back" type="button" onClick={() => setWorkDetailOpen(false)}><ChevronLeft size={16} /> Inbox</button>
               <span>{selectedWorkIndex >= 0 ? `${selectedWorkIndex + 1} of ${visibleWorkThreads.length}` : detailState}</span>
-              <div><button type="button" onClick={() => moveWorkSelection(-1)} disabled={selectedWorkIndex <= 0} aria-label="Previous thread"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveWorkSelection(1)} disabled={selectedWorkIndex < 0 || selectedWorkIndex >= visibleWorkThreads.length - 1} aria-label="Next thread"><ChevronRight size={14} /></button></div>
+              <div><button type="button" onClick={() => moveWorkSelection(-1)} disabled={selectedWorkIndex <= 0} aria-label="Previous thread"><ChevronLeft size={14} /><b>Previous</b></button><button type="button" onClick={() => moveWorkSelection(1)} disabled={selectedWorkIndex < 0 || selectedWorkIndex >= visibleWorkThreads.length - 1} aria-label="Next thread"><b>Next</b><ChevronRight size={14} /></button></div>
             </div>
             <header className="work-thread-heading">
               <div><span>{selectedWorkThread.source}</span><time dateTime={selectedWorkThread.updatedAt}>{relativeTime(selectedWorkThread.updatedAt)}</time></div>
-              <h2>{selectedWorkThread.title}</h2>
+              <h2 ref={workDetailHeadingRef} tabIndex={-1}>{selectedWorkThread.title}</h2>
               <em className={`work-state work-state--${selectedWorkThread.group}`}>{detailState}</em>
             </header>
             <p className="work-thread-summary">{selectedWorkJob?.instruction ?? selectedWorkItem?.summary}</p>
@@ -3071,20 +3242,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {selectedWorkJob?.state === "needs_you" ? <div className="job-response"><label htmlFor="job-reply">One-line answer</label><div><input id="job-reply" maxLength={280} value={jobReply} onChange={(event) => setJobReply(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); answerSelectedJob(selectedWorkJob); } }} /><button className="page-primary-action" type="button" disabled={jobBusy} onClick={() => answerSelectedJob(selectedWorkJob)}>Answer</button></div></div> : null}
             {selectedWorkJob?.state === "review" ? <div className="job-response"><label htmlFor="job-reply">Send-back note</label><div><input id="job-reply" maxLength={280} value={jobReply} onChange={(event) => setJobReply(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); sendBackSelectedJob(selectedWorkJob); } }} /><button className="secondary-action" type="button" disabled={jobBusy} onClick={() => sendBackSelectedJob(selectedWorkJob)}><CornerUpLeft size={12} /> Send back <kbd>b</kbd></button></div></div> : null}
             <footer className="work-thread-actions">
-              {actionItem?.source.kind === "email" && actionItem.state !== "resolved" ? <>
-                <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} title={sendState === "disabled" ? "Email sending is disabled on the server" : undefined} onClick={() => sendWorkItem(actionItem)}><Send size={12} /> {sendButtonLabel} <kbd>s</kbd></button>
-                <button className="secondary-action" type="button" disabled={!selectedWorkDraft || !itemCanAct} onClick={() => openReplyEditor(actionItem)}><Pencil size={12} /> Edit draft <kbd>d</kbd></button>
-              </> : null}
-              {actionItem && actionItem.state !== "resolved" ? <>
-                <button className="secondary-action" type="button" disabled={!itemCanAskHermes} onClick={() => openJobComposer({ title: actionItem.title, inboxId: actionItem.id })}><MessageSquare size={12} /> Ask Hermes <kbd>h</kbd></button>
-                <button className="secondary-action" type="button" disabled={!itemCanAct || Boolean(actionItem.taskId)} onClick={() => openTaskComposer(undefined, undefined, actionItem)}><ListTodo size={12} /> Make task <kbd>t</kbd></button>
-                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => snoozeWorkItem(actionItem)}><Clock3 size={12} /> Snooze <kbd>z</kbd></button>
-                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "read")}><Check size={12} /> Done <kbd>e</kbd></button>
-                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "dismissed")}><X size={12} /> Not interested <kbd>x</kbd></button>
-                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => decideWorkItem(actionItem, "noise")}><Circle size={12} /> Noise <kbd>n</kbd></button>
+              {actionItem && !selectedWorkJob && actionItem.state !== "resolved" ? <>
+                {itemShowsSendAction ? <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} onClick={() => sendWorkItem(actionItem)}><Send size={12} /> {sendButtonLabel}</button> : null}
+                <button className={itemShowsSendAction ? "secondary-action" : "page-primary-action"} type="button" disabled={!itemCanAskHermes} onClick={() => openJobComposer({ title: actionItem.title, inboxId: actionItem.id })}><MessageSquare size={13} /> Ask Hermes <kbd>h</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => dismissWorkItem(actionItem)}><X size={13} /> Dismiss <kbd>x</kbd></button>
               </> : null}
               {selectedWorkJob?.state === "review" ? <>
-                <button className="page-primary-action" type="button" disabled={jobBusy || linkedJobTaskUnavailable} title={linkedJobTaskUnavailable ? "The linked Google task is not ready" : undefined} onClick={() => settleSelectedJob(selectedWorkJob, "accepted")}><Check size={12} /> {selectedWorkJob.taskId ? "Accept & complete" : "Accept"} <kbd>a</kbd></button>
+                {selectedWorkItem?.source.kind === "email" && selectedWorkDraft && sendState !== "disabled" ? <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} onClick={() => sendWorkItem(selectedWorkItem)}><Send size={12} /> {sendButtonLabel}</button> : null}
+                {selectedWorkItem && !selectedWorkItem.taskId ? <button className="secondary-action" type="button" disabled={jobBusy} onClick={() => openTaskComposer(undefined, undefined, selectedWorkItem)}><ListTodo size={12} /> Review task</button> : null}
+                <button className={selectedWorkJob.taskId ? "page-primary-action" : "secondary-action"} type="button" disabled={jobBusy || linkedJobTaskUnavailable} title={linkedJobTaskUnavailable ? "The linked Google task is not ready" : undefined} onClick={() => settleSelectedJob(selectedWorkJob, "accepted")}><Check size={12} /> {selectedWorkJob.taskId ? "Accept & complete" : "Accept result"} <kbd>a</kbd></button>
                 <button className="danger-button" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "dropped")}><Trash2 size={12} /> Drop</button>
               </> : null}
             </footer>
@@ -3135,6 +3301,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ? data.inboxItems.find((item) => item.id === eventModal.inboxId)
       : null;
   const modalInboxRow = taskModal?.inboxId ? inboxRowById.get(taskModal.inboxId) ?? null : null;
+  const jobPromptPresets = jobComposer?.inboxId
+    ? [
+        ["Edit draft", "Revise the current reply draft. Keep the verified thread and recipients, and leave it ready for my approval."],
+        ["Make task", "Turn this into a concrete task proposal with a clear title, next action, deadline, and realistic duration."],
+        ["Plan time", "Find a realistic time for this around my current calendar and explain any conflict."],
+        ["Prepare to send", "Prepare or improve the reply for my review. Do not send it; leave the exact draft for my approval."],
+      ]
+    : jobComposer?.taskId
+      ? [
+          ["Plan it", "Plan a realistic time for this task around my calendar and note any conflict."],
+          ["Break it down", "Break this task into the smallest useful next steps."],
+          ["Check context", "Check the available context and tell me what is missing or likely to block this task."],
+          ["Reschedule", "Suggest a better day and time for this task based on my current schedule."],
+        ]
+      : [
+          ["Check details", "Check the details and tell me the useful next step."],
+          ["Plan around it", "Help me plan around this using my current tasks and calendar."],
+        ];
   return (
     <div className="control-room">
       <header className="command-bar" aria-hidden={isOverlayOpen}>
@@ -3146,7 +3330,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <button className={activeSection === "today" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "today" ? "page" : undefined} onClick={() => openWorkspaceView("today")}><Clock3 size={14} /><span>Today</span></button>
           <button className={activeSection === "agenda" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "agenda" ? "page" : undefined} onClick={() => openWorkspaceView("agenda")}><CalendarDays size={14} /><span>Calendar</span></button>
           <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "tasks" ? "page" : undefined} onClick={() => openWorkspaceView("tasks")}><ListTodo size={14} /><span>Tasks</span></button>
-          <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => openWorkspaceView("review")}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
+          <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => { setWorkDetailOpen(false); openWorkspaceView("review"); }}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
         </nav>
         <div className="command-actions">
           <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
@@ -3199,7 +3383,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Planned time</span><input type="time" value={hermesTaskDraft.scheduledTime} onChange={(event) => setHermesTaskDraft(current => ({ ...current, scheduledTime: event.target.value }))} /></label>
               <label className="field field--full"><span>Reminder</span><select value={hermesTaskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setHermesTaskDraft(current => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
             </div>
-            <div className="editor-footer"><span>{editingHermesTask.sourceDueOn ? `Google due date: ${formatDublinDateKey(editingHermesTask.sourceDueOn, { day: "numeric", month: "short" })}.` : "Planning and reminders are local to Fox Focus."}</span><div><button className="secondary-action" type="button" onClick={() => setEditingHermesTaskId(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save details</button></div></div>
+            <div className="editor-footer"><span>{editingHermesTask.sourceDueOn ? `Google due date: ${formatDublinDateKey(editingHermesTask.sourceDueOn, { day: "numeric", month: "short" })}.` : "Planning and reminders are local to Fox Focus."}</span><div><button className="secondary-action" type="button" onClick={() => openJobComposer({ title: editingHermesTask.title, context: `Hermes task: ${editingHermesTask.title}` })}><MessageSquare size={13} /> Ask Hermes</button><button className="secondary-action" type="button" onClick={() => setEditingHermesTaskId(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save details</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -3242,25 +3426,27 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Planned time{taskPlannedInstant ? " · exact source" : ""}</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => { setTaskPlannedInstant(null); setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value })); }} /></label>
               {modalCreatingGoogle ? <label className="field field--full"><span>Local reminder · Dublin</span><input type="datetime-local" value={taskReminderLocal} onChange={(event) => { setTaskReminderInstant(null); setTaskReminderLocal(event.target.value); }} /></label> : modalRowOwned ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
             </div> : null}
-            <div className="editor-footer"><span>{modalCreatingGoogle ? selectedTaskDestination ? `${selectedTaskDestination.accountId} · ${selectedTaskDestination.listName}` : "Choose a destination." : modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{initial && modalTask && (modalGoogleOwned || modalPendingGoogle) ? <button className="secondary-action" type="button" disabled={modalPendingGoogle} title={modalPendingGoogle ? "Wait for Google creation confirmation" : undefined} onClick={() => openJobComposer({ title: modalTask.title, taskId: modalTask.id })}><MessageSquare size={13} /> Hand to Hermes</button> : null}{modalCreateAction?.state === "conflict" && taskCreateConflictCandidates(modalCreateAction).length ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setTaskCreateConflictActionId(modalCreateAction.id); }}><RefreshCw size={13} /> Review matches</button> : modalTaskAction?.state === "conflict" || modalCreateAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy || (modalCreatingGoogle && !selectedTaskDestination)}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalCreatingGoogle ? "Create in Google" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
+            <div className="editor-footer"><span>{modalCreatingGoogle ? selectedTaskDestination ? `${selectedTaskDestination.accountId} · ${selectedTaskDestination.listName}` : "Choose a destination." : modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{initial && modalTask && modalTaskRow ? <button className="secondary-action" type="button" disabled={modalPendingGoogle} title={modalPendingGoogle ? "Wait for Google creation confirmation" : undefined} onClick={() => openTaskJobComposer(modalTask)}><MessageSquare size={13} /> Ask Hermes</button> : null}{modalCreateAction?.state === "conflict" && taskCreateConflictCandidates(modalCreateAction).length ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setTaskCreateConflictActionId(modalCreateAction.id); }}><RefreshCw size={13} /> Review matches</button> : modalTaskAction?.state === "conflict" || modalCreateAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy || (modalCreatingGoogle && !selectedTaskDestination)}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalCreatingGoogle ? "Create in Google" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
 
       {jobComposer ? (
-        <DialogFrame title="Hand to Hermes" onClose={() => setJobComposer(null)} className="editor-dialog--job">
+        <DialogFrame title="Ask Hermes" onClose={() => setJobComposer(null)} className="editor-dialog--job">
           <form onSubmit={submitJob}>
             <div className="editor-heading">
               <div className="composer-icon"><MessageSquare size={17} /></div>
-              <div><p className="eyebrow">Hermes job</p><h2>Hand it over</h2></div>
+              <div><p className="eyebrow">Hermes request</p><h2>What should Hermes do?</h2></div>
               <button className="close-composer" type="button" onClick={() => setJobComposer(null)} aria-label="Close job editor"><X size={17} /></button>
             </div>
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
             <div className="editor-grid">
               <label className="field field--full"><span>Title</span><input required value={jobComposer.title} maxLength={200} onChange={(event) => setJobComposer((current) => current ? { ...current, title: event.target.value } : current)} /></label>
-              <label className="field field--full"><span>Instruction</span><textarea autoFocus required maxLength={2000} value={jobInstruction} onChange={(event) => setJobInstruction(event.target.value)} /></label>
+              {jobComposer.context ? <p className="job-composer-context">{jobComposer.context}</p> : null}
+              <div className="job-prompt-presets" role="group" aria-label="Suggested requests">{jobPromptPresets.map(([label, instruction]) => <button className="secondary-action" type="button" key={label} onClick={() => setJobInstruction(instruction)}>{label}</button>)}</div>
+              <label className="field field--full"><span>Request</span><textarea autoFocus required maxLength={2000} value={jobInstruction} onChange={(event) => setJobInstruction(event.target.value)} placeholder="Ask for a draft, a task, a plan, or a check…" /></label>
             </div>
-            <div className="editor-footer"><span>{jobComposer.taskId ? "Linked task" : jobComposer.inboxId ? "Linked Inbox item" : "Unlinked job"}</span><div><button className="secondary-action" type="button" onClick={() => setJobComposer(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === "job:create"}><CornerUpLeft size={14} /> Queue</button></div></div>
+            <div className="editor-footer"><span>{jobComposer.taskId ? "Hermes receives this task's context." : jobComposer.inboxId ? "Hermes receives this Inbox item's context." : "Hermes receives the context shown above."}</span><div><button className="secondary-action" type="button" onClick={() => setJobComposer(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === "job:create"}><CornerUpLeft size={14} /> Send to Hermes</button></div></div>
           </form>
         </DialogFrame>
       ) : null}

@@ -59,6 +59,8 @@ const emptyIntegrations: IntegrationOverview = {
   records: [],
 };
 
+const JOB_LEASE_MILLISECONDS = 10 * 60_000;
+
 function providerFrom(value: string): 'google' | 'microsoft' | null {
   return value === 'google' || value === 'microsoft' ? value : null;
 }
@@ -228,9 +230,14 @@ export function createApp(
   app.post('/api/v1/requests/:id/claim', (c) => {
     const id = c.req.param('id');
     if (!id || id.length > 200) return c.json({ error: 'Invalid request ID' }, 400);
+    const expectedKind = c.req.header('X-Request-Kind');
+    const claimRequestKey = c.req.header('X-Claim-Key');
+    if (claimRequestKey && !/^[A-Za-z0-9_-]{32,100}$/.test(claimRequestKey)) {
+      return c.json({ error: 'Invalid claim key' }, 400);
+    }
     const claimedAt = now().toISOString();
     if (store.getJob(id)) {
-      const result = store.claimJob(id, claimedAt, 120_000);
+      const result = store.claimJob(id, claimedAt, JOB_LEASE_MILLISECONDS, claimRequestKey);
       if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
       if (result.outcome === 'unavailable') {
         return c.json({ error: 'Request is not available to claim', current: result.job }, 409);
@@ -242,6 +249,7 @@ export function createApp(
         leaseUntil: result.job.leaseUntil,
       });
     }
+    if (expectedKind === 'job') return c.json({ error: 'Job not found' }, 404);
     const result = store.claimEmailSendAction(id, claimedAt, 120_000, emailSendEnabled);
     if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
     if (result.outcome === 'disabled') {
@@ -269,7 +277,7 @@ export function createApp(
     let body: unknown;
     try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
     if (isJobResultInput(body)) {
-      const result = store.postJobResult(id, claimId, body, now().toISOString(), 120_000);
+      const result = store.postJobResult(id, claimId, body, now().toISOString(), JOB_LEASE_MILLISECONDS);
       if (result.outcome === 'not_found') return c.json({ error: 'Request not found' }, 404);
       if (result.outcome === 'invalid_claim') {
         return c.json({ error: 'Claim is invalid or expired', current: result.job }, 409);
@@ -459,6 +467,9 @@ export function createApp(
     if (result.outcome === 'missing_inbox') return c.json({ error: 'Linked Inbox item not found' }, 404);
     if (result.outcome === 'idempotency_conflict') {
       return c.json({ error: 'This job key was already used for a different instruction', current: result.job }, 409);
+    }
+    if (result.outcome === 'active_job') {
+      return c.json({ error: 'Hermes already has an active request for this item', current: result.job }, 409);
     }
     return c.json({ job: result.job }, result.outcome === 'created' ? 201 : 200);
   });

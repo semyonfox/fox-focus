@@ -89,12 +89,69 @@ test("jobs that need an answer or review wait on the owner", () => {
   });
 });
 
-test("a job linked to an Inbox item names its source", () => {
+test("a job whose Inbox item is missing remains a standalone Hermes thread", () => {
   const [thread] = buildWorkThreads([], [job("linked", { inboxId: "mail" })].map(entry => entry), new Map(), now);
   assert.equal(thread?.source, "Hermes");
+  assert.equal(thread?.key, "job:linked");
+});
+
+test("the newest active Inbox job governs one stable Inbox thread", () => {
   const threads = buildWorkThreads([item("mail", { source: { kind: "email", accountId: "gmail", messageId: "m", threadId: "t" } })],
-    [job("linked", { inboxId: "mail" })], new Map(), now);
-  assert.equal(threads.find(entry => entry.kind === "job")?.source, "Email · gmail · Hermes");
+    [
+      job("older", { inboxId: "mail", state: "needs_you", updatedAt: "2026-09-14T10:15:00.000Z" }),
+      job("newer", { inboxId: "mail", title: "Hermes is handling mail", state: "working", updatedAt: "2026-09-14T10:30:00.000Z" }),
+      job("settled", { inboxId: "mail", state: "settled", outcome: "accepted", updatedAt: "2026-09-14T10:45:00.000Z" }),
+    ], new Map(), now);
+
+  assert.deepEqual(threads.map(thread => thread.key).sort(), ["inbox:mail", "job:older"]);
+  const governed = threads.find(thread => thread.key === "inbox:mail");
+  assert.equal(governed?.kind, "job");
+  assert.equal(governed?.item?.id, "mail");
+  assert.equal(governed?.job?.id, "newer");
+  assert.equal(governed?.title, "Hermes is handling mail");
+  assert.equal(governed?.source, "Email · gmail · Hermes");
+  assert.equal(governed?.updatedAt, "2026-09-14T10:30:00.000Z");
+  assert.equal(governed?.group, "working");
+});
+
+test("a send problem stays in Needs you while Hermes work is active", () => {
+  const [thread] = buildWorkThreads(
+    [item("mail")],
+    [job("active", { inboxId: "mail", state: "working" })],
+    latestSendActions([sendAction("mail", "unknown")]),
+    now,
+  );
+
+  assert.equal(thread?.key, "inbox:mail");
+  assert.equal(thread?.job?.id, "active");
+  assert.equal(thread?.group, "needs_you");
+});
+
+test("settled Inbox jobs stay in history without duplicating the Inbox thread", () => {
+  const threads = buildWorkThreads(
+    [item("mail")],
+    [job("settled", { inboxId: "mail", state: "settled", outcome: "accepted" })],
+    new Map(),
+    now,
+  );
+
+  assert.equal(threads.length, 1);
+  assert.equal(threads[0]?.key, "inbox:mail");
+  assert.equal(threads[0]?.kind, "inbox");
+  assert.equal(threads[0]?.job, null);
+});
+
+test("task-linked jobs remain separate even when they also reference an Inbox item", () => {
+  const threads = buildWorkThreads(
+    [item("mail")],
+    [job("task-job", { inboxId: "mail", taskId: "task-1", state: "working" })],
+    new Map(),
+    now,
+  );
+
+  assert.deepEqual(threads.map(thread => thread.key).sort(), ["inbox:mail", "job:task-job"]);
+  assert.equal(threads.find(thread => thread.key === "inbox:mail")?.job, null);
+  assert.equal(threads.find(thread => thread.key === "job:task-job")?.job?.id, "task-job");
 });
 
 test("the newest send action wins and drives the label", () => {
