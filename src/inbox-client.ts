@@ -1,3 +1,4 @@
+import { apiFetch } from "./api-transport.ts";
 import { dublinDateKey, dublinDateTimeToInstant, dublinTimeValue, isDateKey } from "./calendar-time.ts";
 import { areas, isOneOf, isRecord, priorities, type Area } from "./model.ts";
 import {
@@ -294,9 +295,14 @@ export function emailSendBlocksInboxMutation(action: ActionRow | undefined): boo
 }
 
 export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapshot> {
-  const response = await fetch("/api/v1/rows", { cache: "no-store", signal });
+  const response = await apiFetch("/api/v1/rows", { cache: "no-store", signal });
   const value: unknown = await response.json();
-  if (!response.ok || !isRecord(value) || !Array.isArray(value.inbox) || !value.inbox.every(isInboxItemRow) ||
+  if (!response.ok) throw new Error("Could not load Inbox rows");
+  return parseWorkRows(value);
+}
+
+export function parseWorkRows(value: unknown): WorkRowsSnapshot {
+  if (!isRecord(value) || !Array.isArray(value.inbox) || !value.inbox.every(isInboxItemRow) ||
     !Array.isArray(value.drafts) || !value.drafts.every(isDraftRevision) || !Array.isArray(value.actions) ||
     !value.actions.every(isActionRow) || !Array.isArray(value.jobs) || !value.jobs.every(isJob) ||
     !Array.isArray(value.jobUpdates) || !value.jobUpdates.every(isJobUpdate) ||
@@ -318,7 +324,7 @@ export async function loadWorkRows(signal?: AbortSignal): Promise<WorkRowsSnapsh
 }
 
 async function request(path: string, method: "POST" | "PUT", body: unknown): Promise<unknown> {
-  const response = await fetch(path, {
+  const response = await apiFetch(path, {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -335,7 +341,7 @@ export async function loadTaskDestinations(signal?: AbortSignal): Promise<{
   destinations: TaskDestination[];
   fallback: TaskDestination | null;
 }> {
-  const response = await fetch("/api/v1/task-destinations", { cache: "no-store", signal });
+  const response = await apiFetch("/api/v1/task-destinations", { cache: "no-store", signal });
   const value: unknown = await response.json();
   if (!response.ok || !isRecord(value) || !Array.isArray(value.destinations) ||
     !value.destinations.every(isTaskDestination) || !(value.fallback === null || isTaskDestination(value.fallback))) {

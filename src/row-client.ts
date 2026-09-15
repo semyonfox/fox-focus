@@ -1,3 +1,4 @@
+import { apiFetch } from "./api-transport.ts";
 import { isDateKey } from "./calendar-time.ts";
 import { isOneOf, isRecord, priorities } from "./model.ts";
 import { isNullableUtcInstant, isUtcInstant, type ActionRow, type TaskPlanRow, type TaskRow, type TaskStatusPayload } from "./row-model.ts";
@@ -125,10 +126,8 @@ export function mergeTaskRows(current: TaskRowsSnapshot | null, incoming: TaskRo
   };
 }
 
-export async function loadTaskRows(signal?: AbortSignal): Promise<TaskRowsSnapshot> {
-  const response = await fetch("/api/v1/rows", { cache: "no-store", signal });
-  const value: unknown = await response.json();
-  if (!response.ok || !isRecord(value) || !Array.isArray(value.tasks) || !value.tasks.every(isTaskRow) ||
+export function parseTaskRows(value: unknown): TaskRowsSnapshot {
+  if (!isRecord(value) || !Array.isArray(value.tasks) || !value.tasks.every(isTaskRow) ||
     !Array.isArray(value.taskPlans) || !value.taskPlans.every(isTaskPlanRow) || !Array.isArray(value.actions)) {
     throw new Error("Could not load task rows");
   }
@@ -137,4 +136,33 @@ export async function loadTaskRows(signal?: AbortSignal): Promise<TaskRowsSnapsh
     taskPlans: value.taskPlans,
     actions: value.actions.filter(isTaskStatusActionRow),
   };
+}
+
+export type TaskPlanInput = Pick<TaskPlanRow, "priority" | "waiting" | "deadlineOn" | "plannedOn" | "plannedAt" | "estimateMinutes"> & {
+  version: number;
+};
+
+export type RowResponse = { ok: boolean; status: number; value: unknown };
+
+async function sendRow(path: string, method: "POST" | "PUT", body: unknown): Promise<RowResponse> {
+  const response = await apiFetch(path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  let value: unknown = null;
+  try { value = await response.json(); } catch { /* the status still identifies the failed request */ }
+  return { ok: response.ok, status: response.status, value };
+}
+
+// the caller merges value.task or value.current either way, so the response is returned rather than thrown
+export function requestTaskStatus(taskId: string, version: number, state: "open" | "completed"): Promise<RowResponse> {
+  return sendRow(`/api/v1/tasks/${encodeURIComponent(taskId)}/status`, "POST", { version, state });
+}
+
+export function requestTaskPlan(taskId: string, plan: TaskPlanInput): Promise<RowResponse> {
+  return sendRow(`/api/v1/tasks/${encodeURIComponent(taskId)}/plan`, "PUT", plan);
+}
+
+export async function loadTaskRows(signal?: AbortSignal): Promise<TaskRowsSnapshot> {
+  const response = await apiFetch("/api/v1/rows", { cache: "no-store", signal });
+  const value: unknown = await response.json();
+  if (!response.ok) throw new Error("Could not load task rows");
+  return parseTaskRows(value);
 }

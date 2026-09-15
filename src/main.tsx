@@ -75,11 +75,22 @@ import {
   isTaskStatusActionRow,
   loadTaskRows,
   mergeTaskRows,
+  requestTaskPlan,
+  requestTaskStatus,
   taskConflictFromAction,
   type TaskRowsSnapshot,
   type TaskStatusActionRow,
 } from "./row-client.ts";
 import type { ActionRow, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow } from "./row-model.ts";
+import {
+  buildWorkThreads,
+  inboxSourceLabel,
+  inboxStateLabel,
+  jobStateLabel,
+  latestSendActions,
+  relativeTime,
+  type WorkThread,
+} from "./work-threads.ts";
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
@@ -469,61 +480,6 @@ type DisplayReminder = {
   source: "workspace" | "row" | "hermes";
 };
 type ReviewUndo = { itemId: string; status: InboxStatus };
-type WorkThread = {
-  key: string;
-  kind: "inbox" | "job";
-  title: string;
-  source: string;
-  updatedAt: string;
-  group: "needs_you" | "working" | "settled" | "noise";
-  item: InboxItemRow | null;
-  job: Job | null;
-};
-
-function inboxSourceLabel(item: InboxItemRow): string {
-  if (item.source.kind === "email") return `Email · ${item.source.accountId}`;
-  if (item.source.kind === "hermes") return "Hermes";
-  return "Capture";
-}
-
-function relativeTime(value: string): string {
-  const difference = Date.now() - Date.parse(value);
-  if (!Number.isFinite(difference)) return "";
-  const future = difference < 0;
-  const minutes = Math.max(0, Math.round(Math.abs(difference) / 60_000));
-  const label = minutes < 1
-    ? "now"
-    : minutes < 60
-      ? `${minutes}m`
-      : minutes < 24 * 60
-        ? `${Math.round(minutes / 60)}h`
-        : `${Math.round(minutes / (24 * 60))}d`;
-  return future && label !== "now" ? `in ${label}` : label;
-}
-
-function jobStateLabel(job: Job): string {
-  if (job.state === "needs_you") return "Needs you";
-  if (job.state === "review") return "Review";
-  if (job.state === "working") return "Working";
-  if (job.state === "queued") return "Queued";
-  return job.outcome === "accepted" ? "Accepted" : "Dropped";
-}
-
-function inboxStateLabel(item: InboxItemRow, sendState: ReturnType<typeof emailSendUiState>): string {
-  if (sendState === "sending") return "Sending";
-  if (sendState === "reconciling") return "Reconciling";
-  if (sendState === "unknown") return "Needs reconciliation";
-  if (sendState === "failed") return "Send failed";
-  if (item.state === "waiting") return item.snoozedUntil && Date.parse(item.snoozedUntil) <= Date.now() ? "Ready" : "Snoozed";
-  if (item.state === "resolved") {
-    if (item.outcome === "task") return "Task made";
-    if (item.outcome === "noise") return "Noise";
-    if (item.outcome === "dismissed") return "Not interested";
-    if (item.outcome === "sent") return "Sent";
-    return "Done";
-  }
-  return item.currentDraftId ? "Draft ready" : "New";
-}
 
 function destinationKey(destination: Pick<TaskDestination, "accountId" | "listId">): string {
   return `${destination.accountId}\u0000${destination.listId}`;
@@ -1261,66 +1217,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
     return drafts;
   }, [workRows?.drafts, workRows?.inbox]);
-  const latestSendActionByInbox = useMemo(() => {
-    const actions = new Map<string, ActionRow>();
-    for (const action of workRows?.actions ?? []) {
-      if (action.payload.kind !== "email-send") continue;
-      const current = actions.get(action.payload.inboxId);
-      if (!current || action.createdAt > current.createdAt ||
-        (action.createdAt === current.createdAt && action.version >= current.version)) actions.set(action.payload.inboxId, action);
-    }
-    return actions;
-  }, [workRows?.actions]);
-  const pendingSendInboxIds = useMemo(() => new Set([...latestSendActionByInbox]
-    .flatMap(([inboxId, action]) => action.state === "queued" || action.state === "running" ? [inboxId] : [])), [latestSendActionByInbox]);
+  const latestSendActionByInbox = useMemo(() => latestSendActions(workRows?.actions ?? []), [workRows?.actions]);
   const problemSendInboxIds = useMemo(() => new Set([...latestSendActionByInbox]
     .flatMap(([inboxId, action]) => action.state === "failed" || action.state === "conflict" || action.state === "unknown" ? [inboxId] : [])), [latestSendActionByInbox]);
-  const workThreads = useMemo<WorkThread[]>(() => {
-    const inboxThreads = (workRows?.inbox ?? []).map<WorkThread>((item) => {
-      const stillSnoozed = item.state === "waiting" &&
-        (item.snoozedUntil === null || Date.parse(item.snoozedUntil) > Date.now());
-      const sendAction = latestSendActionByInbox.get(item.id);
-      return {
-        key: `inbox:${item.id}`,
-        kind: "inbox",
-        title: item.title,
-        source: inboxSourceLabel(item),
-        updatedAt: sendAction && sendAction.updatedAt > item.updatedAt ? sendAction.updatedAt : item.updatedAt,
-        group: pendingSendInboxIds.has(item.id)
-          ? "working"
-          : problemSendInboxIds.has(item.id)
-            ? "needs_you"
-            : item.likelyNoise
-              ? "noise"
-              : item.state === "resolved"
-                ? "settled"
-                : stillSnoozed
-                  ? "working"
-                  : "needs_you",
-        item,
-        job: null,
-      };
-    });
-    const jobThreads = (workRows?.jobs ?? []).map<WorkThread>((job) => {
-      const item = job.inboxId ? inboxRowById.get(job.inboxId) ?? null : null;
-      return {
-        key: `job:${job.id}`,
-        kind: "job",
-        title: job.title,
-        source: item ? `${inboxSourceLabel(item)} · Hermes` : "Hermes",
-        updatedAt: job.updatedAt,
-        group: job.state === "settled"
-          ? "settled"
-          : job.state === "queued" || job.state === "working"
-            ? "working"
-            : "needs_you",
-        item,
-        job,
-      };
-    });
-    return [...inboxThreads, ...jobThreads]
-      .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt) || first.key.localeCompare(second.key));
-  }, [inboxRowById, latestSendActionByInbox, pendingSendInboxIds, problemSendInboxIds, workRows?.inbox, workRows?.jobs]);
+  const workThreads = useMemo(
+    () => buildWorkThreads(workRows?.inbox ?? [], workRows?.jobs ?? [], latestSendActionByInbox),
+    [latestSendActionByInbox, workRows?.inbox, workRows?.jobs],
+  );
   const needsYouThreads = workThreads.filter((thread) => thread.group === "needs_you");
   const workingThreads = workThreads.filter((thread) => thread.group === "working");
   const settledThreads = workThreads.filter((thread) => thread.group === "settled");
@@ -1836,12 +1739,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setBusyTaskIds((current) => new Set(current).add(task.id));
     setStatusMessage("");
     try {
-      const response = await fetch(`/api/v1/tasks/${encodeURIComponent(task.id)}/status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ version: row.version, state: desiredState }),
-      });
-      const value: unknown = await response.json();
+      const { ok, value } = await requestTaskStatus(task.id, row.version, desiredState);
       const nextTask = isRecord(value) && isRowTask(value.task)
         ? value.task
         : isRecord(value) && isRowTask(value.current)
@@ -1853,7 +1751,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         taskPlans: [],
         actions: action ? [action] : [],
       }) : current);
-      if (!response.ok || !action) {
+      if (!ok || !action) {
         throw new Error(isRecord(value) && typeof value.error === "string"
           ? value.error
           : "Could not record the Google task change.");
@@ -2039,20 +1937,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setTaskPlanBusy(true);
       setModalError("");
       try {
-        const response = await fetch(`/api/v1/tasks/${encodeURIComponent(row.id)}/plan`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            version: taskPlanVersion,
-            priority: taskDraft.priority,
-            waiting: taskDraft.state === "waiting",
-            deadlineOn: taskDraft.deadlineDate || null,
-            plannedOn: taskDraft.scheduledDate && !plannedStartAt ? taskDraft.scheduledDate : null,
-            plannedAt: plannedStartAt,
-            estimateMinutes,
-          }),
+        const { ok, value } = await requestTaskPlan(row.id, {
+          version: taskPlanVersion,
+          priority: taskDraft.priority,
+          waiting: taskDraft.state === "waiting",
+          deadlineOn: taskDraft.deadlineDate || null,
+          plannedOn: taskDraft.scheduledDate && !plannedStartAt ? taskDraft.scheduledDate : null,
+          plannedAt: plannedStartAt,
+          estimateMinutes,
         });
-        const value: unknown = await response.json();
         const nextPlan = isRecord(value) && isTaskPlanRow(value.plan)
           ? value.plan
           : isRecord(value) && isTaskPlanRow(value.current)
@@ -2063,7 +1956,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           taskPlans: [nextPlan],
           actions: [],
         }) : current);
-        if (!response.ok || !nextPlan) {
+        if (!ok || !nextPlan) {
           throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Could not save the task plan.");
         }
         setStatusMessage(`Saved the plan for "${displayTask.title}".`);
