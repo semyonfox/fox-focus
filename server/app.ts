@@ -893,7 +893,9 @@ export function createApp(
   app.notFound((c) => c.json({ error: 'Not found' }, 404));
   app.onError((error, c) => {
     if (error instanceof HTTPException) return error.getResponse();
-    console.error('Request failed:', error.name);
+    // Preserve the server-side stack for bounded operational diagnosis without
+    // exposing source data or internal details to the browser response.
+    console.error('Request failed:', error);
     return c.json({ error: 'Request failed' }, 500);
   });
   return app;
