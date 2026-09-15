@@ -187,6 +187,9 @@ export type TaskMigrationPreviewItem = {
   status: TaskStatus;
   localTaskId: string;
   operation: "bind" | "create";
+  /** A completed legacy source is created open, then completed by a separate
+   * durable, approval-recorded Google status action after create readback. */
+  completeAfterCreate?: boolean;
   destination: TaskMigrationDestination;
   existingExternalId: string | null;
   targetSnapshot: {
@@ -245,6 +248,7 @@ export type MigrationPayload = {
   sourceKey: string;
   sourceSnapshot: Record<string, unknown>;
   operation: "bind" | "create";
+  completeAfterCreate?: boolean;
   taskId: string;
   source: TaskMigrationSource;
   sourceAliases: TaskMigrationSource[];

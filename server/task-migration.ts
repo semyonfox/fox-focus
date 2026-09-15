@@ -71,28 +71,42 @@ function utcInstant(value: string | null): string | null | undefined {
   return Number.isNaN(milliseconds) ? undefined : new Date(milliseconds).toISOString();
 }
 
-function planForHermes(task: HermesTask): TaskMigrationPlan {
-  const due = task.due.trim();
+function hermesDueOn(value: string, year: number): string | null {
+  const due = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(due)) return due;
+  const match = due.match(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/i);
+  if (!match) return null;
+  const months: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+  const month = months[match[2].toLowerCase()];
+  const day = Number(match[1]);
+  const date = new Date(Date.UTC(year, month, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month && date.getUTCDate() === day
+    ? date.toISOString().slice(0, 10)
+    : null;
+}
+
+function planForHermes(task: HermesTask, year: number): TaskMigrationPlan {
+  const dueOn = hermesDueOn(task.due, year);
   return {
     priority: hermesPriority(task.priority),
     waiting: task.localState === 'waiting',
-    deadlineOn: isDateKey(due) ? due : null,
+    deadlineOn: dueOn,
     plannedOn: null,
     plannedAt: utcInstant(task.scheduledAt) ?? null,
     estimateMinutes: durationMinutes(task.duration),
   };
 }
 
-function hermesDueConflict(task: HermesTask): string | null {
+function hermesDueConflict(task: HermesTask, year: number): string | null {
   const due = task.due.trim();
   const lowered = due.toLowerCase();
-  if (!due || lowered === 'no deadline' || isDateKey(due)) return null;
+  if (!due || lowered === 'no deadline' || hermesDueOn(due, year)) return null;
   if (lowered === 'waiting' && task.localState === 'waiting') return null;
   return `Hermes task ${task.id} has a due label without an exact migration date.`;
 }
 
-function hermesPlanningConflict(task: HermesTask): string | null {
-  const due = hermesDueConflict(task);
+function hermesPlanningConflict(task: HermesTask, year: number): string | null {
+  const due = hermesDueConflict(task, year);
   if (due) return due;
   const duration = task.duration.trim();
   if (duration && duration.toLowerCase() !== 'no estimate' && durationMinutes(duration) === null) {
@@ -227,7 +241,7 @@ function approvalText(item: Omit<TaskMigrationPreviewItem, 'approvalText'>): str
     `Source title: ${item.title}`,
     `Source status: ${item.status}`,
     `Google title: ${item.outgoing?.title ?? ''}`,
-    `Google status: open`,
+    `Google status: ${item.completeAfterCreate ? 'completed after verified creation' : 'open'}`,
     `Google notes: ${item.outgoing?.notes ?? ''}`,
     `Google due: ${item.outgoing?.doOn ?? 'none'}`,
     `Keep local planning on Fox Focus task ${item.localTaskId}.`,
@@ -263,6 +277,7 @@ export function buildTaskMigrationPreview(
   feed: HermesFeed,
   generatedAt = new Date().toISOString(),
 ): TaskMigrationPreview {
+  const generatedYear = new Date(generatedAt).getUTCFullYear();
   const items: TaskMigrationPreviewItem[] = [];
   const blockers: TaskMigrationBlocker[] = [];
   const accountId = catalogue.accountId;
@@ -524,12 +539,12 @@ export function buildTaskMigrationPreview(
     let desiredPlan = plan;
     let reminder: TaskMigrationPreviewItem['reminder'] = null;
     if (relatedHermes?.annotationUpdatedAt) {
-      const planningConflict = hermesPlanningConflict(relatedHermes);
+      const planningConflict = hermesPlanningConflict(relatedHermes, generatedYear);
       if (planningConflict) {
         blockers.push(sourceBlocker(sourceKey, 'planning_conflict', planningConflict));
         continue;
       }
-      const annotatedPlan = planForHermes(relatedHermes);
+      const annotatedPlan = planForHermes(relatedHermes, generatedYear);
       if (!samePlan(plan, annotatedPlan) && !defaultPlan(plan)) {
         blockers.push(sourceBlocker(sourceKey, 'planning_conflict', `Fox Focus and Hermes have different local planning for task ${row.id}.`));
         continue;
@@ -611,10 +626,6 @@ export function buildTaskMigrationPreview(
       items.push(item);
       continue;
     }
-    if (row.observed.status === 'completed') {
-      blockers.push(sourceBlocker(sourceKey, 'completed_create', `Completed Fox Focus task ${row.id} needs an explicit completion migration path.`));
-      continue;
-    }
     const destination = accountId ? destinationForArea(catalogue, sourceTask.area) : null;
     if (!destination) {
       blockers.push(sourceBlocker(sourceKey, 'destination_missing', `No unambiguous Google list is mapped for ${sourceTask.area}.`));
@@ -637,6 +648,7 @@ export function buildTaskMigrationPreview(
       status: row.observed.status,
       localTaskId: row.id,
       operation: 'create',
+      completeAfterCreate: row.observed.status === 'completed',
       destination: { accountId: destination.accountId, listId: destination.listId, listName: destination.name },
       existingExternalId: null,
       targetSnapshot: null,
@@ -655,13 +667,15 @@ export function buildTaskMigrationPreview(
       if (existingMigrationSources.has(`hermes:${board.slug}:${task.id}`)) continue;
       if (claimedHermesIds.has(task.id)) continue;
       const sourceKey = `hermes:${board.slug}:${task.id}`;
-      const sourceStatus = task.status === 'done' ? 'completed' as const : 'open' as const;
-      const planningConflict = hermesPlanningConflict(task);
+      const sourceStatus = task.status === 'done' || task.sourceStatus === 'completed'
+        ? 'completed' as const
+        : 'open' as const;
+      const planningConflict = hermesPlanningConflict(task, generatedYear);
       if (planningConflict) {
         blockers.push(sourceBlocker(sourceKey, 'planning_conflict', planningConflict));
         continue;
       }
-      const plan = planForHermes(task);
+      const plan = planForHermes(task, generatedYear);
       const reminder = reminderForHermes(task);
       if (task.reminderMode !== 'none' && !reminder) {
         blockers.push(sourceBlocker(sourceKey, 'planning_conflict', `Hermes task ${task.id} has a reminder without an exact fire time.`));
@@ -733,10 +747,6 @@ export function buildTaskMigrationPreview(
         blockers.push(sourceBlocker(sourceKey, 'source_missing', `Hermes task ${task.id} has incomplete Google provenance.`));
         continue;
       }
-      if (sourceStatus === 'completed') {
-        blockers.push(sourceBlocker(sourceKey, 'completed_create', `Completed Hermes task ${task.id} needs an explicit completion migration path.`));
-        continue;
-      }
       if (task.parentTitle) {
         blockers.push(sourceBlocker(sourceKey, 'ambiguous_source', `Hermes task ${task.id} has a parent title but no stable parent ID.`));
         continue;
@@ -764,6 +774,7 @@ export function buildTaskMigrationPreview(
         status: sourceStatus,
         localTaskId,
         operation: 'create',
+        completeAfterCreate: sourceStatus === 'completed',
         destination: { accountId: destination.accountId, listId: destination.listId, listName: destination.name },
         existingExternalId: null,
         targetSnapshot: null,

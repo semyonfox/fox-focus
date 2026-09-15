@@ -2039,7 +2039,14 @@ export function createRowStore(db: DatabaseSync) {
       details: { actionId: action.id, externalId, via, destinationUnavailable }, at: now,
     });
 
-    const conflict = forceConflict ?? (destinationUnavailable
+    let completionError: string | null = null;
+    if (action.payload.kind === 'task-migration' && action.payload.completeAfterCreate) {
+      const queued = queueTaskStatusActionInTransaction(task.id, bound.version, 'completed', now);
+      if (queued.outcome !== 'queued') {
+        completionError = 'The created Google task could not be queued for its approved completion transition.';
+      }
+    }
+    const conflict = forceConflict ?? completionError ?? (destinationUnavailable
       ? 'The destination list disappeared while Google task creation was being confirmed.'
       : null);
     const migrationMapping = action.payload.kind === 'task-migration' ? {
@@ -3035,6 +3042,7 @@ export function createRowStore(db: DatabaseSync) {
           sourceKey: item.sourceKey,
           sourceSnapshot: item.sourceSnapshot,
           operation: item.operation,
+          completeAfterCreate: item.operation === 'create' && item.completeAfterCreate === true,
           taskId: item.localTaskId,
           source: item.source,
           sourceAliases: item.sourceAliases,
