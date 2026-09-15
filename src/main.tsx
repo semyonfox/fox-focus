@@ -740,6 +740,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [selectedWorkKey, setSelectedWorkKey] = useState<string | null>(null);
   const [workDetailOpen, setWorkDetailOpen] = useState(false);
   const workDetailHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const workThreadListRef = useRef<HTMLElement | null>(null);
   const workThreadRefs = useRef(new Map<string, HTMLButtonElement>());
   const workDetailWasOpen = useRef(false);
   const [settledOpen, setSettledOpen] = useState(false);
@@ -987,10 +988,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (workDetailOpen) {
         workDetailHeadingRef.current?.focus({ preventScroll: true });
         workDetailHeadingRef.current?.scrollIntoView({ block: "start" });
-      } else if (wasOpen && selectedWorkKey) {
-        const selected = workThreadRefs.current.get(selectedWorkKey);
-        selected?.focus({ preventScroll: true });
-        selected?.scrollIntoView({ block: "nearest" });
+      } else if (wasOpen) {
+        const selected = selectedWorkKey ? workThreadRefs.current.get(selectedWorkKey) : null;
+        const target = selected ?? workThreadListRef.current;
+        target?.focus({ preventScroll: true });
+        target?.scrollIntoView({ block: "nearest" });
       }
     });
     return () => window.cancelAnimationFrame(frame);
@@ -2401,6 +2403,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setSelectedWorkKey(next.key);
       return true;
     }
+    setSelectedWorkKey(null);
     setWorkDetailOpen(false);
     return false;
   }
@@ -2589,7 +2592,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setStatusMessage("The linked Google task is not ready for completion.");
       return;
     }
-    const threadKey = job.inboxId && !job.taskId ? `inbox:${job.inboxId}` : `job:${job.id}`;
+    const threadKey = selectedWorkThread?.job?.id === job.id
+      ? selectedWorkThread.key
+      : job.inboxId && !job.taskId && inboxRowById.has(job.inboxId)
+        ? `inbox:${job.inboxId}`
+        : `job:${job.id}`;
     void runWorkMutation(threadKey, () => settleJob(job, outcome, outcome === "accepted" ? task?.version : undefined),
       outcome === "accepted" ? "Accepted the result." : "Dropped the job.").then((settled) => {
       if (settled) chooseNextWorkThread(threadKey);
@@ -3185,7 +3192,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       <article className="pane review-workspace work-inbox">
         {workRowsError ? <p className="task-sync-note task-sync-note--warning"><RefreshCw size={13} /> Inbox rows could not refresh.</p> : null}
         <div className={`review-workbench${workDetailOpen ? " review-workbench--detail" : ""}`}>
-          <aside className="work-thread-list" aria-label="Inbox threads">
+          <aside className="work-thread-list" aria-label="Inbox threads" ref={workThreadListRef} tabIndex={-1}>
             {renderAlwaysOpenGroup("Needs you", needsYouThreads)}
             {renderAlwaysOpenGroup("Working", workingThreads)}
             {renderCollapsibleGroup("Likely noise", noiseThreads, noiseOpen, setNoiseOpen)}
