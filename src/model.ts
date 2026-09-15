@@ -383,8 +383,9 @@ export function isPrototypeData(value: unknown): value is PrototypeData {
     value.inboxItems.every(isInboxItem) &&
     Array.isArray(value.reminders) &&
     value.reminders.every(isReminder) &&
+    [value.tasks, value.events, value.reminders].every(items => items.length <= 500) &&
     [value.tasks, value.events, value.inboxItems, value.reminders].every(items =>
-      items.length <= 500 && new Set(items.map(item => item.id)).size === items.length &&
+      new Set(items.map(item => item.id)).size === items.length &&
       items.every(item => item.id.length > 0 && item.id.length <= 200 && item.title.trim().length > 0 && item.title.length <= 500))
   );
   if (!collectionsAreValid) return false;

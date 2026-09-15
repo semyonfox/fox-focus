@@ -1,4 +1,5 @@
-import type { PrototypeData, Reminder } from '../src/model.ts';
+import type { Reminder } from '../src/model.ts';
+import type { ReminderRow } from '../src/row-model.ts';
 
 export type StoredPushSubscription = {
   endpoint: string;
@@ -18,10 +19,44 @@ export type PushDeliverySummary = {
   removed: number;
 };
 
+export type PushReminder = Pick<Reminder, 'id' | 'title' | 'when' | 'state' | 'fireAt'>;
+
 export const PUSH_DELIVERY_GRACE_MS = 24 * 60 * 60_000;
+const pushReminderTimeFormatter = new Intl.DateTimeFormat('en-IE', {
+  day: 'numeric',
+  month: 'short',
+  hour: '2-digit',
+  minute: '2-digit',
+  timeZone: 'Europe/Dublin',
+});
+
+export function formatPushReminderTime(fireAt: string): string {
+  return pushReminderTimeFormatter.format(new Date(fireAt));
+}
+
+export function mergeReminderSources(...sources: readonly (readonly PushReminder[])[]): PushReminder[] {
+  const reminders = new Map<string, PushReminder>();
+  for (const source of sources) {
+    for (const reminder of source) {
+      if (!reminders.has(reminder.id)) reminders.set(reminder.id, reminder);
+    }
+  }
+  return [...reminders.values()];
+}
+
+export function projectRowReminder(row: ReminderRow, title: string, when: string): PushReminder | null {
+  if (row.state !== 'scheduled') return null;
+  return {
+    id: row.id,
+    title,
+    when,
+    state: 'scheduled',
+    fireAt: row.fireAt,
+  };
+}
 
 // a snoozed reminder gets a new fireAt, so the key changes and it can be delivered again
-export function deliveryKey(reminder: Reminder): string {
+export function deliveryKey(reminder: PushReminder): string {
   return `${reminder.id}@${reminder.fireAt ?? ''}`;
 }
 
@@ -29,7 +64,7 @@ export function subscriptionDeliveryKey(delivery: StoredPushDelivery): string {
   return `${delivery.endpoint.length}:${delivery.endpoint}${delivery.deliveryKey}`;
 }
 
-export function dueReminders(data: PrototypeData, now: Date): Reminder[] {
+export function dueReminders(data: { reminders: readonly PushReminder[] }, now: Date): PushReminder[] {
   const latestFireAt = now.getTime();
   const earliestFireAt = latestFireAt - PUSH_DELIVERY_GRACE_MS;
   return data.reminders.filter(reminder => {
@@ -40,7 +75,7 @@ export function dueReminders(data: PrototypeData, now: Date): Reminder[] {
 }
 
 type DeliverPushOptions = {
-  data: PrototypeData;
+  data: { reminders: readonly PushReminder[] };
   now: Date;
   subscriptions: StoredPushSubscription[];
   delivered: ReadonlySet<string>;

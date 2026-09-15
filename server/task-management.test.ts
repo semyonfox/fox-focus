@@ -55,7 +55,7 @@ test('adopts an imported task once and keeps it after the provider snapshot disa
     const record = store.listProviderRecords()[0];
     const preview = previewProviderTaskAdoption(store, record.id, now);
     assert.equal(preview.before.ownership, 'google');
-    assert.equal(preview.task.deadlineDate, '2026-09-14');
+    assert.equal(preview.task.deadlineDate, undefined);
     assert.equal(preview.task.due, 'Tomorrow');
     assert.equal(preview.task.externalLinks?.[0].policy, 'completion_only');
 
@@ -215,7 +215,7 @@ test('an older-generation source link requires explicit selection of its existin
   }
 });
 
-test('completion preview records exact states and a failed upstream action keeps the local task done', () => {
+test('completion preview records exact states and an old failure cannot replace a newer status intent', () => {
   const store = openStore(':memory:');
   try {
     connectGoogle(store);
@@ -247,6 +247,24 @@ test('completion preview records exact states and a failed upstream action keeps
     store.finishTaskAction(action.id, 'failed', { retryable: true }, 'Network unavailable', '2026-09-13T10:03:00.000Z');
     assert.equal(store.read().data.tasks[0].completed, true);
     assert.equal(store.getTaskAction(action.id)?.status, 'failed');
+    const reopen = previewTaskAction(store, adopted.adoptedTaskId, 'open', 'newer-reopen-1', new Date('2026-09-13T10:04:00.000Z'));
+    assert.equal(store.beginTaskAction(reopen.id, '2026-09-13T10:04:01.000Z')?.outcome, 'started');
+    store.finishTaskAction(reopen.id, 'succeeded', { retryable: false }, null, '2026-09-13T10:04:02.000Z');
+    const completeAgain = previewTaskAction(
+      store,
+      adopted.adoptedTaskId,
+      'completed',
+      'newer-complete-1',
+      new Date('2026-09-13T10:05:00.000Z'),
+    );
+    assert.equal(store.beginTaskAction(completeAgain.id, '2026-09-13T10:05:01.000Z')?.outcome, 'started');
+    store.finishTaskAction(completeAgain.id, 'succeeded', { retryable: false }, null, '2026-09-13T10:05:02.000Z');
+    assert.equal(store.read().data.tasks[0].completed, true, 'the final state deliberately matches the old failed action');
+
+    const retried = store.beginTaskAction(action.id, '2026-09-13T10:06:00.000Z', true);
+    assert.equal(retried?.outcome, 'conflict');
+    assert.match(retried?.action.lastError ?? '', /newer task status intent/i);
+    assert.equal(store.read().data.tasks[0].completed, true);
   } finally {
     store.close();
   }
@@ -394,7 +412,7 @@ test('status projection exposes only native task planning fields', () => {
     store.approveTaskAdoption(adoption.id, '2026-09-13T10:01:00.000Z');
     const status = taskStatusProjection(store.read(), '2026-09-13T10:02:00.000Z');
     assert.equal(status.counts.open, 1);
-    assert.equal(status.tasks[0].deadlineDate, '2026-09-14');
+    assert.equal(status.tasks[0].deadlineDate, null);
     assert.ok(!JSON.stringify(status).includes('google-task-1'));
     assert.ok(!JSON.stringify(status).includes('etag-1'));
   } finally {

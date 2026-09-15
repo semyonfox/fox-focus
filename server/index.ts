@@ -8,8 +8,16 @@ import { createIntegrationService, integrationConfigFromEnvironment } from './in
 import { openStore } from './store.ts';
 import { createHermesActionClient, createHermesMirrorService, type HermesActionClient } from './hermes.ts';
 import webPush from 'web-push';
-import { deliverDuePushNotifications, deliveryKey, subscriptionDeliveryKey } from './push.ts';
+import {
+  deliverDuePushNotifications,
+  deliveryKey,
+  formatPushReminderTime,
+  mergeReminderSources,
+  projectRowReminder,
+  subscriptionDeliveryKey,
+} from './push.ts';
 import { adoptedTaskIdForHermes } from './task-management.ts';
+import { createTaskStatusActionWorker } from './action-worker.ts';
 
 const PUSH_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -31,11 +39,14 @@ if (typeof vapid !== 'object' || vapid === null || !('publicKey' in vapid) || !(
   typeof vapid.publicKey !== 'string' || typeof vapid.privateKey !== 'string') throw new Error('Invalid VAPID key file');
 webPush.setVapidDetails('mailto:semyon.fox@gmail.com', vapid.publicKey, vapid.privateKey);
 const taskStatusTokenPath = process.env.HERMES_STATUS_TOKEN_FILE;
+const emailSendRequested = process.env.EMAIL_SEND_ENABLED === 'true';
 let taskStatusToken: string | undefined;
 if (taskStatusTokenPath) {
   taskStatusToken = readFileSync(taskStatusTokenPath, 'utf8').trim();
-  if (!taskStatusToken) throw new Error('Hermes task-status token file is empty');
+  if (!taskStatusToken) throw new Error('Hermes API token file is empty');
 }
+if (emailSendRequested && !taskStatusToken) throw new Error('EMAIL_SEND_ENABLED requires HERMES_STATUS_TOKEN_FILE');
+const emailSendEnabled = emailSendRequested;
 const store = openStore(join(dataDir, 'focus.sqlite'));
 const hermesPath = process.env.HERMES_KANBAN_DB;
 const hermesActionUrl = process.env.HERMES_ACTION_API_URL;
@@ -52,14 +63,34 @@ const hermes = hermesPath
   : undefined;
 const integrationConfig = integrationConfigFromEnvironment();
 const integrations = integrationConfig ? createIntegrationService(store, integrationConfig) : undefined;
+const actionWorker = createTaskStatusActionWorker(store, integrations ?? {
+  updateGoogleTaskCompletion: async () => ({
+    outcome: 'failed',
+    notice: 'Google Tasks is not configured.',
+    retryable: false,
+  }),
+  createGoogleTask: async () => ({
+    outcome: 'failed',
+    notice: 'Google Tasks is not configured.',
+    retryable: false,
+  }),
+  reconcileGoogleTaskCreate: async () => ({
+    outcome: 'unknown',
+    notice: 'Google Tasks is not configured. Reconnect the original account to reconcile this create.',
+  }),
+});
 const app = createApp(store, password, hermes, integrations, {
   pushPublicKey: vapid.publicKey,
   taskStatusToken,
+  emailSendEnabled,
+  actionWorker,
 });
+actionWorker.start();
 // Establish a current or explicitly stale mirror before the first reminder
 // tick, so persisted rows from a previous run can never fire unchecked.
 if (hermes) await hermes.poll();
 app.get('/assets/*', serveStatic({ root: './dist' }));
+app.get('/favicon.svg', serveStatic({ path: './dist/favicon.svg' }));
 // both files come from public/ via the vite build; read once so a missing file is a clean 404
 function readDistFile(name: string): string | null {
   try { return readFileSync(join('./dist', name), 'utf8'); } catch { return null; }
@@ -95,10 +126,31 @@ async function sendDuePushNotifications(): Promise<void> {
       .filter(reminder => !belongsToAdoptedTask(reminder.targetId));
     const retainedHermesReminders = store.listHermesReminders(true)
       .filter(reminder => !belongsToAdoptedTask(reminder.targetId));
-    const notificationData = { ...snapshot.data, reminders: [...snapshot.data.reminders, ...hermesReminders] };
+    const rowReminders = store.listReminders().flatMap(reminder => {
+      let title = 'Reminder';
+      if (reminder.target.kind === 'task') {
+        const task = store.getTask(reminder.target.id);
+        const createAction = task?.binding.kind === 'pending' ? store.getAction(task.binding.createActionId) : null;
+        const legacyTitle = task?.binding.kind === 'legacy' ? task.binding.source.title : null;
+        title = task?.observed?.title ??
+          (createAction?.payload.kind === 'task-create' ? createAction.payload.title : null) ??
+          (typeof legacyTitle === 'string' ? legacyTitle : null) ??
+          'Task reminder';
+      } else {
+        title = snapshot.data.events.find(event => event.id === reminder.target.id)?.title ?? 'Calendar reminder';
+      }
+      const projected = projectRowReminder(reminder, title, formatPushReminderTime(reminder.fireAt));
+      return projected ? [projected] : [];
+    });
+    const notificationReminders = mergeReminderSources(snapshot.data.reminders, rowReminders, hermesReminders);
+    const notificationData = { reminders: notificationReminders };
     // Keep delivery keys for the last good Hermes mirror while polling is
     // stale or disabled, but never send reminders from that unverified view.
-    store.prunePushDeliveries([...snapshot.data.reminders, ...retainedHermesReminders].map(deliveryKey));
+    store.prunePushDeliveries(mergeReminderSources(
+      snapshot.data.reminders,
+      rowReminders,
+      retainedHermesReminders,
+    ).map(deliveryKey));
     const summary = await deliverDuePushNotifications({
       data: notificationData,
       now: new Date(),
@@ -137,6 +189,7 @@ if (integrations) {
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   clearInterval(pushTimer);
+  actionWorker.stop();
   if (hermesTimer) clearInterval(hermesTimer);
   server.close(() => { store.close(); process.exit(0); });
 });

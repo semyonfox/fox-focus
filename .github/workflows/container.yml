@@ -33,6 +33,7 @@ jobs:
             import { createInitialData } from "./src/model.ts";
             assert.deepEqual(readdirSync("/data"), []);
             assert.deepEqual(readdirSync("/app/server").sort(), [
+              "action-worker.ts",
               "app.ts",
               "hermes.ts",
               "index.ts",
@@ -40,8 +41,10 @@ jobs:
               "oauth.ts",
               "providers.ts",
               "push.ts",
+              "row-store.ts",
               "store.ts",
               "task-management.ts",
+              "task-migration.ts",
             ]);
             assert.deepEqual(createInitialData(), {
               tasks: [],

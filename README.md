@@ -1,68 +1,45 @@
 # Fox Focus
 
-Fox Focus is a private, self-hosted home for tasks and time. Open it, see what needs attention, and get on with the day.
+Fox Focus is a private, self-hosted task and time app. Google Tasks is the task home; Fox Focus adds local planning, reminders, a calm Today view, read-only calendar context, and a terse Inbox for email decisions and work handed to Hermes.
 
-It is intentionally smaller than a project manager. There are four working views:
+The four views are:
 
-- **Today** shows the current or next calendar item, roughly five useful tasks, due-soon work, and Inbox decisions.
-- **Tasks** is the full task browser. A checkbox completes a task. Opening the rest of the row shows its details and editing controls.
-- **Calendar** shows the day and upcoming schedule without mixing task management into the same long page.
-- **Inbox** holds captures and agent proposals until you decide what they become.
+- Today for the next calendar context, a short task list, deadlines, and a collapsed briefing;
+- Tasks for active and completed Google-backed tasks with local planning;
+- Calendar for read-only provider events and existing local time blocks;
+- Inbox for email threads and Hermes jobs grouped into Needs you, Working, and Settled.
 
-Each view owns the page scrollbar. Task lists do not trap the user inside a second scrolling panel.
+Each view uses the page scrollbar rather than nested scrolling panels.
 
-## Task ownership
+## Ownership and safety
 
-Fox Focus is the canonical home for native personal tasks. The task model works without Google, Hermes, Microsoft, or any other provider.
+Google Tasks owns task content and completion, including new tasks created through Fox Focus. Fox Focus owns local planning, deadlines, reminders, Inbox decisions, and execution records. Pending Google creations are commands awaiting confirmation, not local-only tasks. Google Calendar, Gmail, and Canvas remain authoritative for their records.
 
-A task can keep optional provenance and an external link. Those fields extend the local record. They never become a prerequisite for adding, editing, scheduling, or completing a task.
+The existing Hermes `personal-tasks` board remains canonical until the owner separately approves and verifies its live migration. The migration flow is built, but no live migration is implied by installing this version.
 
-Optional code is not the same as runtime configuration. The local Docker command below leaves provider OAuth, Hermes credentials, and the legacy Hermes completion bridge off. Deploying a Fox Focus image does not create a Microsoft app registration, install the Hermes plugin, or add private mounts to an operator-owned production Compose file.
+An owner checkbox click approves completing or reopening the displayed Google task. Fox Focus records the exact status change and ETag, applies only that status change, and reads the task back. New tasks show their Google account, destination list, and outgoing fields before approval. A nonce in the notes prevents a lost create response from causing a blind duplicate.
 
-The Google Tasks bridge is deliberately narrow:
+Email sending is off by default. When enabled, the owner approves one immutable reply envelope; Hermes builds MIME and returns a receipt bound to the stored payload hash. An uncertain send becomes reconciliation-only and can never be resent by Fox Focus.
 
-- A legacy Google task must be explicitly adopted before Fox Focus owns it.
-- Adoption keeps an opaque Fox Focus connection generation, the stable Google list ID and task ID, the source ETag, and the last known state. The generation is not a verified Google account name or email address.
-- Completing or reopening that adopted task can request the same status change in Google after an exact before-and-after preview and approval.
-- Fox Focus checks the remote version, makes one status change, and reads the task back.
-- A failed Google write leaves the local task completed or reopened. The external action remains visible for retry or conflict review.
-- New Fox Focus tasks are never created in Google automatically.
-- Fox Focus does not mirror edits, move tasks, clear completed tasks, or delete Google tasks.
-- Assigned tasks from Google Docs or Chat import as read-only and never receive the completion bridge.
+Fox Focus has no provider delete, Google move or clear, calendar write, Microsoft write, Canvas submission, direct Gmail access, assistant settlement, or Hermes database write path.
 
-Completing a task is not deletion. Completed tasks remain in Fox Focus history, including after a Google refresh.
+## What is implemented
 
-The existing Hermes `personal-tasks` board stays canonical until explicit live migration approvals begin. Shadow reads and adoption do not touch that board. Approving a Hermes adoption cuts over that one task; Hermes remains canonical for every task not yet adopted. When the same old task also exists in Google, the adoption preview can add the Google link to the existing Hermes-adopted Fox Focus task instead of creating a duplicate. After the final cutover, Hermes reads a safe Fox Focus task-status projection and submits suggested work to Inbox. It does not own or mutate the task list.
-
-## What works
-
-- Create, edit, schedule, prioritise, reopen, and complete local tasks.
-- Keep completed tasks in local history.
-- Add and edit local calendar blocks with Dublin-aware time handling.
-- Capture an Inbox item, review it, and turn it into a task, calendar block, draft request, or no action.
-- Store the workspace in SQLite with revision checks that stop one browser tab from silently overwriting another.
-- Deliver opted-in Web Push reminders to subscribed devices, with in-tab reminders when push is unavailable.
-- Install as a PWA on supported browsers.
-- Mirror selected Hermes board data through the transitional read-only adapter when its database is mounted. Fox Focus can keep local planning annotations for an unadopted Hermes task.
-- Prepare an approved completion for an unadopted Hermes task when the separately scoped legacy action bridge is installed. An adopted task cannot use that route.
-- Adopt imported Google, Microsoft, or Hermes tasks through a preview and approval record.
-- Complete or reopen an adopted Google task through an exact preview, approval, status-only patch, and readback.
-- Connect Google Calendar and Tasks and Microsoft Calendar and To Do through server-side OAuth. Calendar and Microsoft records remain read-only.
-- Let Hermes read a safe task-status projection and submit idempotent proposals to Inbox through a separate status token.
-- Preserve stable provider identifiers and normalized provenance without returning private source bodies to the browser.
-- Run the app in one Docker container with a generated password and persistent data volume.
-
-The deployed personal instance is private. It is not a public demo and contains no sample workspace for visitors.
-
-## Deliberate limits
-
-Fox Focus has no general bidirectional sync. It does not send email, submit Canvas work, delete provider records, clear Google task lists, create provider tasks, or let an assistant approve an external action. Gmail capture, general MCP support, accounts, provider disconnect and revocation, and broader provider writes are later work.
-
-Google Calendar, Gmail, Canvas, Microsoft, unadopted Google Tasks, and unadopted Hermes tasks remain authoritative for their imported records. Any external write needs a readable preview, explicit human approval, version checking, and a recorded result.
+- Strict SQLite rows for tasks, plans, Inbox items, immutable draft revisions, durable actions, jobs, job updates, reminders, changes, freshness, and daily briefings.
+- Google task imports with complete per-list snapshots, per-list and per-calendar failure isolation, source IDs, ETags, notes, parent, and position.
+- Google task creation for manual, Inbox, and briefing flows, with `Fox-Focus-ID` nonce reconciliation.
+- Click-approved completion and reopening through a leased worker, `If-Match`, readback, restart recovery, superseding intents, and conflict review.
+- A T3 Code-style Inbox with message-ID identity, owner-protected drafts, explicit decisions, keyboard actions, and likely-noise rows kept available.
+- Hermes jobs with short progress, one-line questions and answers, owner review, send-back, accept, and drop. Hermes cannot settle a job or complete a linked task.
+- Guarded email-send actions with exact envelopes, deterministic hashes, receipts, and unknown-outcome reconciliation. `EMAIL_SEND_ENABLED` defaults off.
+- Expiring news and event briefings on Today. Save as task uses normal Google creation; Remind me also creates a local timed reminder.
+- Read-only Google Calendar, Microsoft Calendar, and Microsoft To Do adapters. Microsoft controls stay hidden from daily views while unconfigured.
+- An owner-facing, resumable migration preview for native Fox tasks and `personal-tasks` board items. It is built and fixture-tested, not run against live data.
+- Web Push reminders, an installable PWA, and an offline visual bundle.
 
 ## Run locally
 
-The quickest path is Docker. This creates an empty local workspace.
+The shortest path creates an empty local workspace without provider or Hermes configuration:
 
 ```bash
 git clone https://github.com/semyonfox/fox-focus.git
@@ -76,15 +53,15 @@ docker run --detach --name fox-focus \
 docker exec fox-focus cat /data/workspace-password
 ```
 
-Open `http://localhost:8789`, sign in as `fox`, and use the password from the final command. The password lives in the volume, so it survives a container restart. Do not share it or add it to the repository.
+Open `http://localhost:8789` and sign in as `fox` with the generated password. The password remains in the volume across container restarts. Do not share or commit it.
 
-To stop the local container:
+To stop the container:
 
 ```bash
 docker stop fox-focus
 ```
 
-`docker rm fox-focus` removes only the container. Remove the `fox-focus-data` volume only when you mean to discard the workspace and its generated password.
+Removing the container does not remove the named volume. Remove that volume only when you intend to discard the workspace and generated password.
 
 ### Build from source
 
@@ -98,7 +75,7 @@ pnpm build
 pnpm start
 ```
 
-The source build stores local data in `./data` unless `DATA_DIR` is set. Open the same local address and retrieve `./data/workspace-password` from your machine.
+The source build stores data in `./data` unless `DATA_DIR` is set. Retrieve the generated password from `./data/workspace-password`.
 
 For an offline visual review:
 
@@ -106,74 +83,50 @@ For an offline visual review:
 pnpm bundle
 ```
 
-This writes `dist/fox-focus.html`. It has browser-only state and does not connect to the server, Hermes, or a provider.
+This writes `dist/fox-focus.html`. It uses browser-only state and does not connect to the server, Hermes, or providers.
 
 ## System shape
 
 ```text
-Browser
+Browser owner
   -> Today, Tasks, Calendar, Inbox
-  -> Hono HTTP API
-  -> SQLite workspace and action history
+  -> Basic-authenticated Hono API
+  -> SQLite rows, immutable approvals and action payloads, and ordered changes
 
-Optional Hermes board
-  -> read-only 60-second poll
-  -> persistent mirror + local planning annotations
-  -> unadopted legacy tasks only
-  -> same Hono API
+Google OAuth
+  -> full paginated task-list snapshots and bounded calendar reads
+  <- approved task creates and status-only changes
 
-Optional legacy Hermes action plugin
-  <- one explicitly approved completion for an unadopted task
-  <- separate, narrowly scoped service token
+Hermes bearer API
+  -> context and ordered changes
+  <- Inbox upserts, job updates, email receipts, and briefings
+  -> no owner decisions and no direct database access
 
-Optional Google / Microsoft connections
-  -> server-held OAuth and encrypted tokens
-  -> read-only calendar, Microsoft, and unadopted task imports
-  -> completion-only Google bridge for explicitly adopted tasks
+Microsoft OAuth
+  -> read-only calendar and To Do imports
 
-Optional assistants
-  -> read-only task-status projection
-  -> proposals into Inbox
+Legacy personal-tasks bridge
+  -> read-only during the unrun migration
 ```
 
-The owner uses HTTP Basic authentication in this first self-hosted release. That is a privacy gate, not a multi-user login system. Put it behind HTTPS or a private network if it leaves your machine.
+The owner API uses HTTP Basic authentication in this single-owner release. Put it behind HTTPS or a private network if it leaves the local machine. Hermes uses one separate bearer token accepted only on its six documented routes.
 
-## Task API
+## Primary APIs
 
-- `GET /healthz` is an unauthenticated health check with no workspace data.
-- `GET /api/v1/workspace` reads the local workspace.
-- `PUT /api/v1/workspace` saves it when the supplied revision still matches.
-- `GET /api/v1/hermes` reads the persisted Hermes mirror.
-- `POST /api/v1/hermes/sync` requests a read-only mirror refresh.
-- `PUT /api/v1/hermes/tasks/:taskId/annotation` saves Fox-owned planning details.
-- `POST /api/v1/hermes/tasks/:taskId/complete` submits one confirmed completion for an unadopted task when the legacy action bridge is configured.
-- `GET /api/v1/integrations` returns safe connection status and imported read-only records.
-- `GET /api/v1/integrations/:provider/connect` starts OAuth; its callback consumes a one-time server state.
-- `POST /api/v1/integrations/:provider/sync` performs an authenticated, read-only provider refresh.
-- `GET /api/v1/task-status` returns the safe read-only projection used by Hermes.
-- `POST /api/v1/task-proposals` adds an idempotent Hermes proposal to Inbox.
-- `POST /api/v1/task-adoptions/preview` and `POST /api/v1/task-adoptions/:id/approve` adopt one imported task.
-- `GET /api/v1/task-actions` lists status-write requests.
-- `POST /api/v1/task-actions/preview` creates the exact completion or reopen preview.
-- `POST /api/v1/task-actions/:id/approve` runs an approved request. `POST /api/v1/task-actions/:id/retry` retries an eligible failure.
+- `GET /healthz` is the unauthenticated health check.
+- `GET /api/v1/rows` returns current row state and feature capabilities.
+- `GET /api/v1/task-destinations` and `POST /api/v1/tasks` drive approved Google creation.
+- `POST /api/v1/tasks/:taskId/status` records an approved completion or reopen.
+- Inbox item, draft, send, and job routes are owner-only.
+- Migration preview, approval, and status routes are owner-only.
+- Hermes uses only `GET /api/v1/context`, `GET /api/v1/changes`, `PUT /api/v1/inbox/:proposalKey`, `POST /api/v1/requests/:id/claim`, `POST /api/v1/requests/:id/result`, and `PUT /api/v1/briefings/:day`.
 
-All private routes accept the owner's Basic authentication. Only the status and proposal routes also accept the Hermes bearer token loaded from `HERMES_STATUS_TOKEN_FILE`. Fox Focus publishes no public API catalog, OpenAPI document, MCP endpoint, or `llms.txt`.
-
-`compose.yaml` adds a persistent SQLite volume and an optional read-only Hermes board mount. Set `HERMES_BOARD_DIR` and `HERMES_KANBAN_DB=/hermes/personal-tasks/kanban.db` to show the old board during migration. Read-only mirroring and local annotations work without the legacy action bridge. That bridge stays disabled until its plugin, private endpoint, separate action token, and exact completion effects have been reviewed. You do not need Hermes, a tunnel, or a reverse proxy to run the Docker command above.
+Compatibility workspace, mirror, annotation, adoption, old task-action, task-status, and task-proposal routes remain until the live migration is verified. They are not the current ownership path. Fox Focus publishes no public API catalog, OpenAPI document, MCP endpoint, or `llms.txt`.
 
 ## Documentation
 
-- [Architecture and delivery plan](docs/architecture-plan.md) defines the native task model, approval boundary, and staged rollout.
-- [Task ownership and sync handover](docs/task-organisation-and-sync-handover.md) records the approved product behaviour.
-- [Hermes task handover](docs/hermes-task-sync-request.md) defines the read-only status and proposal boundary.
-- [Google and Microsoft connections](docs/integrations.md) covers OAuth, scopes, and the Google completion bridge.
-- [Self-hosting notes](docs/deployment.md) covers persistence, private access, backups, and secret mounts.
-
-## Project rules
-
-- Fox Focus owns native tasks and their completion history.
-- The existing `personal-tasks` board remains canonical until a separate live migration approval.
-- Imported services stay authoritative for records that Fox Focus has not explicitly adopted.
-- Never commit credentials, private records, provider tokens, or database files.
-- Never perform an external write without an exact preview, approval record, and guarded execution.
-- The legacy Hermes completion client applies only to unadopted tasks and stays disabled until its preview matches every completion effect in the installed Hermes release.
+- [Architecture](docs/architecture-plan.md)
+- [Task ownership and workflow handover](docs/task-organisation-and-sync-handover.md)
+- [Hermes integration contract](docs/hermes-task-sync-request.md)
+- [Provider setup and boundaries](docs/integrations.md)
+- [Self-hosting notes](docs/deployment.md)
