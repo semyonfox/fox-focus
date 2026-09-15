@@ -355,23 +355,12 @@ function scopesStayWithinRequest(
   requested: readonly string[],
 ): boolean {
   if (granted === undefined) return true;
-  const allowed = new Set(requested);
-  // Google can return previously granted narrower scopes alongside the newer
-  // requested write scopes on reconnect. Each exception below is strictly
-  // narrower than a requested scope, so it adds no capability.
-  if (provider === 'google') {
-    if (requested.includes('https://www.googleapis.com/auth/tasks')) {
-      allowed.add('https://www.googleapis.com/auth/tasks.readonly');
-    }
-    if (requested.includes('https://www.googleapis.com/auth/calendar')) {
-      allowed.add('https://www.googleapis.com/auth/calendar.events');
-      allowed.add('https://www.googleapis.com/auth/calendar.events.readonly');
-      allowed.add('https://www.googleapis.com/auth/calendar.calendarlist.readonly');
-    } else if (requested.includes('https://www.googleapis.com/auth/calendar.events')) {
-      allowed.add('https://www.googleapis.com/auth/calendar.events.readonly');
-    }
-  }
-  return granted.every(scope => allowed.has(scope));
+  // Semyon explicitly authorises keeping any scopes Google returns from this
+  // account's consent screen. Fox Focus still exposes only its own narrowly
+  // implemented operations; an unused Google scope does not create an API or
+  // executor inside this app.
+  if (provider === 'google') return true;
+  return granted.every(scope => requested.includes(scope));
 }
 
 function connectionToken(

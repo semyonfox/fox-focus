@@ -1268,7 +1268,7 @@ test('provider reads abort at their configured deadline without blocking other s
   }
 });
 
-test('Google callback retains legacy narrower Calendar and Tasks grants beside the requested full scopes', async () => {
+test('Google callback preserves every returned Google scope while keeping operations bounded', async () => {
   let currentTime = new Date('2026-09-11T10:00:00.000Z');
   const calls: Array<{ url: URL; method: string }> = [];
   const fakeFetch: typeof fetch = async (input, init) => {
@@ -1282,7 +1282,7 @@ test('Google callback retains legacy narrower Calendar and Tasks grants beside t
         refresh_token: 'test-refresh-token',
         token_type: 'Bearer',
         expires_in: 3_600,
-        scope: 'openid email https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/tasks https://www.googleapis.com/auth/tasks.readonly',
+        scope: 'openid email https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.calendarlist.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.events.readonly https://www.googleapis.com/auth/tasks https://www.googleapis.com/auth/tasks.readonly https://www.googleapis.com/auth/drive.file',
       });
     }
     if (url.origin === 'https://openidconnect.googleapis.com') return json({ sub: 'google-account-callback' });
@@ -1454,7 +1454,7 @@ test('a failed authorization-code exchange leaves no imported provider data behi
   }
 });
 
-test('a token response with an unrequested scope is never stored', async () => {
+test('a non-Google token response with an unrequested scope is never stored', async () => {
   const store = openStore(':memory:');
   try {
     const methods: string[] = [];
@@ -1468,17 +1468,17 @@ test('a token response with an unrequested scope is never stored', async () => {
         });
       },
       providers: {
-        google: {
+        microsoft: {
           clientId: 'client-id', clientSecret: 'client-secret',
           authorizationEndpoint: 'https://accounts.example.test/authorize', tokenEndpoint: 'https://oauth.example.test/token',
           scopes: ['calendar.readonly'], additionalAuthorizationParameters: {},
         },
       },
     });
-    const state = new URL(integrations.startAuthorization('google') ?? '').searchParams.get('state');
+    const state = new URL(integrations.startAuthorization('microsoft') ?? '').searchParams.get('state');
     assert.ok(state);
-    assert.equal((await integrations.completeAuthorization('google', new URLSearchParams({ state, code: 'test-code' }))).outcome, 'failed');
-    assert.equal(store.getConnection('google'), null);
+    assert.equal((await integrations.completeAuthorization('microsoft', new URLSearchParams({ state, code: 'test-code' }))).outcome, 'failed');
+    assert.equal(store.getConnection('microsoft'), null);
     assert.deepEqual(store.listProviderRecords(), []);
     assert.deepEqual(methods, ['POST']);
   } finally {
