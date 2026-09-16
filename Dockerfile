@@ -18,10 +18,8 @@ WORKDIR /app
 RUN mkdir /data && chown node:node /data
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
-COPY --from=build --chown=node:node /app/server/app.ts /app/server/index.ts /app/server/store.ts /app/server/hermes.ts /app/server/integrations.ts /app/server/oauth.ts /app/server/providers.ts /app/server/push.ts /app/server/task-management.ts ./server/
-COPY --from=build --chown=node:node /app/src/model.ts ./src/model.ts
-COPY --from=build --chown=node:node /app/src/calendar-time.ts ./src/calendar-time.ts
-COPY --from=build --chown=node:node /app/src/hermes-model.ts ./src/hermes-model.ts
+COPY --from=build --chown=node:node /app/server/action-worker.ts /app/server/app.ts /app/server/hermes.ts /app/server/index.ts /app/server/integrations.ts /app/server/oauth.ts /app/server/providers.ts /app/server/push.ts /app/server/row-store.ts /app/server/store.ts /app/server/task-completion-fingerprint.ts /app/server/task-management.ts /app/server/task-migration.ts ./server/
+COPY --from=build --chown=node:node /app/src/calendar-time.ts /app/src/hermes-model.ts /app/src/integration-model.ts /app/src/model.ts /app/src/row-model.ts ./src/
 COPY --from=build --chown=node:node /app/package.json ./package.json
 USER node
 EXPOSE 8789

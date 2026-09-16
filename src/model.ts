@@ -12,7 +12,7 @@ export type SectionAnchor = "today" | "agenda" | "tasks" | "review" | "signals";
 export type TaskOrigin = "manual" | "inbox" | "migration";
 export type TaskLinkProvider = "google_tasks" | "microsoft_todo" | "hermes";
 export type TaskLinkPolicy = "read_only" | "completion_only";
-export type EventOrigin = "fixture" | "local" | "task" | "inbox";
+export type EventOrigin = "fixture" | "local" | "task" | "inbox" | "imported";
 export type ReminderMode = "none" | "one-hour" | "morning";
 export type ActiveReminderMode = Exclude<ReminderMode, "none">;
 export type ReminderState = "scheduled" | "snoozed";
@@ -144,7 +144,7 @@ export const priorities = ["high", "medium", "low"] as const;
 export const taskStates = ["up-next", "scheduled", "waiting", "done"] as const;
 export const activeTaskStates = ["up-next", "scheduled", "waiting"] as const;
 export const inboxStatuses = ["new", "draft-ready", "waiting-on-agent", "handled"] as const;
-export const eventOrigins = ["fixture", "local", "task", "inbox"] as const;
+export const eventOrigins = ["fixture", "local", "task", "inbox", "imported"] as const;
 export const taskOrigins = ["manual", "inbox", "migration"] as const;
 export const taskLinkProviders = ["google_tasks", "microsoft_todo", "hermes"] as const;
 export const taskLinkPolicies = ["read_only", "completion_only"] as const;
@@ -383,8 +383,9 @@ export function isPrototypeData(value: unknown): value is PrototypeData {
     value.inboxItems.every(isInboxItem) &&
     Array.isArray(value.reminders) &&
     value.reminders.every(isReminder) &&
+    [value.tasks, value.events, value.reminders].every(items => items.length <= 500) &&
     [value.tasks, value.events, value.inboxItems, value.reminders].every(items =>
-      items.length <= 500 && new Set(items.map(item => item.id)).size === items.length &&
+      new Set(items.map(item => item.id)).size === items.length &&
       items.every(item => item.id.length > 0 && item.id.length <= 200 && item.title.trim().length > 0 && item.title.length <= 500))
   );
   if (!collectionsAreValid) return false;

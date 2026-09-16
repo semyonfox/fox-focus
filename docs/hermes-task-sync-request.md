@@ -1,137 +1,273 @@
-# Hermes task handover
+# Hermes integration contract
 
-Status: implemented on the Fox Focus side, without live migration approval. Fox Focus has the status and proposal routes, a persistent read-only Hermes mirror, local annotations, task adoption, and a fail-closed legacy completion client. The bundled plugin contract depends on matching Hermes changes that must be forward-ported and reviewed against the installed Hermes release. No production completion route is configured by this repository.
+Status: the live job bridge is verified end to end. The `personal-tasks` migration and real mail executor have not been run or verified.
 
-Fox Focus is becoming the canonical home for personal tasks. Hermes should read their status and propose new work. It should not keep a second editable personal task board or change Fox Focus tasks directly.
+Hermes reads work, proposes Inbox items, carries short jobs forward and back, publishes briefings, and executes an email only after the owner approves its exact envelope. It cannot settle a job, approve a write, complete a task directly, access SQLite directly, or write the Hermes database.
 
-The existing `personal-tasks` board remains canonical until a separate migration approval. The current read-only SQLite adapter is a temporary source for shadow import and reconciliation.
+## Authentication
 
-During that transition, Fox Focus polls the mounted board on startup and every 60 seconds. It keeps a normalized mirror by stable Hermes task ID and can add Fox-owned planning and reminder annotations without changing the source. A failed read keeps the last good mirror.
+Fox Focus loads one bearer token from `HERMES_STATUS_TOKEN_FILE`. The token must contain at least 24 characters and stay outside the repository, browser bundle, logs, database exports, and Hermes output.
 
-There is one temporary compatibility write for tasks Hermes still owns. After an exact confirmation, the separately installed `fox-focus-sync` plugin can complete one unadopted `personal-tasks` item using a scoped token, optimistic version, idempotency key, approval ID, and durable receipt. Fox Focus blocks that route as soon as the task is adopted. The bridge does not edit titles, planning fields, or another board, and it must stay off until its preview names every completion effect in the installed Hermes release.
+The bearer token works only on these six routes:
 
-## Before cutover
+| Method and route | Use |
+| --- | --- |
+| `GET /api/v1/context?from=YYYY-MM-DD&to=YYYY-MM-DD` | Read one consistent task, calendar, Inbox, job, action, briefing, and freshness snapshot |
+| `GET /api/v1/changes?after=<seq>&limit=<1..500>` | Read ordered immutable changes after a saved cursor |
+| `PUT /api/v1/inbox/:proposalKey` | Create or update one structured Inbox item |
+| `POST /api/v1/requests/:id/claim` | Claim a job or approved email action |
+| `POST /api/v1/requests/:id/result` | Add a job update or return an email receipt |
+| `PUT /api/v1/briefings/:day` | Create or replace one daily briefing |
 
-Hermes needs to expose enough stable information for a safe migration, either through its public API or a deliberate export:
+All other routes require owner Basic authentication. In particular, the compatibility routes `/api/v1/task-status` and `/api/v1/task-proposals` no longer accept the Hermes bearer token.
+
+Requests and responses use JSON unless the route is a GET or claim without a body. Fox Focus limits request bodies and rejects cross-origin browser mutations.
+
+## Context and changes
+
+`GET /api/v1/context` requires an inclusive `from` and `to` date. Its response includes:
+
+- a `cursor` from the same SQLite read transaction;
+- tasks with local plans, derived area, and pending action;
+- calendar context in the requested range;
+- Inbox items with their current draft;
+- unsettled jobs and their updates;
+- outstanding actions;
+- non-expired briefings whose day is in the requested range;
+- per-list and per-calendar Google freshness.
+
+Process changes after that cursor through `GET /api/v1/changes`. Save the returned cursor after each page. Each entry contains the actor, mutation identity and hash, entity version, operation, immutable snapshot or tombstone, transition details, and UTC timestamp. A `410` with `resetRequired: true` means the saved cursor is too old. Read a fresh context before continuing.
+
+Neither read route changes state.
+
+## Inbox upsert
+
+Email identity is account plus message ID. Keep thread ID for context, but do not use it as the item key. A new message in an old resolved thread must surface as a new item.
+
+Example:
 
 ```json
 {
-  "taskId": "stable-hermes-task-id",
-  "boardId": "personal-tasks",
-  "listId": "stable-list-id",
-  "parentId": null,
-  "title": "Example task",
-  "status": "todo",
-  "priority": 2,
-  "sourceKind": "direct_request",
-  "sourceId": "stable-source-id-or-null",
-  "sourceLabel": "My Tasks",
-  "createdAt": "2026-09-01T09:00:00Z",
-  "updatedAt": "2026-09-12T18:20:00Z",
-  "version": "opaque-version-token",
-  "deletedAt": null
+  "expectedVersion": null,
+  "source": {
+    "kind": "email",
+    "accountId": "mail-account",
+    "messageId": "provider-message-id",
+    "threadId": "provider-thread-id"
+  },
+  "title": "Confirm the booking",
+  "summary": "The organiser asked for a reply.",
+  "likelyNoise": false,
+  "draft": {
+    "accountId": "mail-account",
+    "threadId": "provider-thread-id",
+    "replyToMessageId": "provider-message-id",
+    "inReplyTo": "<provider-message-id@example.test>",
+    "references": ["<earlier-message@example.test>"],
+    "from": "owner@example.test",
+    "to": ["organiser@example.test"],
+    "cc": [],
+    "bcc": [],
+    "subject": "Re: Booking",
+    "bodyText": "That time works for me."
+  }
 }
 ```
 
-- Keep task, board, list, parent, and source IDs stable.
-- Define status and priority values explicitly.
-- Include deletion or archive tombstones in an incremental read or final export.
-- Do not make Fox Focus infer source grouping from a title or private task body.
-- Do not expose task bodies, result text, workspace paths, sessions, provider credentials, or unrelated boards.
+Use `expectedVersion: null` to create. Use the current positive version to update. The `proposalKey` is the idempotency key; reusing it with different content returns `409`.
 
-Preparing an adoption preview is read-only. Approving it cuts over only that Hermes task while leaving the board unchanged and canonical for every task not yet adopted. If a Hermes task also exists in the provider mirror, first adopt the Hermes task, then use the provider adoption preview's `targetTaskId` to attach that provider link to the same native task. This avoids a duplicate and keeps the provider action policy separate from Hermes provenance. Before the final live cutover, the operator must shadow-read and reconcile every remaining record, back up the board, validate the backup, briefly freeze changes, and compare the final source version of every task. The user must approve that exact set. Implementation work, previews, and fixture tests are not migration approval.
+A draft must match the source account, thread, and message. Fox Focus appends immutable draft revisions. It keeps an owner-edited draft or an envelope with an unsettled send action instead of replacing it. Hermes may refresh title, summary, and likely-noise classification, but cannot change owner decision fields. Likely-noise items remain reviewable.
 
-## After cutover
+Do not send raw MIME, credentials, or unrelated message bodies in this request.
 
-Hermes has two permitted capabilities.
+## Jobs
 
-### Read task status
+The owner creates a job, optionally linked to a task or Inbox item. Fox Focus allows one unsettled job per linked task or Inbox item. Its states are:
 
-Hermes reads `GET /api/v1/task-status` with a distinct bearer token. The response shape is:
+```text
+queued -> working -> needs_you -> working -> review
+review -> settled/accepted
+review -> settled/dropped
+review -> queued          owner sends it back
+```
+
+Claim it with:
+
+```http
+POST /api/v1/requests/<job-id>/claim
+Authorization: Bearer <token>
+X-Request-Kind: job
+X-Claim-Key: <stable key for this job version>
+```
+
+A job claim returns:
 
 ```json
 {
-  "revision": 42,
-  "generatedAt": "2026-09-13T10:15:00Z",
-  "counts": {
-    "open": 8,
-    "completed": 4,
-    "scheduled": 3,
-    "waiting": 1
-  },
-  "tasks": [
+  "kind": "job",
+  "job": { "id": "job-id", "state": "working" },
+  "claimId": "opaque-claim-id",
+  "leaseUntil": "2026-09-14T10:10:00.000Z"
+}
+```
+
+The worker generates `X-Claim-Key` before the request and reuses it only to recover a lost response for that job version. Fox Focus maps it to a fresh opaque `claimId`; the request key is never the lease credential. Repeating the request while that lease is active returns the same `claimId`. After the lease ends, the worker must refresh the job and use a key for its new version. `X-Request-Kind: job` prevents a mistaken action ID from claiming an approved email send.
+
+Post updates with the returned claim in `X-Claim-Id`:
+
+```json
+{ "kind": "progress", "text": "Checking the published timetable.", "url": null }
+```
+
+`kind` is `progress`, `question`, or `result`. Text is one plain-text line of at most 280 characters. URL is `null` or a safe HTTPS URL. A new progress update keeps the job working and renews the ten-minute lease. A question moves it to `needs_you` and releases the claim. A result moves it to `review` and releases the claim.
+
+The owner answers a question in one line, accepts, drops, or sends the job back with one line. Hermes cannot call those owner routes. Accepting a job linked to a task is also the owner's completion click; Fox Focus queues the normal ETag-guarded Google action.
+
+Hermes may post several distinct progress bodies while the claim is active. Replaying the exact body under the same claim returns the same update without extending the lease.
+
+## Email send actions
+
+Fox Focus has no Gmail access. Hermes owns the mail executor. It must send only the envelope returned by a claimed action and build MIME deterministically from those fields. Fox Focus never stores MIME.
+
+The owner approves the current draft through an owner-only route. The durable action contains:
+
+```ts
+{
+  kind: "email-send";
+  inboxId: string;
+  draftId: string;
+  reply: {
+    accountId: string;
+    threadId: string;
+    replyToMessageId: string;
+    inReplyTo: string;
+    references: string[];
+    from: string;
+    to: string[];
+    cc: string[];
+    bcc: string[];
+    subject: string;
+    bodyText: string;
+  };
+  payloadHash: string;
+}
+```
+
+Header fields reject control characters. Extra envelope and receipt fields are rejected, so raw MIME cannot be smuggled into either record.
+
+### Hash contract
+
+Construct this preimage object:
+
+```json
+{
+  "schema": "fox-focus-email-send-v1",
+  "inboxId": "<action inboxId>",
+  "draftId": "<action draftId>",
+  "reply": "<the exact reply object>"
+}
+```
+
+Canonicalize it by sorting every object's keys lexicographically and applying the same rule recursively. Preserve array order. Serialize with JSON string escaping and no whitespace, encode that string as UTF-8, hash it with SHA-256, then encode the 32-byte digest as unpadded base64url.
+
+This golden preimage:
+
+```json
+{"draftId":"draft-golden","inboxId":"inbox-golden","reply":{"accountId":"mail-account","bcc":[],"bodyText":"Approved wording","cc":[],"from":"owner@example.test","inReplyTo":"<message-send@example.test>","references":["<earlier@example.test>"],"replyToMessageId":"message-send","subject":"Re: Message message-send","threadId":"thread-1","to":["sender@example.test"]},"schema":"fox-focus-email-send-v1"}
+```
+
+must produce:
+
+```text
+odrnJF5zH-so1Uu51RZZ69M_FpVfVSEPNT1cPEWYi8Y
+```
+
+Do not hash only `reply`. Do not include `payloadHash` in the preimage.
+
+### Claim and receipt
+
+An email claim uses the same claim route and returns:
+
+```json
+{
+  "kind": "email-send",
+  "action": { "id": "action-id", "payload": { "kind": "email-send" } },
+  "mode": "send",
+  "claimId": "opaque-claim-id",
+  "leaseUntil": "2026-09-14T10:02:00.000Z"
+}
+```
+
+In `send` mode, build MIME from the stored reply, send once, and return this exact receipt with `X-Claim-Id`:
+
+```json
+{
+  "kind": "email-send",
+  "payloadHash": "<the action payloadHash>",
+  "providerMessageId": "<new sent-message id>",
+  "providerThreadId": "<the approved thread id>"
+}
+```
+
+Fox Focus rejects a different hash, thread, reused reply-to message ID, expired claim, extra receipt field, or different replay. It records the successful receipt and Inbox `sent` outcome atomically.
+
+If dispatch may have started and the lease expires, the action becomes `unknown`. Never send it again. A later claim returns `mode: "reconcile"`, including when `EMAIL_SEND_ENABLED` has since been disabled. Search Gmail for the already-sent reply using the approved account, thread, headers, and content. Return the same receipt only after finding one exact sent message. No match leaves the action unknown.
+
+The first claim or result request that notices an expired running lease may return `409` with the action now marked unknown. Claim it again and expect `reconcile`. Do not treat that response as permission to send.
+
+`EMAIL_SEND_ENABLED` defaults off. Fox Focus will not queue or issue a new send-mode claim while it is off. Setting it to `true` without `HERMES_STATUS_TOKEN_FILE` stops server startup. Keep it off until the real executor reproduces the golden hash, deterministic MIME, provider IDs, and reconciliation behavior.
+
+## Briefings
+
+Publish one briefing for a Dublin date:
+
+```http
+PUT /api/v1/briefings/2026-09-14
+Authorization: Bearer <token>
+Content-Type: application/json
+```
+
+```json
+{
+  "expectedVersion": null,
+  "expiresAt": "2026-09-15T05:00:00.000Z",
+  "entries": [
     {
-      "id": "fox-task-id",
-      "title": "Example task",
-      "area": "University",
-      "state": "scheduled",
-      "completed": false,
-      "priority": "high",
-      "deadlineDate": "2026-09-15",
-      "dueLabel": "Tuesday",
-      "planned": {
-        "date": "2026-09-14",
-        "time": "10:00",
-        "timeZone": "Europe/Dublin"
-      },
-      "completedAt": null,
-      "origin": "manual"
+      "kind": "news",
+      "title": "Example headline",
+      "summary": "One short source-based summary.",
+      "url": "https://example.test/story",
+      "startsAt": null
+    },
+    {
+      "kind": "event",
+      "title": "Example event",
+      "summary": "Doors open at 18:30.",
+      "url": "https://example.test/event",
+      "startsAt": "2026-09-14T17:30:00.000Z"
     }
   ]
 }
 ```
 
-The route returns an ETag based on the workspace revision and honors `If-None-Match` with `304 Not Modified`. It must not return notes, source bodies, raw provider payloads, external action details, filesystem paths, session identifiers, or credentials.
+Use `expectedVersion: null` to create and the current positive version to replace. The day must be `YYYY-MM-DD`, entries are limited to 50, URLs are `null` or HTTPS, and all instants are UTC. An expiry at or before server time is rejected. Repeating identical content returns the stored row; stale different content returns `409` with the current row.
 
-A status read has no side effect. Polling the same state must not create activity, tasks, or Inbox items.
+Briefing publication creates no Inbox item and performs no provider write. The owner's Save as task and Remind me actions use the normal Google task creation route. Remind me adds a local timed reminder in the same transaction.
 
-### Submit proposed work
+## Migration boundary
 
-When Hermes finds something that may deserve action, it calls `POST /api/v1/task-proposals` with `application/json` instead of creating a task:
+The `personal-tasks` board remains canonical until the owner approves and verifies the live migration. Until then, Fox Focus may read its mounted SQLite database and the compatibility bridge may complete an unadopted board item after owner confirmation. Fox Focus never writes the Hermes database.
 
-```json
-{
-  "idempotencyKey": "hermes-domain-renewal-2026",
-  "title": "Renew the domain",
-  "summary": "The renewal notice says it expires next month. Source reference: safe-stable-reference.",
-  "area": "Admin"
-}
-```
+After verified cutover, remove the mirror, annotations, completion bridge, and `fox-focus-sync` plugin. Preserve source-to-target mappings, action receipts, and approval history. Hermes should then use only the six routes in this document.
 
-`area` is optional and must match a Fox Focus area when supplied. The response reports `created` with status `201`, or `already_received` with status `200`, plus the Inbox item ID. The proposal appears in Inbox. The user can accept, edit, defer, dismiss, or ask for more work. A retry with the same idempotency key returns the original Inbox item.
+## Acceptance checks for the Hermes side
 
-Do not include a complete private email body or another provider's token in a proposal. Source text is evidence, not authorization.
-
-## Forbidden capabilities
-
-After adoption, Hermes must not receive an endpoint or tool that can:
-
-- complete, reopen, edit, or delete a Fox Focus task;
-- approve or execute a Google action;
-- read task notes or private provider bodies by default;
-- read or write the Fox Focus or Hermes SQLite file directly;
-- create a Google or Microsoft task;
-- bypass Inbox review.
-
-If Hermes thinks an existing task should change, it submits a proposal that names the task and explains why.
-
-The legacy completion plugin is not an exception for a Fox-owned task. It applies only while the specific task remains canonical in Hermes, and Fox Focus rejects it after adoption.
-
-## Credential boundary
-
-Create one random token of at least 24 characters in an owner-only file. A direct server run uses `HERMES_STATUS_TOKEN_FILE`; the supplied Compose file takes the host path through `HERMES_STATUS_TOKEN_FILE_HOST` and sets the internal path. Supply the same token to Hermes through its secret configuration. This repository configures only the Fox Focus side. The server reads it at startup and compares bearer tokens without storing the value in SQLite. Keep the file out of the repository, browser bundle, logs, database exports, and Hermes output.
-
-The token works only for `GET /api/v1/task-status` and `POST /api/v1/task-proposals`. Owner Basic authentication also works. The app exposes no public discovery endpoints, API catalog, OpenAPI document, MCP endpoint, or `llms.txt`.
-
-## Acceptance checks
-
-- A status read changes nothing.
-- The status response contains only the documented safe fields.
-- A Hermes credential cannot call browser task mutations or external action approval.
-- Repeating one proposal idempotency key creates one Inbox item.
-- An Inbox proposal cannot become a task without a user decision.
-- The final migration refuses a changed source version and produces a new preview.
-- Every migrated task maps to one native Fox Focus ID.
-- A post-cutover Hermes task refresh cannot resurrect or duplicate a Fox Focus task.
-- No direct SQLite write path exists in either direction.
-- The legacy completion route rejects an adopted task.
+- The bearer token receives `401` from every non-Hermes route.
+- Context and change polling create no state.
+- Replaying one Inbox proposal, job update, email receipt, or briefing does not duplicate it.
+- A new message in an old thread uses its new message ID and surfaces separately.
+- Hermes cannot replace an owner or approved draft.
+- Hermes cannot settle a job or tick a task.
+- The mail executor matches the golden hash, sends once, and reconciles an expired send without resending.
+- Briefing publication creates no Inbox item.
+- Hermes never accesses SQLite directly or writes the Hermes database.
