@@ -5612,7 +5612,7 @@ button[aria-busy="true"] {
   }
 
   .workspace-heading > div {
-    flex: 1 1 200px;
+    flex: 1 1 auto;
   }
 
   .today-grid {
