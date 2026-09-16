@@ -348,7 +348,7 @@ function TaskRow({
             {task.externalLinks?.some((link) => link.provider === "google_tasks") ? <em className="source-chip">Google linked</em> : task.origin === "migration" ? <em className="source-chip">Imported</em> : null}
             {sourceBadge}
             {actionStateLabel(latestAction) ? <em className={`task-action-state task-action-state--${latestAction?.status}`}>{actionStateLabel(latestAction)}</em> : null}
-            {!compact ? <em className={`task-created${createdAt ? "" : " task-created--unknown"}`}>{createdAt ? `Added ${createdAt}` : "Created date unknown"}</em> : null}
+            {!compact && createdAt ? <em className="task-created">Added {createdAt}</em> : null}
           </span>
         </span>
         <time dateTime={task.deadlineDate}>{dueLabel ?? task.due}</time>
@@ -620,32 +620,53 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  const isOverlayOpen = Boolean(modal || editingHermesTaskId || hermesCompletionApproval || showReminderTray || activeReminderId || showIntegrations || taskActionPreview || hermesAdoption);
+  // Match the dialog paint order so reminders and drawer transitions keep focus.
+  const activeOverlay = showIntegrations ? "integrations"
+    : hermesAdoption ? "adoption"
+    : taskActionPreview ? "task-action"
+    : activeReminderId ? `reminder-${activeReminderId}`
+    : showReminderTray ? "reminders"
+    : modal ? modal.kind
+    : editingHermesTaskId ? "hermes-editor"
+    : hermesCompletionApproval ? "hermes-completion"
+    : null;
+  const isOverlayOpen = activeOverlay !== null;
 
   useEffect(() => {
-    if (!isOverlayOpen) {
+    if (!activeOverlay) {
       if (focusBeforeOverlay.current?.isConnected) focusBeforeOverlay.current.focus();
+      else if (focusBeforeOverlay.current) document.querySelector<HTMLElement>(".workspace-nav-item--active")?.focus();
+      focusBeforeOverlay.current = null;
       return;
     }
 
-    focusBeforeOverlay.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusableSelector = "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    focusBeforeOverlay.current ??= previousFocus;
+    const dialogs = Array.from(document.querySelectorAll<HTMLElement>(".editor-dialog"));
+    const dialog = dialogs.at(-1);
+    if (!dialog) return;
+    const backgroundOverlays = dialogs.slice(0, -1).map((element) => element.closest<HTMLElement>(".overlay")).filter((element) => element !== null);
+    backgroundOverlays.forEach((element) => { element.inert = true; });
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusableSelector = "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex='-1'])";
+    const controls = () => Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector)).filter((element) => element.getClientRects().length > 0 && !element.closest("[inert]"));
     const focusFirstControl = () => {
-      const dialog = document.querySelector<HTMLElement>(".editor-dialog");
-      const preferred = dialog?.querySelector<HTMLElement>("[autofocus]");
-      const first = dialog?.querySelector<HTMLElement>(focusableSelector);
-      (preferred ?? first)?.focus();
+      if (dialog.contains(document.activeElement)) return;
+      const preferred = dialog.querySelector<HTMLElement>("[data-autofocus]");
+      (preferred ?? controls()[0])?.focus();
     };
     const frame = window.requestAnimationFrame(focusFirstControl);
     const trapFocus = (event: KeyboardEvent) => {
       if (event.key !== "Tab") return;
-      const dialog = document.querySelector<HTMLElement>(".editor-dialog");
-      if (!dialog) return;
-      const controls = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
-      if (!controls.length) return;
-      const first = controls[0];
-      const last = controls.at(-1) ?? first;
-      if (event.shiftKey && document.activeElement === first) {
+      const available = controls();
+      if (!available.length) { event.preventDefault(); return; }
+      const first = available[0];
+      const last = available.at(-1) ?? first;
+      if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && document.activeElement === last) {
@@ -658,8 +679,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => {
       window.cancelAnimationFrame(frame);
       window.removeEventListener("keydown", trapFocus);
+      document.body.style.overflow = previousOverflow;
+      backgroundOverlays.forEach((element) => { element.inert = false; });
+      if (previousFocus?.isConnected) previousFocus.focus();
     };
-  }, [isOverlayOpen]);
+  }, [activeOverlay]);
 
   useEffect(() => {
     if (!("Notification" in window)) {
@@ -765,19 +789,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      setModal(null);
-      setEditingHermesTaskId(null);
-      setHermesCompletionApproval(null);
-      setShowReminderTray(false);
-      setActiveReminderId(null);
-      setShowIntegrations(false);
-      if (!taskActionBusy) setTaskActionPreview(null);
-      if (!adoptingHermesId) setHermesAdoption(null);
+      if (activeOverlay === "integrations") document.querySelector<HTMLButtonElement>(".integrations-drawer .close-composer")?.click();
+      else if (activeOverlay === "adoption") { if (!adoptingHermesId) setHermesAdoption(null); }
+      else if (activeOverlay === "task-action") { if (!taskActionBusy) setTaskActionPreview(null); }
+      else if (activeOverlay?.startsWith("reminder-")) setActiveReminderId(null);
+      else if (activeOverlay === "reminders") setShowReminderTray(false);
+      else if (modal) setModal(null);
+      else if (activeOverlay === "hermes-editor") setEditingHermesTaskId(null);
+      else if (activeOverlay === "hermes-completion") setHermesCompletionApproval(null);
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [adoptingHermesId, taskActionBusy]);
+  }, [activeOverlay, adoptingHermesId, taskActionBusy, modal]);
 
   useEffect(() => {
     if (!completionUndo) return;
@@ -1859,7 +1883,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </article>
 
         <article className="pane today-card today-card--due">
-          <PaneHeader eyebrow="Due soon" title="What is coming" />
+          <PaneHeader eyebrow="Due soon" title="Coming up" />
           <div className="today-stat-list">
             <button type="button" onClick={() => { selectTaskFilter("due-today"); openWorkspaceView("tasks"); }}><span>Today</span><strong>{dueTodayCount}</strong></button>
             <button type="button" onClick={() => { selectTaskFilter("open"); openWorkspaceView("tasks"); }}><span>Tomorrow</span><strong>{dueTomorrowCount}</strong></button>
@@ -1929,14 +1953,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function renderTasksView() {
     return <section className="workspace-page workspace-page--tasks" aria-labelledby="tasks-heading">
-      <header className="workspace-heading"><div><p className="eyebrow">Your work</p><h1 id="tasks-heading">Tasks</h1><p>Everything stays visible here. Complete with the checkbox or open a task to change it.</p></div><button className="page-primary-action" type="button" onClick={() => openTaskComposer()}><Plus size={13} /> Add task</button></header>
+      <header className="workspace-heading"><div><p className="eyebrow">Your work</p><h1 id="tasks-heading">Tasks</h1><p>Check off a task to complete it, or open it to edit the details.</p></div><button className="page-primary-action" type="button" onClick={() => openTaskComposer()}><Plus size={13} /> Add task</button></header>
       <article className="pane tasks-workspace">
         {initial && hermes.failed ? <p className="task-sync-note task-sync-note--warning"><Bot size={13} /> Hermes could not refresh. Fox Focus tasks are unaffected.</p> : initial && hermes.loading && !hermesBoard ? <p className="task-sync-note"><Bot size={13} /> Checking Hermes tasks…</p> : null}
         <nav className="task-category-strip" aria-label="Task categories">{taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}</nav>
         {hermesBoard && (taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory) && taskFilter !== "all" && taskFilter !== "open" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks appear in All, Open, or Done because they do not have Fox Focus deadlines yet.</p> : null}
         <div className="task-compact-toolbar">
           <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
-          <span className="task-view-count" role="status" aria-live="polite">{shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
+          <span className="task-view-count" role="status" aria-live="polite">{taskFilterLabel(taskFilter)} · {shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
           {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
         </div>
         <p className="planned-note"><CalendarDays size={13} /> {plannedTaskCount ? `${plannedTaskCount} planned task${plannedTaskCount === 1 ? "" : "s"} on the local calendar.` : "Open a task to give it calendar time."}</p>
@@ -1956,9 +1980,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <div className="review-workbench">
           <div className="inbox-list inbox-list--lifeboard">
             {reviewItems.map((item) => <div className={`inbox-list-row${item.status === "handled" ? " inbox-list-row--handled" : ""}`} key={item.id}><button className={`inbox-list-item${selectedInbox?.id === item.id ? " inbox-list-item--selected" : ""}`} type="button" aria-pressed={selectedInbox?.id === item.id} onClick={() => selectInbox(item)}><span className={`calendar-event-mark calendar-event-mark--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><span className={`review-status review-status--${item.status}`}>{formatStatus(item.status)}</span></button><button className={`inbox-complete${item.status === "handled" ? " inbox-complete--done" : ""}`} type="button" onClick={() => toggleInboxHandled(item)} aria-label={`${item.status === "handled" ? "Return" : "Mark"} ${item.title} ${item.status === "handled" ? "to review" : "as handled"}`}>{item.status === "handled" ? <Check size={13} /> : <Circle size={15} />}</button></div>)}
-            {!reviewItems.length ? <p className="empty-line">Inbox is clear.</p> : null}
+            {!reviewItems.length ? <div className="empty-state"><Inbox size={22} /><strong>Inbox is clear</strong><p>New captures and proposals will appear here.</p></div> : null}
           </div>
-          {selectedInbox ? <div className="review-detail"><div className="review-queue-nav"><span>{selectedInboxIndex + 1} of {reviewItems.length}</span><div><button type="button" onClick={() => moveInboxSelection(-1)} disabled={selectedInboxIndex <= 0} aria-label="Previous review item"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveInboxSelection(1)} disabled={selectedInboxIndex >= reviewItems.length - 1} aria-label="Next review item"><ChevronRight size={14} /></button></div></div><div className="review-item-meta"><i className={`area-dot area-dot--${areaClass(selectedInbox.accent)}`} /><span>{selectedInbox.actor}</span><span className={`review-status review-status--${selectedInbox.status}`}>{formatStatus(selectedInbox.status)}</span></div><h3>{selectedInbox.title}</h3><p>{selectedInbox.summary}</p><div className="evidence-card evidence-card--compact"><span>Source evidence</span><strong>{selectedInbox.source}</strong><p>No connected email body is available in this review surface.</p></div>{selectedInbox.draft ? <div className="saved-draft"><span>Saved draft · not sent</span><pre>{selectedInbox.draft}</pre></div> : null}{selectedInbox.moreWork ? <div className="saved-request"><span>Feedback note · not delivered</span><p>{selectedInbox.moreWork}</p></div> : null}<div className="review-next-step"><span>Choose the next step</span><p>Local outcomes happen now. Nothing is sent back to its source.</p></div>{selectedInbox.status === "handled" ? <div className="review-detail-actions"><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><RotateCcw size={13} /> Return to review</button></div> : <div className="review-detail-actions"><button className="page-primary-action" type="button" onClick={() => acceptInbox("task")}><ListTodo size={13} /> Create task</button><button className="secondary-action" type="button" onClick={() => openDraft(selectedInbox)}><Pencil size={13} /> Draft reply</button><button className="secondary-action" type="button" onClick={() => acceptInbox("event")}><CalendarDays size={13} /> Schedule block</button><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><CheckCircle2 size={13} /> No action</button></div>}<div className="agent-request agent-request--compact"><label htmlFor="more-work">Feedback note</label><textarea id="more-work" value={agentRequest} onChange={(event) => setAgentRequest(event.target.value)} placeholder="What should Hermes check or change later?" /><button className="quiet-panel-action" type="button" onClick={saveMoreWork}>Save note</button></div></div> : null}
+          {selectedInbox ? <div className="review-detail"><div className="review-queue-nav"><span>{selectedInboxIndex + 1} of {reviewItems.length}</span><div><button type="button" onClick={() => moveInboxSelection(-1)} disabled={selectedInboxIndex <= 0} aria-label="Previous review item"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveInboxSelection(1)} disabled={selectedInboxIndex >= reviewItems.length - 1} aria-label="Next review item"><ChevronRight size={14} /></button></div></div><div className="review-item-meta"><i className={`area-dot area-dot--${areaClass(selectedInbox.accent)}`} /><span>{selectedInbox.actor}</span><span className={`review-status review-status--${selectedInbox.status}`}>{formatStatus(selectedInbox.status)}</span></div><h2>{selectedInbox.title}</h2><p>{selectedInbox.summary}</p><div className="evidence-card evidence-card--compact"><span>Source evidence</span><strong>{selectedInbox.source}</strong><p>No connected email body is available in this review surface.</p></div>{selectedInbox.draft ? <div className="saved-draft"><span>Saved draft · not sent</span><pre>{selectedInbox.draft}</pre></div> : null}{selectedInbox.moreWork ? <div className="saved-request"><span>Feedback note · not delivered</span><p>{selectedInbox.moreWork}</p></div> : null}<div className="review-next-step"><span>Choose the next step</span><p>Local outcomes happen now. Nothing is sent back to its source.</p></div>{selectedInbox.status === "handled" ? <div className="review-detail-actions"><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><RotateCcw size={13} /> Return to review</button></div> : <div className="review-detail-actions"><button className="page-primary-action" type="button" onClick={() => acceptInbox("task")}><ListTodo size={13} /> Create task</button><button className="secondary-action" type="button" onClick={() => openDraft(selectedInbox)}><Pencil size={13} /> Draft reply</button><button className="secondary-action" type="button" onClick={() => acceptInbox("event")}><CalendarDays size={13} /> Schedule block</button><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><CheckCircle2 size={13} /> No action</button></div>}<div className="agent-request agent-request--compact"><label htmlFor="more-work">Feedback note</label><textarea id="more-work" value={agentRequest} onChange={(event) => setAgentRequest(event.target.value)} placeholder="What should Hermes check or change later?" /><button className="quiet-panel-action" type="button" onClick={saveMoreWork}>Save note</button></div></div> : null}
         </div>
       </article>
     </section>;
@@ -1990,7 +2014,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   return (
     <div className="control-room">
-      <header className="command-bar" aria-hidden={isOverlayOpen}>
+      <header className="command-bar" aria-hidden={isOverlayOpen} inert={isOverlayOpen}>
         <div className="brand-lockup">
           <span className="fox-mark" aria-hidden="true"><span /><span /></span>
           <div><strong>Fox Focus</strong></div>
@@ -2002,18 +2026,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => openWorkspaceView("review")}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
         </nav>
         <div className="command-actions">
-          <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
+          <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} />{reminderCount ? <b>{reminderCount}</b> : null}<span>Reminders</span></button>
           <button className="quiet-action theme-action" type="button" onClick={toggleTheme} aria-label={`Switch to ${themeTarget} theme`} title={`Switch to ${themeTarget} theme`}>{resolvedTheme === "black" ? <Sun size={15} /> : <Moon size={15} />}</button>
           <button className="capture-button" type="button" onClick={() => openTaskComposer()}><Plus size={15} /><span>Add task</span></button>
         </div>
       </header>
 
-      {saveError || statusMessage || completionUndo || reviewUndo ? <div className={`status-footer${saveError ? " status-footer--error" : ""}`} role={saveError ? "alert" : "status"} aria-live={saveError ? "assertive" : "polite"} aria-hidden={isOverlayOpen}>
+      {saveError || statusMessage || completionUndo || reviewUndo ? <div className={`status-footer${saveError ? " status-footer--error" : ""}`} role={saveError ? "alert" : "status"} aria-live={saveError ? "assertive" : "polite"} aria-hidden={isOverlayOpen} inert={isOverlayOpen}>
         <span />
         <p>{saveError ?? statusMessage}</p>
         {completionUndo ? <button className="status-undo" type="button" onClick={undoTaskCompletion}>Undo</button> : reviewUndo ? <button className="status-undo" type="button" onClick={undoInboxChange}>Undo</button> : null}
+        {!saveError ? <button className="status-dismiss" type="button" aria-label="Dismiss notification" onClick={() => { setStatusMessage(""); setCompletionUndo(null); setReviewUndo(null); }}><X size={16} /></button> : null}
       </div> : null}
-      <main aria-hidden={isOverlayOpen}>{renderWorkspaceView()}</main>
+      <main aria-hidden={isOverlayOpen} inert={isOverlayOpen}>{renderWorkspaceView()}</main>
 
       {hermesCompletionApproval ? (
         <DialogFrame title="Confirm Hermes completion" onClose={() => setHermesCompletionApproval(null)} className="editor-dialog--confirmation">
@@ -2044,7 +2069,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             <div className="editor-grid">
               <label className="field field--full"><span>Task · managed in Hermes</span><input value={editingHermesTask.title} readOnly /></label>
               <label className="field field--full"><span>Status · managed in Hermes</span><input value={hermesLabels[editingHermesTask.status]} readOnly /></label>
-              <label className="field"><span>Area</span><select autoFocus value={hermesTaskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setHermesTaskDraft(current => ({ ...current, area: value })); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
+              <label className="field"><span>Area</span><select data-autofocus value={hermesTaskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setHermesTaskDraft(current => ({ ...current, area: value })); }}>{areas.map(area => <option value={area} key={area}>{area}</option>)}</select></label>
               <label className="field"><span>Deadline</span><select value={hermesTaskDraft.due} onChange={(event) => setHermesTaskDraft(current => ({ ...current, due: event.target.value }))}><option value="Today">Today</option><option value="Tomorrow">Tomorrow</option><option value="Friday">Friday</option><option value="Waiting">Waiting</option><option value="No deadline">No deadline</option></select></label>
               <label className="field"><span>Duration</span><select value={hermesTaskDraft.duration} onChange={(event) => setHermesTaskDraft(current => ({ ...current, duration: event.target.value }))}><option value="5 min">5 min</option><option value="10 min">10 min</option><option value="20 min">20 min</option><option value="30 min">30 min</option><option value="40 min">40 min</option><option value="45 min">45 min</option><option value="60 min">60 min</option></select></label>
               <label className="field"><span>Task state</span><select value={hermesTaskDraft.state} onChange={(event) => { const value = event.target.value; if (value === "up-next" || value === "waiting") setHermesTaskDraft(current => ({ ...current, state: value })); }}><option value="up-next">Up next</option><option value="waiting">Waiting</option></select></label>
@@ -2070,7 +2095,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {modalTaskGoogleLink ? <div className="source-notice"><Link2 size={14} /> Fox Focus owns this task. Its existing Google task can only be completed or reopened after a preview.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
             {modalTaskAction && modalTaskAction.status !== "succeeded" ? <div className={`task-action-notice task-action-notice--${modalTaskAction.status}`}><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.lastError ?? "The approved Google update is still being checked."}</span></div> : null}
             <div className="editor-grid editor-grid--quick-task">
-              <label className="field field--full"><span>Task</span><input autoFocus required value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
+              <label className="field field--full"><span>Task</span><input data-autofocus required value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
               <label className="field field--full"><span>Deadline</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
@@ -2083,7 +2108,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Planned time</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value }))} /></label>
               <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>
             </div> : null}
-            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{modalTaskAction?.status === "failed" && modalTaskAction.result?.retryable === true ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Retry Google</button> : null}{modalTaskAction?.status === "running" ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Check Google</button> : null}{modalTask && modalTaskGoogleLink && (modalTaskAction?.status === "failed" || modalTaskAction?.status === "conflict") ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void previewLinkedTaskAction(modalTask, modalTask.completed ? "completed" : "open"); }}><Link2 size={13} /> Send current state</button> : null}{modalTaskAction?.status === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Refresh Google</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
+            <div className="editor-footer"><span>{taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Add a planned time in More options to put this task on your calendar."}</span><div>{modalTaskAction?.status === "failed" && modalTaskAction.result?.retryable === true ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Retry Google</button> : null}{modalTaskAction?.status === "running" ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void executeTaskAction(modalTaskAction, true); }}><RotateCcw size={13} /> Check Google</button> : null}{modalTask && modalTaskGoogleLink && (modalTaskAction?.status === "failed" || modalTaskAction?.status === "conflict") ? <button className="secondary-action" type="button" disabled={taskActionBusy} onClick={() => { setModal(null); void previewLinkedTaskAction(modalTask, modalTask.completed ? "completed" : "open"); }}><Link2 size={13} /> Send current state</button> : null}{modalTaskAction?.status === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Refresh Google</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save task</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -2099,7 +2124,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
             {modalInbox ? <div className="source-notice"><Inbox size={14} /> Capturing from <strong>{modalInbox.source}</strong>. The local block keeps that source.</div> : null}
             <div className="editor-grid">
-              <label className="field field--full"><span>Block title</span><input autoFocus value={eventDraft.title} onChange={(event) => setEventDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What belongs in the timetable?" /></label>
+              <label className="field field--full"><span>Block title</span><input data-autofocus value={eventDraft.title} onChange={(event) => setEventDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What belongs in the timetable?" /></label>
               <label className="field field--full"><span>Location or context</span><input value={eventDraft.subtitle} onChange={(event) => setEventDraft((current) => ({ ...current, subtitle: event.target.value }))} placeholder="Optional note, location, or call link" /></label>
               <label className="field"><span>Area</span><select value={eventDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setEventDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
               <label className="field"><span>Day</span><input type="date" required value={eventDraft.date} onChange={(event) => setEventDraft((current) => ({ ...current, date: event.target.value }))} /></label>
@@ -2121,7 +2146,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           </div>
           {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
           <p className="draft-context">This stays in the local Inbox. It is not a send screen.</p>
-          <label className="field"><span>Draft reply</span><textarea autoFocus value={draftText} onChange={(event) => setDraftText(event.target.value)} /></label>
+          <label className="field"><span>Draft reply</span><textarea data-autofocus value={draftText} onChange={(event) => setDraftText(event.target.value)} /></label>
           <div className="editor-footer"><span>Source remains attached for review.</span><div><button className="secondary-action" type="button" onClick={() => setModal(null)}>Keep reviewing</button><button className="submit-button" type="button" onClick={saveDraft}><Check size={14} /> Save draft</button></div></div>
         </DialogFrame>
       ) : null}
@@ -2133,7 +2158,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {allReminders.map((reminder) => <div className="reminder-row" key={reminder.id}><Bell size={14} /><span><strong>{reminder.title}</strong><small>{reminder.when} · {reminder.targetId.startsWith("hermes:") ? "Hermes task · " : ""}{reminder.firedAt ? "fired" : reminder.fireAt ? "scheduled" : "needs a planned time"}</small></span></div>)}
             {!allReminders.length ? <p className="empty-line">No local reminders yet.</p> : null}
           </div>
-          <div className="editor-footer"><span>{pushSubscribed ? "Notifications can arrive when Fox Focus is closed." : "In-tab reminders still work while Fox Focus is open."}</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}{pushSubscribed ? <button className="mini-action" type="button" onClick={() => void turnOffDeviceNotifications()}>Turn off</button> : <button className="secondary-action" type="button" disabled={notificationPermission === "denied" || notificationPermission === "unsupported"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button>}<button className="submit-button" type="button" onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
+          <div className="editor-footer"><span>{pushSubscribed ? "Notifications can arrive when Fox Focus is closed." : "In-tab reminders still work while Fox Focus is open."}</span><div className="reminder-footer-actions">{notificationStatus ? <p className="notification-status">{notificationStatus}</p> : null}{pushSubscribed ? <button className="mini-action" type="button" onClick={() => void turnOffDeviceNotifications()}>Turn off</button> : <button className="secondary-action" type="button" disabled={notificationPermission === "denied" || notificationPermission === "unsupported"} onClick={() => void requestNotificationPermission()}>Enable device notifications</button>}<button className="submit-button" type="button" disabled={!allReminders.length} onClick={testReminder}><Bell size={14} /> Preview first reminder</button></div></div>
         </DialogFrame>
       ) : null}
 

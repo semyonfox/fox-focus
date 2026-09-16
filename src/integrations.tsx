@@ -1,5 +1,5 @@
 import { CalendarDays, CheckCircle2, Link2, ListTodo, RefreshCw, ShieldCheck, X } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { dublinDateKey, isDateKey } from './calendar-time.ts';
 import { areaForList, filterCalendarContextByDateRange, listAreaKey } from './integration-model.ts';
 import {
@@ -213,14 +213,40 @@ export function IntegrationsDrawer({
   const [adoption, setAdoption] = useState<AdoptionPreview | null>(null);
   const [adoptionSourceRecord, setAdoptionSourceRecord] = useState<ImportedRecord | null>(null);
   const [adopting, setAdopting] = useState<number | null>(null);
+  const [approvingAdoption, setApprovingAdoption] = useState(false);
   const [linkTargetId, setLinkTargetId] = useState('');
+  const approvalInFlight = useRef(false);
+  const adoptionTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const adoptionDestinationRef = useRef<HTMLSelectElement | null>(null);
+  const adoptionApproveRef = useRef<HTMLButtonElement | null>(null);
+  const drawerCloseRef = useRef<HTMLButtonElement | null>(null);
+
+  function restoreAdoptionFocus() {
+    window.requestAnimationFrame(() => {
+      if (adoptionTriggerRef.current?.isConnected) adoptionTriggerRef.current.focus();
+      else drawerCloseRef.current?.focus();
+    });
+  }
+
   useEffect(() => {
     if (open) return;
     setAdoption(null);
     setAdoptionSourceRecord(null);
     setLinkTargetId('');
     setMessage(null);
+    setApprovingAdoption(false);
+    approvalInFlight.current = false;
   }, [open]);
+
+  useEffect(() => {
+    if (!open || approvingAdoption) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (adoption) adoptionApproveRef.current?.focus();
+      else if (adoptionSourceRecord) adoptionDestinationRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [adoption, adoptionSourceRecord, approvingAdoption, open]);
+
   if (!open) return null;
 
   async function sync(provider: Provider) {
@@ -242,6 +268,7 @@ export function IntegrationsDrawer({
   }
 
   async function previewAdoption(record: ImportedRecord, targetTaskId?: string) {
+    if (approvalInFlight.current) return;
     setAdopting(record.id);
     setMessage(null);
     try {
@@ -265,7 +292,9 @@ export function IntegrationsDrawer({
   }
 
   async function approveAdoption() {
-    if (!adoption) return;
+    if (!adoption || approvalInFlight.current) return;
+    approvalInFlight.current = true;
+    setApprovingAdoption(true);
     setMessage(null);
     try {
       await beforeWorkspaceMutation?.();
@@ -281,8 +310,12 @@ export function IntegrationsDrawer({
         : 'Task adopted. Fox Focus now keeps its history.');
       onWorkspaceChanged?.(snapshot);
       await refresh();
+      restoreAdoptionFocus();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Could not adopt task.');
+    } finally {
+      approvalInFlight.current = false;
+      setApprovingAdoption(false);
     }
   }
 
@@ -315,25 +348,25 @@ export function IntegrationsDrawer({
   const selectedLinkTarget = linkTargetId ? nativeTasks.find(task => task.id === linkTargetId) : undefined;
 
   return (
-    <div className="overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="overlay" role="presentation" onMouseDown={(event) => { if (!approvingAdoption && event.target === event.currentTarget) onClose(); }}>
       <section className="editor-dialog editor-dialog--drawer integrations-drawer" role="dialog" aria-modal="true" aria-label="Calendar and task connections">
         <div className="editor-heading">
           <div className="composer-icon"><Link2 size={17} /></div>
           <div><p className="eyebrow">Connections</p><h2>Calendars &amp; legacy tasks</h2></div>
-          <button className="close-composer" type="button" onClick={onClose} aria-label="Close connections"><X size={17} /></button>
+          <button ref={drawerCloseRef} className="close-composer" type="button" disabled={approvingAdoption} onClick={onClose} aria-label="Close connections"><X size={17} /></button>
         </div>
         <p className="drawer-intro">Calendar context stays read-only. You can adopt a legacy task into Fox Focus, then approve each completion or reopen sent to that exact Google task.</p>
         <div className="integration-security"><ShieldCheck size={15} /><span>New Fox Focus tasks never appear in Google. Delete and clear actions are not available.</span></div>
-        {message ? <p className="integration-message" role="status">{message}</p> : null}
+        {message ? <p className="integration-message" role="status" aria-live="polite" aria-atomic="true">{message}</p> : null}
         {failed ? <p className="integration-message integration-message--error" role="status">Could not load connection status. Your provider data was not changed.</p> : null}
-        {adoptionSourceRecord && !adoption ? <section className="saved-draft" aria-label="Choose task adoption destination">
+        {adoptionSourceRecord && !adoption ? <section className="saved-draft" aria-label="Choose task adoption destination" aria-busy={adopting === adoptionSourceRecord.id}>
           <span>Prepare adoption preview</span>
           <p><strong>Source:</strong> {adoptionSourceRecord.title} · {providerLabel(adoptionSourceRecord.provider)} · {adoptionSourceRecord.containerName}</p>
-          <div className="integration-link-choice"><label><span>Destination in Fox Focus</span><select value={linkTargetId} onChange={(event) => setLinkTargetId(event.target.value)}><option value="">Create a separate native task</option>{linkableTasks.map(task => <option value={task.id} key={task.id}>{task.title}</option>)}</select></label><button className="submit-button" type="button" disabled={adopting === adoptionSourceRecord.id} onClick={() => void previewAdoption(adoptionSourceRecord, linkTargetId || undefined)}>{adopting === adoptionSourceRecord.id ? 'Preparing…' : 'Review change'}</button></div>
+          <div className="integration-link-choice"><label><span>Destination in Fox Focus</span><select ref={adoptionDestinationRef} value={linkTargetId} onChange={(event) => setLinkTargetId(event.target.value)}><option value="">Create a separate native task</option>{linkableTasks.map(task => <option value={task.id} key={task.id}>{task.title}</option>)}</select></label><button className="submit-button" type="button" disabled={adopting === adoptionSourceRecord.id} onClick={() => void previewAdoption(adoptionSourceRecord, linkTargetId || undefined)}>{adopting === adoptionSourceRecord.id ? 'Preparing…' : 'Review change'}</button></div>
           {selectedLinkTarget ? <p><strong>Compare:</strong> source is {adoptionSourceRecord.status ?? 'unknown'}{adoptionSourceRecord.dueOn ? `, due ${formatDate(adoptionSourceRecord.dueOn)}` : ', no due day'}; “{selectedLinkTarget.title}” is {selectedLinkTarget.completed ? 'completed' : selectedLinkTarget.state}{selectedLinkTarget.deadlineDate ? `, due ${formatDate(selectedLinkTarget.deadlineDate)}` : `, ${selectedLinkTarget.due.toLowerCase()}`}.</p> : null}
-          <div className="integration-provider-actions"><button className="secondary-action" type="button" onClick={() => { setAdoptionSourceRecord(null); setLinkTargetId(''); }}>Cancel</button></div>
+          <div className="integration-provider-actions"><button className="secondary-action" type="button" onClick={() => { setAdoptionSourceRecord(null); setLinkTargetId(''); restoreAdoptionFocus(); }}>Cancel</button></div>
         </section> : null}
-        {adoption ? <section className="saved-draft" aria-label="Task adoption preview">
+        {adoption ? <section className="saved-draft" aria-label="Task adoption preview" aria-busy={approvingAdoption}>
           <span>Before and after</span>
           <p><strong>Before:</strong> {String(adoption.before.title ?? adoption.after.title)} stays in {String(adoption.before.ownership ?? 'the source')}.</p>
           {typeof adoption.before.connectionId === 'string' ? <p>Source connection {adoption.before.connectionId.slice(0, 8)} · {String(adoption.before.list ?? 'task list')} · task {String(adoption.before.externalId ?? 'unknown')}</p> : null}
@@ -344,10 +377,10 @@ export function IntegrationsDrawer({
           <p>{adoption.after.externalLinks?.find(link => link.provider === (adoption.before.provider === 'microsoft' ? 'microsoft_todo' : 'google_tasks'))?.policy === 'completion_only'
             ? 'Its existing Google link may only complete or reopen this exact source task, after another approval preview.'
             : 'The source link is kept as read-only provenance.'}</p>
-          {adoptionRecord && linkableTasks.length ? <div className="integration-link-choice"><label><span>Use an existing Fox Focus task instead</span><select value={linkTargetId} onChange={(event) => setLinkTargetId(event.target.value)}><option value="">Create a separate native task</option>{linkableTasks.map(task => <option value={task.id} key={task.id}>{task.title}</option>)}</select></label><button className="secondary-action" type="button" disabled={adopting === adoptionRecord.id || (linkTargetId || '') === String(adoption.before.targetTaskId ?? '')} onClick={() => void previewAdoption(adoptionRecord, linkTargetId || undefined)}>Update preview</button></div> : null}
+          {adoptionRecord && linkableTasks.length ? <div className="integration-link-choice"><label><span>Use an existing Fox Focus task instead</span><select value={linkTargetId} disabled={approvingAdoption} onChange={(event) => setLinkTargetId(event.target.value)}><option value="">Create a separate native task</option>{linkableTasks.map(task => <option value={task.id} key={task.id}>{task.title}</option>)}</select></label><button className="secondary-action" type="button" disabled={approvingAdoption || adopting === adoptionRecord.id || (linkTargetId || '') === String(adoption.before.targetTaskId ?? '')} onClick={() => void previewAdoption(adoptionRecord, linkTargetId || undefined)}>Update preview</button></div> : null}
           <div className="integration-provider-actions">
-            <button className="secondary-action" type="button" onClick={() => { setAdoption(null); setAdoptionSourceRecord(null); setLinkTargetId(''); }}>Cancel</button>
-            <button className="submit-button" type="button" onClick={() => void approveAdoption()}>Adopt into Fox Focus</button>
+            <button className="secondary-action" type="button" disabled={approvingAdoption} onClick={() => { setAdoption(null); setAdoptionSourceRecord(null); setLinkTargetId(''); restoreAdoptionFocus(); }}>Cancel</button>
+            <button ref={adoptionApproveRef} className="submit-button" type="button" disabled={approvingAdoption} onClick={() => void approveAdoption()}>{approvingAdoption ? 'Adopting…' : 'Adopt into Fox Focus'}</button>
           </div>
         </section> : null}
         <div className="integration-provider-list">
@@ -385,11 +418,11 @@ export function IntegrationsDrawer({
           </div>
           <div className="integration-record-section">
             <div><ListTodo size={15} /><strong>Imported tasks</strong></div>
-            {tasks.map(record => <article className="integration-record" key={record.id}><span><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {record.containerName} · {recordWhen(record)}{record.status === 'completed' ? ' · completed' : ''}</small></span>{record.adoptedTaskId ? <span className="connection-state"><CheckCircle2 size={13} /> In Fox Focus</span> : <button className="mini-action" type="button" onClick={() => { setAdoption(null); setAdoptionSourceRecord(record); setLinkTargetId(''); setMessage(null); }}>Adopt</button>}</article>)}
+            {tasks.map(record => <article className="integration-record" key={record.id}><span><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {record.containerName} · {recordWhen(record)}{record.status === 'completed' ? ' · completed' : ''}</small></span>{record.adoptedTaskId ? <span className="connection-state"><CheckCircle2 size={13} /> In Fox Focus</span> : <button className="mini-action" type="button" disabled={approvingAdoption} onClick={(event) => { adoptionTriggerRef.current = event.currentTarget; setAdoption(null); setAdoptionSourceRecord(record); setLinkTargetId(''); setMessage(null); }}>Adopt</button>}</article>)}
             {overview && !tasks.length ? <p className="empty-line">No tasks imported yet.</p> : null}
           </div>
         </div>
-        <div className="editor-footer"><span>Adoption copies task ownership into Fox Focus. Calendar imports stay source-owned.</span><button className="secondary-action" type="button" onClick={onClose}>Close</button></div>
+        <div className="editor-footer"><span>Adoption copies task ownership into Fox Focus. Calendar imports stay source-owned.</span><button className="secondary-action" type="button" disabled={approvingAdoption} onClick={onClose}>Close</button></div>
       </section>
     </div>
   );
