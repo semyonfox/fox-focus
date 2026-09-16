@@ -6,7 +6,7 @@ import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
 import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
 import { isDateKey } from '../src/calendar-time.ts';
-import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
+import { isHermesCompletionInput, isHermesTaskAnnotationInput, type HermesFeed } from '../src/hermes-model.ts';
 import {
   isBriefingUpsertInput,
   isEmailSendApprovalInput,
@@ -605,11 +605,17 @@ export function createApp(
     store.deletePushSubscription(body.endpoint);
     return c.json({ ok: true });
   });
-  app.get('/api/v1/hermes', (c) => c.json(hermes?.feed() ?? {
+  // migrated tasks live in Google Tasks now and are frozen here, so the board stops listing them
+  const withoutMigratedHermesTasks = (feed: HermesFeed): HermesFeed => {
+    if (!feed.board) return feed;
+    const board = feed.board;
+    return { ...feed, board: { ...board, tasks: board.tasks.filter(task => !store.isHermesTaskCoveredByMigration(board.slug, task.id)) } };
+  };
+  app.get('/api/v1/hermes', (c) => c.json(hermes ? withoutMigratedHermesTasks(hermes.feed()) : {
     state: 'unavailable', checkedAt: new Date().toISOString(), board: null, completionAvailable: false,
   }));
   app.post('/api/v1/hermes/sync', async (c) => c.json(
-    hermes ? await hermes.poll() : {
+    hermes ? withoutMigratedHermesTasks(await hermes.poll()) : {
       state: 'unavailable', checkedAt: new Date().toISOString(), board: null, completionAvailable: false,
     },
   ));

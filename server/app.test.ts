@@ -1371,6 +1371,8 @@ test('task migration preview is read-only, rejects stale approval, and replays o
       body: JSON.stringify({ source: 'hermes', externalId: 'migration-hermes-source' }),
     });
     assert.equal(frozenAdoption.status, 409);
+    const frozenFeed = await app.request('/api/v1/hermes', { headers: { authorization } });
+    assert.deepEqual((await frozenFeed.json() as HermesFeed).board?.tasks, []);
 
     const replay = await app.request('/api/v1/task-migrations/approve', {
       method: 'POST', headers: { authorization, 'Content-Type': 'application/json' },
