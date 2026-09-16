@@ -1321,7 +1321,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       const start = eventStartInstant(event, todayDate);
       return start !== null && Date.parse(start) > now.getTime();
     }) ?? visibleCalendarEvents[0] ?? null;
-  const selectedEventTask = selectedEvent?.taskId ? taskById.get(selectedEvent.taskId) : undefined;
   const selectedEventHermesTask = selectedEvent?.taskId?.startsWith("hermes:")
     ? hermesTasks.find(task => `hermes:${task.id}` === selectedEvent.taskId)
     : undefined;
@@ -2928,7 +2927,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <small>{!event.editable ? <em className="agenda-origin agenda-origin--imported">Imported</em> : null}{event.subtitle}</small>
         </span>
         <span className="schedule-duration">{formatDuration(event.duration)}</span>
-        <ChevronRight className="schedule-arrow" size={14} />
       </button>
     );
   }
@@ -2940,11 +2938,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           return start !== null && Date.parse(start) > now.getTime();
         })
       : -1;
-    const rows: ReactNode[] = events.map((event, index) => renderScheduleRow(event, date, showDate, index === nextIndex));
-    if (date !== todayDate) return rows;
-    const lineIndex = nextIndex === -1 ? rows.length : nextIndex;
-    rows.splice(lineIndex, 0, <div className="calendar-now-line" role="separator" aria-label={`Now ${dublinTimeValue(now)}`} key={`now:${date}`}><span>Now {dublinTimeValue(now)}</span><i /></div>);
+    const lineIndex = date !== todayDate ? -1 : nextIndex === -1 ? events.length : nextIndex;
+    const nowLine = <div className="calendar-now-line" role="separator" aria-label={`Now ${dublinTimeValue(now)}`} key={`now:${date}`}><span>Now {dublinTimeValue(now)}</span><i /></div>;
+    // the open event's detail sits right under its row, once, on the first day it shows up
+    const detailDate = selectedEvent ? calendarMode === "day" ? selectedDate : calendarDateWindow(selectedDate, 0, 6).find((day) => eventOccursOnDate(selectedEvent, day, todayDate)) : undefined;
+    const rows: ReactNode[] = [];
+    events.forEach((event, index) => {
+      if (index === lineIndex) rows.push(nowLine);
+      rows.push(renderScheduleRow(event, date, showDate, index === nextIndex));
+      if (event.id === selectedEvent?.id && date === detailDate) rows.push(renderEventDetail(event));
+    });
+    if (lineIndex === events.length) rows.push(nowLine);
     return rows;
+  }
+
+  function renderEventDetail(event: TimelineEvent) {
+    const task = event.taskId ? taskById.get(event.taskId) : undefined;
+    const taskHasRow = task ? taskRowById.has(task.id) : false;
+    return <div className="agenda-detail" key={`detail:${event.id}`}><div className="agenda-detail-main"><span><em className={`agenda-origin${event.editable ? " agenda-origin--local" : " agenda-origin--imported"}${task?.completed ? " agenda-origin--done" : ""}`}>{task?.completed ? "Completed task" : taskHasRow ? "Task plan" : event.editable ? "Local block" : "Imported calendar"}</em><small>{formatDublinDateKey(eventDateKey(event, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(event)} · {formatDuration(event.duration)} · {event.source ?? event.area}</small></span></div><div className="agenda-detail-actions">{task && taskHasRow ? <><button className="page-primary-action" type="button" onClick={() => openTaskJobComposer(task, "Help me plan or update this task.")}><MessageSquare size={13} /> Ask Hermes</button><button className="secondary-action" type="button" onClick={() => openTaskComposer(task)}><Pencil size={13} /> Edit task plan</button></> : <>{task ? <button className="secondary-action" type="button" onClick={() => openTaskComposer(task)}><Pencil size={12} /> Edit linked task</button> : null}{event.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(event)}><Pencil size={13} /> Edit block</button> : <button className="page-primary-action" type="button" onClick={() => askHermesAboutEvent(event)}><MessageSquare size={13} /> Ask Hermes</button>}</>}</div></div>;
   }
 
   function askHermesAboutEvent(event: TimelineEvent) {
@@ -3097,7 +3108,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           })}
           {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>{calendarMode === "day" ? "No events on this day." : "No events in these seven days."}</span></div> : null}
         </div>
-        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEventTask && taskRowById.has(selectedEventTask.id) ? "Task plan" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.source ?? selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask && taskRowById.has(selectedEventTask.id) ? <><button className="page-primary-action" type="button" onClick={() => openTaskJobComposer(selectedEventTask, "Help me plan or update this task.")}><MessageSquare size={13} /> Ask Hermes</button><button className="secondary-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={13} /> Edit task plan</button></> : <>{selectedEventTask ? <button className="secondary-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit block</button> : <button className="page-primary-action" type="button" onClick={() => askHermesAboutEvent(selectedEvent)}><MessageSquare size={13} /> Ask Hermes</button>}</>}</div></div> : null}
       </article>
     </section>;
   }
@@ -3353,7 +3363,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     <div className="control-room">
       <header className="command-bar" aria-hidden={isOverlayOpen} inert={isOverlayOpen}>
         <div className="brand-lockup">
-          <span className="fox-mark" aria-hidden="true"><span /><span /></span>
+          <img className="fox-mark" src="/favicon.svg" alt="" />
           <div><strong>Fox Focus</strong></div>
         </div>
         <nav className="workspace-nav" aria-label="Workspace views">
