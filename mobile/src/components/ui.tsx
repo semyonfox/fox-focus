@@ -4,6 +4,7 @@ import {
   type StyleProp, type TextInputProps, type TextStyle, type ViewStyle,
 } from "react-native";
 import type { DotTone } from "@/lib/derive";
+import { useDockScroll } from "@/lib/dock";
 import { useStore } from "@/lib/store";
 import { colors, font, radius, space } from "@/lib/theme";
 
@@ -32,10 +33,13 @@ export function T({ children, tone = "text", size = "body", bold = false, style,
 
 export function Screen({ children }: { children: ReactNode }) {
   const { loading, refresh } = useStore();
+  const onDockScroll = useDockScroll();
   return (
     <ScrollView
       style={styles.screen}
       contentContainerStyle={styles.screenContent}
+      onScroll={onDockScroll}
+      scrollEventThrottle={16}
       keyboardShouldPersistTaps="handled"
       refreshControl={
         <RefreshControl refreshing={loading} onRefresh={refresh} tintColor={colors.muted} colors={[colors.page]} progressBackgroundColor={colors.accent} />

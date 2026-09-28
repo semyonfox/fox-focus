@@ -1,7 +1,7 @@
 import { router, Tabs } from "expo-router";
 import { Pressable, Text } from "react-native";
-import { needsCount } from "@/lib/derive";
-import { useStore } from "@/lib/store";
+import { Dock } from "@/components/dock";
+import { DockProvider } from "@/lib/dock";
 import { colors, font, space } from "@/lib/theme";
 
 function SettingsLink() {
@@ -13,35 +13,23 @@ function SettingsLink() {
 }
 
 export default function TabsLayout() {
-  const { rows } = useStore();
-  const needs = needsCount(rows);
   return (
-    <Tabs
-      screenOptions={{
-        headerStyle: { backgroundColor: colors.page },
-        headerTintColor: colors.strong,
-        headerTitleStyle: { fontSize: 17 },
-        headerShadowVisible: false,
-        headerRight: () => <SettingsLink />,
-        sceneStyle: { backgroundColor: colors.page },
-        tabBarStyle: { backgroundColor: colors.page, borderTopColor: colors.line },
-        tabBarActiveTintColor: colors.strong,
-        tabBarInactiveTintColor: colors.faint,
-        tabBarIconStyle: { display: "none" },
-        tabBarLabelStyle: { fontSize: font.small, fontWeight: "500" },
-        tabBarLabelPosition: "beside-icon",
-      }}
-    >
-      <Tabs.Screen name="index" options={{ title: "Today" }} />
-      <Tabs.Screen name="tasks" options={{ title: "Tasks" }} />
-      <Tabs.Screen
-        name="inbox"
-        options={{
-          title: "Inbox",
-          tabBarBadge: needs || undefined,
-          tabBarBadgeStyle: { backgroundColor: colors.amber, color: colors.page, fontSize: font.tiny },
+    <DockProvider>
+      <Tabs
+        tabBar={(props) => <Dock {...props} />}
+        screenOptions={{
+          headerStyle: { backgroundColor: colors.page },
+          headerTintColor: colors.strong,
+          headerTitleStyle: { fontSize: 17 },
+          headerShadowVisible: false,
+          headerRight: () => <SettingsLink />,
+          sceneStyle: { backgroundColor: colors.page },
         }}
-      />
-    </Tabs>
+      >
+        <Tabs.Screen name="index" options={{ title: "Today" }} />
+        <Tabs.Screen name="tasks" options={{ title: "Tasks" }} />
+        <Tabs.Screen name="inbox" options={{ title: "Inbox" }} />
+      </Tabs>
+    </DockProvider>
   );
 }

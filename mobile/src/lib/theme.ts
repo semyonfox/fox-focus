@@ -9,6 +9,8 @@ export const colors = {
   strong: "#fafafa",
   muted: "#b0b0b0",
   faint: "#8c8c8c",
+  headerText: "#f0f0f0",
+  headerMuted: "rgba(240, 240, 240, 0.78)",
   accent: "#dedede",
   accentSoft: "#303030",
   blueSoft: "#282b31",
