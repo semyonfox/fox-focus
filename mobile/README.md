@@ -16,6 +16,19 @@ npm run typecheck
 
 `npm run web` gives a quick browser preview, but the server rejects cross-origin browser requests, so the preview can't sign in. Over-the-air updates only run in a real build.
 
+## Local Android APK
+
+On the server, install dependencies and build a signed arm64 APK:
+
+```bash
+npm ci
+./scripts/build-local-apk.sh
+```
+
+The APK is written to `~/.local/share/fox-focus-android/builds/`. Keep the existing signing files for future builds so a new APK installs over the previous one. Before each release, increase `android.versionCode` in `app.json`; change `version` when the release version changes.
+
+Publish a replacement with `server-stacks/fileshare/publish-file.py --replace-share share-BwUUvIqKYistR_cCPzdoO5WU --expires-days 365` and the new APK path. The stable [download link](https://fileshare.semyon.ie/app.apk.php?share=share-BwUUvIqKYistR_cCPzdoO5WU) then serves the new version. This local build has no EAS project or update URL configured, so install the new APK from that link to update it.
+
 ## Over-the-air updates
 
 One-time setup with an Expo account:

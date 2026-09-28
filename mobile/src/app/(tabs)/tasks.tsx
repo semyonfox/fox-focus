@@ -2,14 +2,17 @@ import type { TaskRow } from "@shared/row-model";
 import { useState } from "react";
 import { RefreshControl, SectionList, StyleSheet, View } from "react-native";
 import { TaskItem } from "@/components/rows";
+import { DockScene } from "@/components/dock";
 import { ConnectPrompt } from "@/components/status-line";
 import { Chip, Field, Section, T } from "@/components/ui";
 import { doneTasks, groupByWhen, listName, openTasks, taskTitle } from "@/lib/derive";
+import { useDock } from "@/lib/dock";
 import { useStore } from "@/lib/store";
 import { colors, space } from "@/lib/theme";
 
 export default function Tasks() {
   const { rows, loading, refresh, connection, ready } = useStore();
+  const dock = useDock();
   const [view, setView] = useState<"open" | "done">("open");
   const [query, setQuery] = useState("");
   const needle = query.trim().toLowerCase();
@@ -20,29 +23,33 @@ export default function Tasks() {
     : [{ title: "Done", data: doneTasks(rows).filter(matches).slice(0, 100) }].filter(section => section.data.length);
 
   return (
-    <SectionList
-      style={styles.list}
-      contentContainerStyle={styles.content}
-      sections={sections}
-      keyExtractor={task => task.id}
-      stickySectionHeadersEnabled={false}
-      keyboardShouldPersistTaps="handled"
-      refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} tintColor={colors.muted} colors={[colors.page]} progressBackgroundColor={colors.accent} />}
-      ListHeaderComponent={
-        <View>
-          <View style={styles.chips}>
-            <Chip label="Open" on={view === "open"} onPress={() => setView("open")} />
-            <Chip label="Done" on={view === "done"} onPress={() => setView("done")} />
+    <DockScene tab="tasks">
+      <SectionList
+        style={styles.list}
+        contentContainerStyle={styles.content}
+        sections={sections}
+        keyExtractor={task => task.id}
+        stickySectionHeadersEnabled={false}
+        keyboardShouldPersistTaps="handled"
+        onScroll={dock.onScroll}
+        scrollEventThrottle={16}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} tintColor={colors.muted} colors={[colors.page]} progressBackgroundColor={colors.accent} />}
+        ListHeaderComponent={
+          <View>
+            <View style={styles.chips}>
+              <Chip label="Open" on={view === "open"} onPress={() => setView("open")} />
+              <Chip label="Done" on={view === "done"} onPress={() => setView("done")} />
+            </View>
+            <Field value={query} onChangeText={setQuery} placeholder="Search" autoCorrect={false} returnKeyType="search" />
           </View>
-          <Field value={query} onChangeText={setQuery} placeholder="Search" autoCorrect={false} returnKeyType="search" />
-        </View>
-      }
-      renderSectionHeader={({ section }) => <Section title={section.title} count={section.data.length} />}
-      renderItem={({ item }) => <TaskItem task={item} />}
-      ListEmptyComponent={ready && !connection
-        ? <ConnectPrompt />
-        : <T size="small" tone="faint" style={styles.empty}>{needle ? "No matches" : "Nothing here"}</T>}
-    />
+        }
+        renderSectionHeader={({ section }) => <Section title={section.title} count={section.data.length} />}
+        renderItem={({ item }) => <TaskItem task={item} />}
+        ListEmptyComponent={ready && !connection
+          ? <ConnectPrompt />
+          : <T size="small" tone="faint" style={styles.empty}>{needle ? "No matches" : "Nothing here"}</T>}
+      />
+    </DockScene>
   );
 }
 
