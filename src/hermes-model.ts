@@ -7,6 +7,7 @@ import {
   type Area,
   type ReminderMode,
 } from "./model.ts";
+import { isDateKey } from "./calendar-time.ts";
 
 export const hermesStatuses = [
   "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
@@ -136,7 +137,7 @@ export function isHermesTask(value: unknown): value is HermesTask {
     (value.parentTitle === null || typeof value.parentTitle === "string") &&
     (value.sourceProvider === null || value.sourceProvider === "google") &&
     (value.sourceExternalId === null || typeof value.sourceExternalId === "string") &&
-    (value.sourceDueOn === null || typeof value.sourceDueOn === "string") &&
+    (value.sourceDueOn === null || isDateKey(value.sourceDueOn)) &&
     (value.sourceStatus === null || typeof value.sourceStatus === "string") &&
     (value.sourceContainerId === null || typeof value.sourceContainerId === "string") &&
     (value.sourceContainerName === null || typeof value.sourceContainerName === "string") &&

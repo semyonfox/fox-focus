@@ -271,16 +271,22 @@ function taskDueTimestamp(due: string, referenceDate: string | undefined): numbe
   if (due === "Today") return reference.getTime();
   if (due === "Tomorrow") return reference.getTime() + 86_400_000;
   if (due === "Friday") {
-    const daysUntilFriday = (5 - reference.getUTCDay() + 7) % 7 || 7;
+    const daysUntilFriday = (5 - reference.getUTCDay() + 7) % 7;
     return reference.getTime() + daysUntilFriday * 86_400_000;
   }
-  const match = due.match(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/);
+  const match = due.match(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/);
   if (!match) return null;
-  const [, dayText, monthText] = match;
+  const [, weekday, dayText, monthText] = match;
   const day = Number(dayText);
   const month = monthIndex[monthText];
-  const candidate = new Date(Date.UTC(reference.getUTCFullYear(), month, day));
-  return candidate.getUTCMonth() === month && candidate.getUTCDate() === day ? candidate.getTime() : null;
+  const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const candidates = [-1, 0, 1]
+    .map(offset => new Date(Date.UTC(reference.getUTCFullYear() + offset, month, day)))
+    .filter(candidate => candidate.getUTCMonth() === month && candidate.getUTCDate() === day &&
+      weekdays[candidate.getUTCDay()] === weekday);
+  candidates.sort((first, second) => Math.abs(first.getTime() - reference.getTime()) -
+    Math.abs(second.getTime() - reference.getTime()));
+  return candidates[0]?.getTime() ?? null;
 }
 
 /** Sorts earlier/current deadlines first, then newest-created, then task ID. */

@@ -10,6 +10,7 @@ import {
   deduplicatedProviderIdentity,
   isHermesCompletionInput,
   isHermesFeed,
+  isHermesTask,
   isHermesTaskAnnotationInput,
   type HermesMirrorSnapshot,
   type HermesRemoteTask,
@@ -162,6 +163,16 @@ function snapshot(tasks: HermesRemoteTask[], complete = true): HermesMirrorSnaps
     board: { slug: "personal-tasks", name: "Personal Tasks", total: tasks.length, tasks, sources: ["Unsorted"] },
   };
 }
+
+test("rejects malformed provider due dates before they reach date formatting", () => {
+  const task = {
+    ...remoteTask(),
+    area: "Personal", localState: "up-next", duration: "30 min", due: "No deadline",
+    scheduledAt: null, reminderMode: "none", reminderFireAt: null, annotationUpdatedAt: null,
+  };
+  assert.equal(isHermesTask({ ...task, sourceDueOn: "2026-09-12" }), true);
+  assert.equal(isHermesTask({ ...task, sourceDueOn: "2026-02-30" }), false);
+});
 
 test("keeps a still-open provider task visible after its Hermes mirror is done", () => {
   const openMirror = remoteTask({

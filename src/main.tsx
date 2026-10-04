@@ -1385,7 +1385,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const microsoftConfigured = integrations.overview?.providers.some((status) =>
     status.provider === "microsoft" && status.configured) === true;
   const importedTasks = (taskRows ? providerTaskRecords.filter((record) => record.provider !== "google") : providerTaskRecords)
-    .filter((record) => record.provider !== "microsoft" || microsoftConfigured);
+    .filter((record) => !record.adoptedTaskId && (record.provider !== "microsoft" || microsoftConfigured));
   const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
     importedTasks.some((task) => task.provider === provider) ||
     integrations.overview?.providers.some((status) => status.provider === provider && status.connection?.state === "connected") === true;
@@ -1477,6 +1477,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }));
   const combinedImportedTasks = visibleImportedTasks.filter((task) =>
     !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
+  const categoryDistinctImportedTasks = categoryImportedTasks.filter((task) =>
+    !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
   const visibleFoxTasks = visibleTasks.filter((task) => !googleTaskIds.has(task.id));
   const visibleGoogleTasks = visibleTasks.filter((task) => googleTaskIds.has(task.id));
   const taskSourceOptions: Array<{ id: TaskSource; label: string; count: number }> = [
@@ -1484,8 +1486,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     { id: localTaskSource, label: "Fox Focus", count: visibleFoxTasks.length },
   ];
   if (hermesBoard) taskSourceOptions.push({ id: hermesTaskSource, label: "Hermes", count: visibleHermesTasks.length });
-  if (googleTasksAvailable || visibleGoogleTasks.length) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleGoogleTasks.length });
-  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
+  if (googleTasksAvailable || visibleGoogleTasks.length) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleGoogleTasks.length + combinedImportedTasks.filter((task) => task.provider === "google").length });
+  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: combinedImportedTasks.filter((task) => task.provider === "microsoft").length });
   const isExternalOnlyScope = taskSource === microsoftTaskSource;
   const isHermesOnlyScope = taskSource === hermesTaskSource;
 
@@ -1500,7 +1502,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const shownImportedTasks = taskSource === allTaskSources
     ? combinedImportedTasks
     : taskSource === googleTaskSource || taskSource === microsoftTaskSource
-      ? visibleImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
+      ? combinedImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
       : [];
 
   const reminderCount = activeReminders.length;
@@ -1515,12 +1517,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
   const selectedTaskCategoryLabel = taskCategory === allTaskCategories ? "all areas" : taskCategory === unclassifiedTaskCategory ? "uncategorised" : taskCategory;
   const taskFilterCounts: Record<TaskFilter, number> = {
-    all: categoryLocalTasks.length + categoryHermesTasks.length,
-    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length,
-    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length,
-    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate) && !task.completed).length,
-    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length,
-    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length,
+    all: categoryLocalTasks.length + categoryHermesTasks.length + categoryDistinctImportedTasks.length,
+    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed").length,
+    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done" && hermesTaskDue(task, todayDate) === "Today").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed" && task.dueOn === todayDate).length,
+    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate) && !task.completed).length + categoryHermesTasks.filter((task) => Boolean(task.scheduledAt) && task.status !== "done").length,
+    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length + categoryHermesTasks.filter((task) => hermesTaskProjection(task, todayDate).state === "waiting").length,
+    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length + categoryDistinctImportedTasks.filter((task) => task.status === "completed").length,
   };
   const activeTaskFilterCount = Number(taskFilter !== "all") + Number(taskSource !== allTaskSources) + Number(taskSort !== "due");
   const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
@@ -2308,6 +2310,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                   title,
                   area: eventDraft.area,
                   duration: formatDuration(nextEvent.duration),
+                  scheduledDate: eventDraft.date,
                   scheduledTime: eventDraft.time,
                   state: task.completed ? "done" : "scheduled",
                 }
@@ -2320,7 +2323,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       inboxItems: modal.inboxId
         ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
         : current.inboxItems,
-      reminders: updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt),
+      reminders: (() => {
+        const eventReminders = updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt);
+        const linkedTaskReminder = existingEvent?.taskId
+          ? current.reminders.find((reminder) => reminder.targetType === "task" && reminder.targetId === existingEvent.taskId)
+          : undefined;
+        return linkedTaskReminder && existingEvent?.taskId
+          ? updateReminder(eventReminders, existingEvent.taskId, "task", title, linkedTaskReminder.mode, startsAt)
+          : eventReminders;
+      })(),
     }));
 
     if (existingEvent?.taskId && completionUndo?.taskId === existingEvent.taskId) setCompletionUndo(null);
@@ -2350,12 +2361,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ...current,
       tasks: current.tasks.map((task) =>
         task.linkedEventId === eventToRemove.id && !rowTaskIds.has(task.id)
-          ? { ...task, linkedEventId: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
+          ? { ...task, linkedEventId: undefined, scheduledDate: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
           : task,
       ),
       events: current.events.filter((event) => event.id !== eventToRemove.id),
       inboxItems: current.inboxItems,
-      reminders: current.reminders.filter((reminder) => reminder.targetId !== eventToRemove.id),
+      reminders: current.reminders.filter((reminder) =>
+        !(reminder.targetType === "event" && reminder.targetId === eventToRemove.id) &&
+        !(reminder.targetType === "task" && current.tasks.some((task) => task.id === reminder.targetId && task.linkedEventId === eventToRemove.id && !rowTaskIds.has(task.id)))),
     }));
     if (eventToRemove.taskId && completionUndo?.taskId === eventToRemove.taskId) setCompletionUndo(null);
     setSelectedEventId(null);
