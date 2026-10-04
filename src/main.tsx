@@ -29,7 +29,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import { telemetry } from "./web-telemetry.ts";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import {
@@ -388,6 +389,8 @@ function TaskRow({
   toggleBusy = false,
   dueLabel,
   latestAction,
+  onReviewConflict,
+  commandDescription,
 }: {
   task: Task;
   onToggle: (task: Task) => void;
@@ -399,10 +402,13 @@ function TaskRow({
   toggleBusy?: boolean;
   dueLabel?: string;
   latestAction?: TaskStatusActionRow;
+  onReviewConflict?: () => void;
+  commandDescription?: string;
 }) {
+  const descriptionId = useId();
   const createdAt = formatCreatedAt(task.createdAt);
-  const planned = task.scheduledTime && !task.completed
-    ? `${plannedDate ? `${formatDublinDateKey(plannedDate, { weekday: "short", day: "numeric" })} ` : ""}${task.scheduledTime}`
+  const planned = (plannedDate || task.scheduledTime) && !task.completed
+    ? `${plannedDate ? formatDublinDateKey(plannedDate, { weekday: "short", day: "numeric" }) : ""}${task.scheduledTime ? ` ${task.scheduledTime}` : ""}`.trim()
     : null;
 
   return (
@@ -414,16 +420,17 @@ function TaskRow({
         disabled={toggleDisabled || toggleBusy}
         aria-busy={toggleBusy || undefined}
         aria-label={`${task.completed ? "Reopen" : "Complete"} ${task.title}`}
+        aria-describedby={descriptionId}
       >
         {task.completed ? <Check size={14} strokeWidth={3} /> : <Circle size={16} strokeWidth={2} />}
       </button>
-      <button className="task-row-main" type="button" onClick={() => onEdit(task)} aria-label={`Open ${task.title}`}>
+      <button className="task-row-main" type="button" onClick={() => onEdit(task)} aria-label={`Open ${task.title}`} aria-describedby={descriptionId}>
         <span className="task-copy">
           <strong className={task.completed ? "task-title--done" : undefined}>{task.title}</strong>
           <span>
             <i className={`area-dot area-dot--${areaClass(task.area)}`} />
             {task.area} · {task.duration}
-            {planned ? <em className="task-sync-chip">{task.completed ? "Calendar done" : `${planned} on calendar`}</em> : null}
+            {planned ? <em className="task-sync-chip">Planned {planned}{task.scheduledTime ? " on calendar" : " locally"}</em> : null}
             {task.origin === "inbox" ? <em className="source-chip" title={task.source} aria-label={`From ${task.source ?? "Inbox"}`}>{task.source?.replace(/^Inbox · /, "") ?? "Inbox"}</em> : null}
             {sourceBadge ?? (task.externalLinks?.some((link) => link.provider === "google_tasks") ? <em className="source-chip">Google linked</em> : task.origin === "migration" ? <em className="source-chip">Imported</em> : null)}
             {actionStateLabel(latestAction) ? <em className={`task-action-state task-action-state--${latestAction?.state}`}>{actionStateLabel(latestAction)}</em> : null}
@@ -433,6 +440,8 @@ function TaskRow({
         <time dateTime={task.deadlineDate}>{dueLabel ?? task.due}</time>
         <ChevronRight className="task-row-arrow" size={15} aria-hidden="true" />
       </button>
+      <span className="sr-only" id={descriptionId}>{task.area}. {task.duration}. {dueLabel ?? task.due}. {planned ? `Planned ${planned}. ` : ""}{toggleBusy ? "Waiting for Google confirmation. " : ""}{commandDescription ?? actionStateLabel(latestAction)}</span>
+      {onReviewConflict ? <button className="secondary-action" type="button" onClick={onReviewConflict} aria-label={`Review Google change for ${task.title}`}>Review change</button> : null}
     </article>
   );
 }
@@ -495,7 +504,7 @@ function DialogFrame({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <section className={`editor-dialog ${className}`} role="dialog" aria-modal="true" aria-label={title}>
+      <section className={`editor-dialog ${className}`} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
         {children}
       </section>
     </div>
@@ -712,6 +721,16 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("open");
+  const [taskQuery, setTaskQuery] = useState("");
+  const [taskDueDay, setTaskDueDay] = useState<string | null>(null);
+  const [rowsRetry, setRowsRetry] = useState(0);
+  const [destinationsRetry, setDestinationsRetry] = useState(0);
+  const [destinationsLoading, setDestinationsLoading] = useState(false);
+  const [narrowInbox, setNarrowInbox] = useState(() => window.matchMedia("(max-width: 820px)").matches);
+  const navigationFocus = useRef(false);
+  const taskSearchRef = useRef<HTMLInputElement | null>(null);
+  const statusFocus = useRef<{ taskId: string; control: HTMLElement } | null>(null);
+  const observedActionStates = useRef(new Map<string, ActionRow["state"]>());
   const [taskSource, setTaskSource] = useState<TaskSource>(allTaskSources);
   const [taskCategory, setTaskCategory] = useState<TaskCategory>(allTaskCategories);
   const [taskSort, setTaskSort] = useState<TaskSort>("due");
@@ -888,6 +907,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       }).catch((error: unknown) => {
         if (!active || (error instanceof DOMException && error.name === "AbortError")) return;
         setTaskRowsError(true);
+        telemetry.emit({ kind: "error", name: "request_failed" }, "workspace");
       }).finally(() => {
         if (taskRowsRefresh.current === request) taskRowsRefresh.current = null;
       });
@@ -901,7 +921,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       controller.abort();
       window.clearInterval(interval);
     };
-  }, [hasUnsettledTaskAction, initial]);
+  }, [hasUnsettledTaskAction, initial, rowsRetry]);
 
   const hasLiveWork = workRows?.jobs.some((job) => job.state === "queued" || job.state === "working") === true ||
     workRows?.actions.some((action) => (action.payload.kind === "task-create" || action.payload.kind === "email-send") &&
@@ -934,21 +954,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       controller.abort();
       window.clearInterval(interval);
     };
-  }, [hasLiveWork, initial]);
+  }, [hasLiveWork, initial, rowsRetry]);
 
   useEffect(() => {
     if (!initial) return;
     const controller = new AbortController();
+    let active = true;
+    setDestinationsLoading(true);
     void loadTaskDestinations(controller.signal).then(({ destinations, fallback }) => {
+      if (!active) return;
       setTaskDestinations(destinations);
-      setTaskDestinationKey((current) => current || (fallback ? destinationKey(fallback) : ""));
+      setTaskDestinationKey(current => destinations.some(candidate => destinationKey(candidate) === current) ? current : fallback ? destinationKey(fallback) : destinations[0] ? destinationKey(destinations[0]) : "");
       setTaskDestinationError("");
     }).catch((error: unknown) => {
-      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (!active || (error instanceof DOMException && error.name === "AbortError")) return;
       setTaskDestinationError(error instanceof Error ? error.message : "Google task lists are unavailable");
-    });
-    return () => controller.abort();
-  }, [initial]);
+    }).finally(() => { if (active) setDestinationsLoading(false); });
+    return () => { active = false; controller.abort(); };
+  }, [initial, destinationsRetry, modal?.kind === "task" && !modal.taskId, showIntegrations]);
 
   useEffect(() => {
     if (!initial || modal?.kind !== "task" || modal.taskId) return;
@@ -983,12 +1006,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   useEffect(() => {
     const wasOpen = workDetailWasOpen.current;
     workDetailWasOpen.current = workDetailOpen;
-    if (activeSection !== "review" || !window.matchMedia("(max-width: 820px)").matches) return;
+    if (activeSection !== "review" || !narrowInbox) return;
     const frame = window.requestAnimationFrame(() => {
       if (workDetailOpen) {
         workDetailHeadingRef.current?.focus({ preventScroll: true });
         workDetailHeadingRef.current?.scrollIntoView({ block: "start" });
-      } else if (wasOpen) {
+      } else if (wasOpen || document.activeElement instanceof HTMLElement && document.activeElement.closest(".work-thread-detail")) {
         const selected = selectedWorkKey ? workThreadRefs.current.get(selectedWorkKey) : null;
         const target = selected ?? workThreadListRef.current;
         target?.focus({ preventScroll: true });
@@ -996,7 +1019,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeSection, selectedWorkKey, workDetailOpen]);
+  }, [activeSection, selectedWorkKey, workDetailOpen, narrowInbox]);
 
   // Match the dialog paint order so reminders and drawer transitions keep focus.
   const activeOverlay = showIntegrations ? "integrations"
@@ -1013,6 +1036,53 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     : hermesCompletionApproval ? "hermes-completion"
     : null;
   const isOverlayOpen = activeOverlay !== null;
+
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 820px)");
+    const update = () => setNarrowInbox(query.matches);
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    if (!navigationFocus.current || isOverlayOpen) return;
+    navigationFocus.current = false;
+    const frame = window.requestAnimationFrame(() => {
+      const heading = document.querySelector<HTMLElement>("#workspace-main h1");
+      if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeSection, isOverlayOpen]);
+
+  useEffect(() => {
+    telemetry.emit({ kind: "count", name: "screen_view" }, activeSection === "today" ? "home" : "workspace");
+  }, [activeSection]);
+
+  useEffect(() => {
+    const actions = new Map([...(taskRows?.actions ?? []), ...(workRows?.actions ?? [])].map(action => [action.id, action]));
+    for (const action of actions.values()) {
+      const previous = observedActionStates.current.get(action.id);
+      observedActionStates.current.set(action.id, action.state);
+      if (!previous || previous === action.state || !["succeeded", "failed", "conflict", "unknown"].includes(action.state)) continue;
+      if (action.payload.kind !== "task-status" && action.payload.kind !== "task-create") continue;
+      const taskId = action.payload.taskId;
+      const title = action.payload.kind === "task-create" ? action.payload.title : taskRows?.tasks.find(task => task.id === taskId)?.observed?.title ?? "Task";
+      const result = action.state === "succeeded" ? action.payload.kind === "task-create" ? "Creation confirmed by Google" : action.payload.after === "completed" ? "Completion confirmed by Google" : "Reopen confirmed by Google"
+        : action.state === "unknown" ? "Outcome unknown. Reconciliation is required before another attempt"
+        : action.state === "conflict" ? "Google changed this task. Review the exact change" : "Google change failed. Open the task for details";
+      setStatusMessage(`${title}: ${result}.`);
+      const captured = statusFocus.current;
+      if (captured?.taskId === taskId) {
+        const focus = document.activeElement;
+        if (focus === captured.control || focus === document.body) {
+          window.requestAnimationFrame(() => {
+            if ((document.activeElement === captured.control || document.activeElement === document.body) && (!captured.control.isConnected || captured.control.matches(":disabled"))) document.getElementById("workspace-main")?.focus({ preventScroll: true });
+          });
+        }
+        statusFocus.current = null;
+      }
+    }
+  }, [taskRows, workRows]);
 
   useEffect(() => {
     if (!activeOverlay) {
@@ -1037,16 +1107,18 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (dialog.contains(document.activeElement)) return;
       const preferred = dialog.querySelector<HTMLElement>('[data-autofocus="true"]');
       const available = controls();
-      (preferred && available.includes(preferred) ? preferred : available[0])?.focus();
+      (preferred && available.includes(preferred) ? preferred : available[0] ?? dialog).focus();
     };
     const frame = window.requestAnimationFrame(focusFirstControl);
+    const observer = new MutationObserver(() => { if (dialog.contains(document.activeElement) && document.activeElement?.matches(":disabled")) dialog.focus(); });
+    observer.observe(dialog, { attributes: true, attributeFilter: ["disabled"], subtree: true });
     const trapFocus = (event: KeyboardEvent) => {
       if (event.key !== "Tab") return;
       const available = controls();
-      if (!available.length) { event.preventDefault(); return; }
+      if (!available.length) { event.preventDefault(); dialog.focus(); return; }
       const first = available[0];
       const last = available.at(-1) ?? first;
-      if (!dialog.contains(document.activeElement)) {
+      if (document.activeElement === dialog || !dialog.contains(document.activeElement)) {
         event.preventDefault();
         (event.shiftKey ? last : first).focus();
       } else if (event.shiftKey && document.activeElement === first) {
@@ -1061,6 +1133,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     window.addEventListener("keydown", trapFocus);
     return () => {
       window.cancelAnimationFrame(frame);
+      observer.disconnect();
       window.removeEventListener("keydown", trapFocus);
       document.body.style.overflow = previousOverflow;
       backgroundOverlays.forEach((element) => { element.inert = false; });
@@ -1069,6 +1142,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [activeOverlay]);
 
   useEffect(() => {
+    if (!initial) { setPushSupported(false); return; }
     if (!("Notification" in window)) {
       setPushSupported(false);
       setNotificationPermission("unsupported");
@@ -1101,7 +1175,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (active) setPushSupported(false);
     });
     return () => { active = false; };
-  }, []);
+  }, [initial]);
 
   useEffect(() => {
     let timeout: number | undefined;
@@ -1491,19 +1565,21 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const isExternalOnlyScope = taskSource === microsoftTaskSource;
   const isHermesOnlyScope = taskSource === hermesTaskSource;
 
-  const shownLocalTasks = taskSource === allTaskSources
+  const taskNeedle = taskQuery.trim().toLocaleLowerCase();
+  const matchesTitle = (title: string) => title.toLocaleLowerCase().includes(taskNeedle);
+  const shownLocalTasks = (taskSource === allTaskSources
     ? visibleTasks
     : taskSource === localTaskSource
       ? visibleFoxTasks
       : taskSource === googleTaskSource
         ? visibleGoogleTasks
-        : [];
-  const shownHermesTasks = taskSource === allTaskSources || taskSource === hermesTaskSource ? visibleHermesTasks : [];
-  const shownImportedTasks = taskSource === allTaskSources
+        : []).filter(task => matchesTitle(task.title) && (!taskDueDay || (task.deadlineDate === taskDueDay || !task.deadlineDate && task.due === "Tomorrow")));
+  const shownHermesTasks = (taskSource === allTaskSources || taskSource === hermesTaskSource ? visibleHermesTasks : []).filter(task => matchesTitle(task.title) && !taskDueDay);
+  const shownImportedTasks = (taskSource === allTaskSources
     ? combinedImportedTasks
     : taskSource === googleTaskSource || taskSource === microsoftTaskSource
       ? combinedImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
-      : [];
+      : []).filter(task => matchesTitle(task.title) && (!taskDueDay || task.dueOn === taskDueDay));
 
   const reminderCount = activeReminders.length;
   const reviewCount = initial ? needsYouThreads.length : data.inboxItems.filter((item) => item.status !== "handled").length;
@@ -1570,8 +1646,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }, [selectedInbox?.id, selectedInbox?.moreWork]);
 
   function openWorkspaceView(section: WorkspaceView) {
+    if (section === activeSection) {
+      const heading = document.querySelector<HTMLElement>("#workspace-main h1");
+      if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
+      return;
+    }
+    navigationFocus.current = true;
     setActiveSection(section);
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${section}`);
+    try { window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${section}`); } catch { /* standalone previews can have an opaque origin */ }
     window.scrollTo({ top: 0, behavior: "auto" });
   }
 
@@ -1581,6 +1663,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function resetTaskFilters() {
+    setTaskQuery("");
+    setTaskDueDay(null);
+    setTaskCategory(allTaskCategories);
     setTaskFilter("all");
     setTaskSource(allTaskSources);
     setTaskSort("due");
@@ -1867,7 +1952,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   async function queueTaskStatus(task: Task, row: TaskRow) {
     const desiredState = task.completed ? "open" : "completed";
+    if (document.activeElement instanceof HTMLElement && document.activeElement.closest(".task-row")) statusFocus.current = { taskId: task.id, control: document.activeElement };
     setBusyTaskIds((current) => new Set(current).add(task.id));
+    const captured = statusFocus.current;
+    window.requestAnimationFrame(() => {
+      if (captured?.taskId === task.id && (document.activeElement === captured.control || document.activeElement === document.body) && captured.control.matches(":disabled")) captured.control.closest(".task-row")?.querySelector<HTMLButtonElement>(".task-row-main")?.focus({ preventScroll: true });
+    });
     setStatusMessage("");
     try {
       const { ok, value } = await requestTaskStatus(task.id, row.version, desiredState);
@@ -2385,7 +2475,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   function moveWorkSelection(delta: number) {
     const index = selectedWorkIndex >= 0 ? selectedWorkIndex : 0;
     const next = visibleWorkThreads[Math.max(0, Math.min(visibleWorkThreads.length - 1, index + delta))];
-    if (next) selectWorkThread(next);
+    if (next) { selectWorkThread(next); if (!narrowInbox) window.requestAnimationFrame(() => workThreadRefs.current.get(next.key)?.focus()); }
   }
 
   async function runWorkMutation(key: string, operation: () => Promise<unknown>, message: string): Promise<boolean> {
@@ -2398,6 +2488,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     } catch (error) {
       try { await refreshRowSnapshots(); } catch {
         setTaskRowsError(true);
+        telemetry.emit({ kind: "error", name: "request_failed" }, "workspace");
         setWorkRowsError(true);
       }
       setStatusMessage(error instanceof Error ? error.message : "The Inbox change could not be saved.");
@@ -2407,6 +2498,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
     try { await refreshRowSnapshots(); } catch {
       setTaskRowsError(true);
+        telemetry.emit({ kind: "error", name: "request_failed" }, "workspace");
       setWorkRowsError(true);
     }
     return true;
@@ -2750,13 +2842,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (activeSection !== "review" || isOverlayOpen || event.metaKey || event.ctrlKey || event.altKey) return;
       if (!(event.target instanceof HTMLElement) || !event.target.closest(".work-inbox") || event.target.isContentEditable ||
         event.target.closest("input, textarea, select, [contenteditable='true']")) return;
+      if (!event.target.closest(".work-thread")) return;
+      const focusedKey = event.target.closest<HTMLElement>(".work-thread")?.dataset.threadKey;
       const thread = selectedWorkThread;
       if (event.key === "j" || event.key === "k") {
         event.preventDefault();
         moveWorkSelection(event.key === "j" ? 1 : -1);
         return;
       }
-      if (!thread) return;
+      if (!thread || focusedKey !== thread.key) return;
       const item = thread.kind === "inbox" ? thread.item : null;
       const job = thread.job;
       const canAct = item ? canMutateInboxItem(item) : false;
@@ -2811,6 +2905,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   async function requestNotificationPermission() {
+    if (!initial) { setPushSupported(false); return; }
     if (!("Notification" in window)) {
       setNotificationPermission("unsupported");
       setPushSupported(false);
@@ -2893,6 +2988,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const googleOwned = row?.binding.kind === "google";
     const createAction = createActionByTask.get(task.id);
     const pendingCreate = row?.binding.kind === "pending" ? createAction : undefined;
+    const descriptionAction = action ?? createAction;
     const createNeedsReview = createAction?.state === "failed" || createAction?.state === "conflict" || createAction?.state === "unknown";
     const pending = action?.state === "queued" || action?.state === "running" ||
       pendingCreate?.state === "queued" || pendingCreate?.state === "running";
@@ -2903,10 +2999,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       task={task}
       dueLabel={taskDeadlineLabel(task, todayDate)}
       latestAction={action}
+      commandDescription={`${googleOwned ? "Google Tasks" : "Current task owner"}. ${actionStateLabel(descriptionAction) ?? ""}${descriptionAction?.state === "unknown" ? ". Reconciliation required before another attempt" : ""}`}
       plannedDate={plannedDateForTask(task)}
       sourceBadge={createNeedsReview ? <em className={`task-action-state task-action-state--${createAction.state}`}>{actionStateLabel(createAction)}</em> : googleOwned ? <em className="source-chip">Google Tasks</em> : pendingCreate ? <em className={`task-action-state task-action-state--${pendingCreate.state}`}>Google {pendingCreate.state}</em> : undefined}
       toggleBusy={busyTaskIds.has(task.id) || pending}
       toggleDisabled={Boolean(initial && (!googleOwned || unavailable))}
+      onReviewConflict={action?.state === "conflict" ? () => setTaskConflictActionId(action.id) : undefined}
       onToggle={toggleTask}
       onEdit={openTaskComposer}
     />;
@@ -3050,19 +3148,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </article>
 
         <article className="pane today-card today-card--tasks">
-          <PaneHeader eyebrow="Attention" title={attentionTasks.length ? `${attentionTasks.length} task${attentionTasks.length === 1 ? "" : "s"}` : "All clear"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("tasks")}>All tasks <ChevronRight size={12} /></button>} />
+          <PaneHeader eyebrow="Attention" title={attentionTasks.length ? `${attentionTasks.length} task${attentionTasks.length === 1 ? "" : "s"}` : "All clear"} action={<button className="pane-link" type="button" onClick={() => { resetTaskFilters(); openWorkspaceView("tasks"); }}>All tasks <ChevronRight size={12} /></button>} />
           <div className="task-browser-list today-task-list">
             {attentionTasks.map((task) => renderTaskRow(task, true))}
-            {!attentionTasks.length ? <div className="today-empty"><CheckCircle2 size={17} /><span><strong>No open local tasks</strong><small>Add one when something comes up.</small></span></div> : null}
+            {!attentionTasks.length ? <div className="today-empty"><CheckCircle2 size={17} /><span><strong>{initial && !taskRows ? taskRowsError ? "Tasks could not load" : "Loading tasks…" : "No open tasks"}</strong><small>{initial ? "Google owns tasks; Fox Focus keeps your plan." : "Add a sample task when something comes up."}</small></span></div> : null}
           </div>
         </article>
 
         <article className="pane today-card today-card--due">
           <PaneHeader eyebrow="Due soon" title="Coming up" />
           <div className="today-stat-list">
-            <button type="button" onClick={() => { selectTaskFilter("due-today"); openWorkspaceView("tasks"); }}><span>Today</span><strong>{dueTodayCount}</strong></button>
-            <button type="button" onClick={() => { selectTaskFilter("open"); openWorkspaceView("tasks"); }}><span>Tomorrow</span><strong>{dueTomorrowCount}</strong></button>
-            <button type="button" onClick={() => { selectTaskFilter("waiting"); openWorkspaceView("tasks"); }}><span>Waiting</span><strong>{waitingTaskCount}</strong></button>
+            <button type="button" onClick={() => { resetTaskFilters(); selectTaskFilter("due-today"); openWorkspaceView("tasks"); }}><span>Today</span><strong>{dueTodayCount}</strong></button>
+            <button type="button" onClick={() => { resetTaskFilters(); selectTaskFilter("open"); setTaskDueDay(addCalendarDays(todayDate, 1)); openWorkspaceView("tasks"); }}><span>Tomorrow</span><strong>{dueTomorrowCount}</strong></button>
+            <button type="button" onClick={() => { resetTaskFilters(); selectTaskFilter("waiting"); openWorkspaceView("tasks"); }}><span>Waiting</span><strong>{waitingTaskCount}</strong></button>
           </div>
         </article>
 
@@ -3130,10 +3228,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       <header className="workspace-heading"><div><p className="eyebrow">Your work</p><h1 id="tasks-heading">Tasks</h1><p>Check off a task to complete it, or open it to edit the details.</p></div><button className="page-primary-action" type="button" onClick={() => openTaskComposer()}><Plus size={13} /> Add task</button></header>
       <article className="pane tasks-workspace">
         {initial && hermes.failed ? <p className="task-sync-note task-sync-note--warning"><Bot size={13} /> Hermes could not refresh. Fox Focus tasks are unaffected.</p> : initial && hermes.loading && !hermesBoard ? <p className="task-sync-note"><Bot size={13} /> Checking Hermes tasks…</p> : null}
-        {initial && taskRowsError ? <p className="task-sync-note task-sync-note--warning"><RefreshCw size={13} /> Task rows could not refresh. Showing the last loaded state.</p> : null}
+        {initial && !taskRows && !taskRowsError ? <p className="task-sync-note" role="status">Loading Google-backed tasks…</p> : null}
+        {initial && taskRowsError ? <p className="task-sync-note task-sync-note--warning" role="alert"><RefreshCw size={13} /> {taskRows ? "Tasks could not refresh. Showing the last loaded state." : "Tasks could not load."} <button type="button" className="mini-action" onClick={() => setRowsRetry(value => value + 1)}>Retry task reads</button></p> : null}
         <nav className="task-category-strip" aria-label="Task categories">{taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}</nav>
         {hermesBoard && (taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory) && taskFilter !== "all" && taskFilter !== "open" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks appear in All, Open, or Done because they do not have Fox Focus deadlines yet.</p> : null}
         <div className="task-compact-toolbar">
+          <label className="task-search"><span className="sr-only">Search task titles</span><input ref={taskSearchRef} type="search" value={taskQuery} onChange={event => setTaskQuery(event.target.value)} placeholder="Search tasks" /></label>
+          {taskDueDay ? <span>Due {formatDublinDateKey(taskDueDay, { day: "numeric", month: "short" })}</span> : null}
           <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{taskSourceOptions.length > 2 ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
           <span className="task-view-count" role="status" aria-live="polite">{taskFilterLabel(taskFilter)} · {shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
           {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
@@ -3143,7 +3244,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           {shownLocalTasks.map((task) => renderTaskRow(task))}
           {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} busy={adoptingHermesId === task.id} onAdopt={(candidate) => void previewHermesAdoption(candidate)} />)}
           {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.containerId}:${task.externalId}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
-          {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Change the category or filters, or add a task."}</p></div> : null}
+          {!shownTaskCount && (!initial || taskRows) ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Change the category or filters, or add a task."}</p><button className="secondary-action" type="button" onClick={() => { resetTaskFilters(); window.requestAnimationFrame(() => taskSearchRef.current?.focus()); }}>Show all tasks</button></div> : null}
         </div>
       </article>
     </section>;
@@ -3243,7 +3344,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
       <header className="workspace-heading"><div><p className="eyebrow">Forward and back</p><h1 id="review-heading">Inbox</h1></div><span className="review-page-count">{reviewCount ? `${reviewCount} ${reviewCount === 1 ? "needs" : "need"} you` : "Clear"}</span></header>
       <article className="pane review-workspace work-inbox">
-        {workRowsError ? <p className="task-sync-note task-sync-note--warning"><RefreshCw size={13} /> Inbox rows could not refresh.</p> : null}
+        {workRowsError ? <p className="task-sync-note task-sync-note--warning" role="alert"><RefreshCw size={13} /> {workRows ? "Inbox could not refresh. Showing the last loaded state." : "Inbox could not load."} <button type="button" className="mini-action" onClick={() => setRowsRetry(value => value + 1)}>Retry Inbox reads</button></p> : null}
         <div className={`review-workbench${workDetailOpen ? " review-workbench--detail" : ""}`}>
           <aside className="work-thread-list" aria-label="Inbox threads" ref={workThreadListRef} tabIndex={-1}>
             {renderAlwaysOpenGroup("Needs you", needsYouThreads)}
@@ -3251,7 +3352,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {renderCollapsibleGroup("Likely noise", noiseThreads, noiseOpen, setNoiseOpen)}
             {renderCollapsibleGroup("Settled", settledThreads, settledOpen, setSettledOpen)}
             {!workThreads.length && workRows ? <p className="empty-line">Inbox is clear.</p> : null}
-            {!workRows ? <p className="empty-line">Loading Inbox…</p> : null}
+            {!workRows && !workRowsError ? <p className="empty-line" role="status">Loading Inbox…</p> : null}
           </aside>
           {selectedWorkThread ? <section className="work-thread-detail" aria-label={selectedWorkThread.title}>
             <div className="review-queue-nav">
@@ -3307,7 +3408,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                 <button className="danger-button" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "dropped")}><Trash2 size={12} /> Drop</button>
               </> : null}
             </footer>
-          </section> : <section className="work-thread-detail work-thread-detail--empty"><Inbox size={19} /><span>{workThreads.length ? "Choose a thread." : "Inbox is clear."}</span></section>}
+          </section> : <section className="work-thread-detail work-thread-detail--empty"><Inbox size={19} /><span>{!workRows ? workRowsError ? "Inbox unavailable. Retry the read." : "Loading Inbox…" : workThreads.length ? "Choose a thread." : "Inbox is clear."}</span></section>}
         </div>
       </article>
     </section>;
@@ -3374,6 +3475,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         ];
   return (
     <div className="control-room">
+      <a className="skip-link" href="#workspace-main" inert={isOverlayOpen}>Skip to content</a>
+      {!initial ? <p className="visual-mode-notice" aria-hidden={isOverlayOpen} inert={isOverlayOpen}><strong>Synthetic visual mode</strong> · Sample data. Changes stay in this browser.</p> : null}
       <header className="command-bar" aria-hidden={isOverlayOpen} inert={isOverlayOpen}>
         <div className="brand-lockup">
           <img className="fox-mark" src="/favicon.svg" alt="" />
@@ -3392,13 +3495,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </div>
       </header>
 
-      {saveError || statusMessage || completionUndo || reviewUndo ? <div className={`status-footer${saveError ? " status-footer--error" : ""}`} role={saveError ? "alert" : "status"} aria-live={saveError ? "assertive" : "polite"} aria-hidden={isOverlayOpen} inert={isOverlayOpen}>
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{isOverlayOpen ? "" : statusMessage}</div>
+      {saveError || statusMessage || completionUndo || reviewUndo ? <div className={`status-footer${saveError ? " status-footer--error" : ""}`} role={saveError ? "alert" : undefined} aria-live={saveError ? "assertive" : "off"} aria-hidden={isOverlayOpen} inert={isOverlayOpen}>
         <span />
         <p>{saveError ?? statusMessage}</p>
         {completionUndo ? <button className="status-undo" type="button" onClick={undoTaskCompletion}>Undo</button> : reviewUndo ? <button className="status-undo" type="button" onClick={undoInboxChange}>Undo</button> : null}
         {!saveError ? <button className="status-dismiss" type="button" aria-label="Dismiss notification" onClick={() => { setStatusMessage(""); setCompletionUndo(null); setReviewUndo(null); }}><X size={16} /></button> : null}
       </div> : null}
-      <main aria-hidden={isOverlayOpen} inert={isOverlayOpen}>{renderWorkspaceView()}</main>
+      <main id="workspace-main" tabIndex={-1} aria-hidden={isOverlayOpen} inert={isOverlayOpen}>{renderWorkspaceView()}</main>
 
       {hermesCompletionApproval ? (
         <DialogFrame title="Confirm Hermes completion" onClose={() => setHermesCompletionApproval(null)} className="editor-dialog--confirmation">
@@ -3454,22 +3558,24 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             {modalInbox ? <div className="source-notice"><Inbox size={14} /> Accepting from <strong>{modalInbox.source}</strong>. It will stay on the created task.</div> : null}
             {modalInboxRow ? <div className="source-notice"><Inbox size={14} /> From <strong>{inboxSourceLabel(modalInboxRow)}</strong>.</div> : null}
             {modalGoogleOwned ? <div className="source-notice"><Link2 size={14} /> Google owns the title, due date, and completion. Planning stays in Fox Focus.</div> : modalPendingGoogle ? <div className="source-notice"><Clock3 size={14} /> Waiting for Google creation confirmation.</div> : modalRowOwned ? <div className="source-notice"><Bot size={14} /> The current task owner keeps its content and completion until migration. Planning stays in Fox Focus.</div> : modalTask?.origin === "migration" ? <div className="source-notice"><Bot size={14} /> Adopted from {modalTask.source ?? "a legacy source"}. The source link is read-only.</div> : null}
-            {modalTaskAction && actionStateLabel(modalTaskAction) ? <div className={`task-action-notice task-action-notice--${modalTaskAction.state}`}><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.error ?? (modalTaskAction.state === "succeeded" ? "Google readback matched the approved change." : "The approved change is waiting for Google readback.")}</span></div> : null}
-            {modalCreateAction && actionStateLabel(modalCreateAction) ? <div className={`task-action-notice task-action-notice--${modalCreateAction.state}`}><strong>{actionStateLabel(modalCreateAction)}</strong><span>{modalCreateAction.error ?? (modalCreateAction.state === "succeeded" ? "Google readback matched the approved task." : "The approved creation is waiting for Google readback.")}</span></div> : null}
+            {modalTaskAction && actionStateLabel(modalTaskAction) ? <div className={`task-action-notice task-action-notice--${modalTaskAction.state}`} role="status"><strong>{actionStateLabel(modalTaskAction)}</strong><span>{modalTaskAction.error ?? (modalTaskAction.state === "succeeded" ? "Google readback matched the approved change." : "The approved change is waiting for Google readback.")}</span></div> : null}
+            {modalCreateAction && actionStateLabel(modalCreateAction) ? <div className={`task-action-notice task-action-notice--${modalCreateAction.state}`} role="status"><strong>{actionStateLabel(modalCreateAction)}</strong><span>{modalCreateAction.error ?? (modalCreateAction.state === "succeeded" ? "Google readback matched the approved task." : "The approved creation is waiting for Google readback.")}</span></div> : null}
+            {!initial ? <p className="source-notice">Sample task · saved only in this browser.</p> : null}
+            {modalCreatingGoogle ? <div className="destination-recovery" id="task-destination-status" role="status"><p>{destinationsLoading ? "Loading Google task lists…" : taskDestinationError || (!taskDestinations.length ? "No Google task list is available. Connect Google in Sources, then retry lists." : "The selected account and list receive the outgoing task below.")}</p><button className="secondary-action" type="button" disabled={destinationsLoading} onClick={event => { event.currentTarget.closest<HTMLElement>(".editor-dialog")?.focus(); setDestinationsRetry(value => value + 1); }}>{destinationsLoading ? "Loading lists…" : "Retry lists"}</button>{!taskDestinations.length ? <button className="secondary-action" type="button" onClick={() => setShowIntegrations(true)}>Open Sources</button> : null}</div> : null}
             <div className="editor-grid editor-grid--quick-task">
-              {modalCreatingGoogle ? <label className="field field--full"><span>Destination</span><select data-autofocus required value={taskDestinationKey} disabled={!taskDestinations.length} onChange={(event) => {
+              {modalCreatingGoogle ? <label className="field field--full"><span>Destination</span><select data-autofocus required value={taskDestinationKey} aria-describedby="task-destination-status" disabled={!taskDestinations.length || destinationsLoading} onChange={(event) => {
                 const destination = taskDestinations.find((candidate) => destinationKey(candidate) === event.target.value);
                 const area = destination?.area;
                 setTaskDestinationKey(event.target.value);
                 if (isOneOf(area, areas)) setTaskDraft((current) => ({ ...current, area }));
-              }}>{taskDestinations.map((destination) => <option value={destinationKey(destination)} key={destinationKey(destination)}>{destination.area} · {destination.listName}{destination.isFallback ? " · fallback" : ""}</option>)}</select>{taskDestinationError ? <small>{taskDestinationError}</small> : null}</label> : null}
+              }}>{taskDestinations.map((destination) => <option value={destinationKey(destination)} key={destinationKey(destination)}>{destination.area} · {destination.listName}{destination.isFallback ? " · fallback" : ""}</option>)}</select></label> : null}
               <label className="field field--full"><span>{modalGoogleOwned || modalPendingGoogle ? "Task · managed in Google" : modalRowOwned ? "Task · managed at source" : "Task"}</span><input data-autofocus={!modalCreatingGoogle || undefined} required readOnly={modalRowOwned} value={taskDraft.title} onChange={(event) => setTaskDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What needs doing?" /></label>
-              {modalCreatingGoogle ? <><label className="field field--full"><span>Google due</span><input type="date" value={taskGoogleDue} onChange={(event) => setTaskGoogleDue(event.target.value)} /></label><label className="field field--full"><span>Notes</span><textarea className="task-notes-field" value={taskNotes} onChange={(event) => setTaskNotes(event.target.value)} /></label></> : null}
+              {modalCreatingGoogle ? <><label className="field field--full"><span>Google due · sent to Google</span><input type="date" value={taskGoogleDue} onChange={(event) => setTaskGoogleDue(event.target.value)} /></label><label className="field field--full"><span>Notes</span><textarea className="task-notes-field" value={taskNotes} onChange={(event) => setTaskNotes(event.target.value)} /></label></> : null}
               {modalGoogleOwned ? <label className="field field--full"><span>Google due</span><input type="date" readOnly value={modalTaskRow?.observed?.doOn ?? ""} /></label> : null}
               {modalPendingGoogle ? <label className="field field--full"><span>Google due · pending</span><input type="date" readOnly value={modalCreateAction?.payload.doOn ?? ""} /></label> : null}
-              <label className="field field--full"><span>{modalGoogleOwned ? "Local deadline" : "Deadline"}</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
+              <label className="field field--full"><span>{modalGoogleOwned || modalCreatingGoogle ? "Local deadline · stays in Fox Focus" : "Deadline"}</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
-            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div><div><dt>Local reminder</dt><dd>{taskReminderLocal ? `${taskReminderLocal.replace("T", " ")} Dublin${taskReminderInstant?.localValue === taskReminderLocal ? ` · ${taskReminderInstant.instant}` : ""}` : "None"}</dd></div></dl><pre>{outgoingTaskNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
+            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div><div><dt>Local reminder</dt><dd>{taskReminderLocal ? `${taskReminderLocal.replace("T", " ")} Dublin${taskReminderInstant?.localValue === taskReminderLocal ? ` · ${taskReminderInstant.instant}` : ""}` : "None"}</dd></div></dl><p>Notes sent to Google · the Fox-Focus-ID marker prevents duplicate creation.</p><pre>{outgoingTaskNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
             {showTaskDetails ? <div className="editor-grid editor-grid--task-details" id="task-more-options">
               <label className="field"><span>{modalGoogleOwned || modalPendingGoogle || modalCreatingGoogle ? "Area · from list" : modalRowOwned ? "Area · from source" : "Area"}</span><select disabled={modalRowOwned || modalCreatingGoogle} value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
@@ -3480,7 +3586,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <label className="field"><span>Planned time{taskPlannedInstant ? " · exact source" : ""}</span><input type="time" value={taskDraft.scheduledTime} onChange={(event) => { setTaskPlannedInstant(null); setTaskDraft((current) => ({ ...current, scheduledTime: event.target.value })); }} /></label>
               {modalCreatingGoogle ? <label className="field field--full"><span>Local reminder · Dublin</span><input type="datetime-local" value={taskReminderLocal} onChange={(event) => { setTaskReminderInstant(null); setTaskReminderLocal(event.target.value); }} /></label> : modalRowOwned ? null : <label className="field field--full"><span>Reminder</span><select value={taskDraft.reminderMode} onChange={(event) => { const value = event.target.value; if (isOneOf(value, reminderModes)) setTaskDraft((current) => ({ ...current, reminderMode: value })); }}><option value="none">No reminder</option><option value="one-hour">1 hour before</option><option value="morning">09:00 on the day</option></select></label>}
             </div> : null}
-            <div className="editor-footer"><span>{modalCreatingGoogle ? selectedTaskDestination ? `${selectedTaskDestination.accountId} · ${selectedTaskDestination.listName}` : "Choose a destination." : modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{initial && modalTask && modalTaskRow ? <button className="secondary-action" type="button" disabled={modalPendingGoogle} title={modalPendingGoogle ? "Wait for Google creation confirmation" : undefined} onClick={() => openTaskJobComposer(modalTask)}><MessageSquare size={13} /> Ask Hermes</button> : null}{modalCreateAction?.state === "conflict" && taskCreateConflictCandidates(modalCreateAction).length ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setTaskCreateConflictActionId(modalCreateAction.id); }}><RefreshCw size={13} /> Review matches</button> : modalTaskAction?.state === "conflict" || modalCreateAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setShowIntegrations(true); }}><RefreshCw size={13} /> Sources</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy || (modalCreatingGoogle && !selectedTaskDestination)}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalCreatingGoogle ? "Create in Google" : modalRowOwned ? "Save plan" : "Save task"}</button></div></div>
+            <div className="editor-footer"><span>{modalCreatingGoogle ? selectedTaskDestination ? `${selectedTaskDestination.accountId} · ${selectedTaskDestination.listName}` : "Choose a destination." : modalGoogleOwned ? "The checkbox records completion approval." : modalRowOwned ? "Fox Focus stores planning only." : taskDraft.scheduledTime ? "This will create or update a local timetable block." : "Leave plan blank to keep it unscheduled."}</span><div>{initial && modalTask && modalTaskRow ? <button className="secondary-action" type="button" disabled={modalPendingGoogle} title={modalPendingGoogle ? "Wait for Google creation confirmation" : undefined} onClick={() => openTaskJobComposer(modalTask)}><MessageSquare size={13} /> Ask Hermes</button> : null}{modalCreateAction?.state === "conflict" && taskCreateConflictCandidates(modalCreateAction).length ? <button className="secondary-action" type="button" onClick={() => { setModal(null); setTaskCreateConflictActionId(modalCreateAction.id); }}><RefreshCw size={13} /> Review matches</button> : modalTaskAction?.state === "conflict" || modalCreateAction?.state === "conflict" ? <button className="secondary-action" type="button" onClick={() => { setModal(null); if (modalTaskAction?.state === "conflict") setTaskConflictActionId(modalTaskAction.id); else setShowIntegrations(true); }}><RefreshCw size={13} /> Review Google change</button> : null}{modalTask?.linkedEventId ? <button className="secondary-action" type="button" onClick={() => { setModal(null); openTaskSchedule(modalTask); }}><CalendarDays size={13} /> View calendar</button> : null}<button className="secondary-action" type="button" disabled={taskPlanBusy} onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit" disabled={taskPlanBusy || (modalCreatingGoogle && (!selectedTaskDestination || destinationsLoading || Boolean(taskDestinationError)))}><Check size={14} /> {taskPlanBusy ? "Saving…" : modalCreatingGoogle ? "Create in Google" : modalRowOwned ? "Save plan" : "Save sample task"}</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
@@ -3652,16 +3758,18 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Missing application root");
 const root = createRoot(rootElement);
-if (import.meta.env.DEV || window.location.protocol === "file:") {
+if (import.meta.env.DEV || import.meta.env.MODE === "standalone" || window.location.protocol === "file:") {
   root.render(<App />);
 } else {
-  fetch("/api/v1/workspace").then(async (response) => {
+  root.render(<main className="workspace-failure"><section className="workspace-failure-card" role="status"><h1>Loading Fox Focus…</h1><p>Reading your workspace. No external changes are being made.</p></section></main>);
+  fetch("/api/v1/workspace", { signal: AbortSignal.timeout(15_000) }).then(async (response) => {
     if (!response.ok) throw new Error("Could not load the server workspace");
     const initial: unknown = await response.json();
     if (!isServerSnapshot(initial)) throw new Error("Invalid server workspace");
     root.render(<App initial={initial} />);
   }).catch(() => {
     document.documentElement.dataset.theme = loadTheme();
+    telemetry.emit({ kind: "error", name: "request_failed" }, "app");
     root.render(<WorkspaceUnavailable />);
   });
 }

@@ -11,7 +11,7 @@ import { useStore } from "@/lib/store";
 import { colors, space } from "@/lib/theme";
 
 export default function Tasks() {
-  const { rows, loading, refresh, connection, ready } = useStore();
+  const { rows, loading, refresh, connection, ready, actionError, error, loadedAt } = useStore();
   const dock = useDock();
   const [view, setView] = useState<"open" | "done">("open");
   const [query, setQuery] = useState("");
@@ -36,18 +36,20 @@ export default function Tasks() {
         refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} tintColor={colors.muted} colors={[colors.page]} progressBackgroundColor={colors.accent} />}
         ListHeaderComponent={
           <View>
+            {actionError ? <T tone="amber" accessibilityRole="alert" accessibilityLiveRegion="polite">{actionError}</T> : null}
+            {error ? <T tone="amber" accessibilityRole="alert">{error}. Pull down to retry reading tasks.</T> : null}
             <View style={styles.chips}>
               <Chip label="Open" on={view === "open"} onPress={() => setView("open")} />
               <Chip label="Done" on={view === "done"} onPress={() => setView("done")} />
             </View>
-            <Field value={query} onChangeText={setQuery} placeholder="Search" autoCorrect={false} returnKeyType="search" />
+            <Field label="Search task titles" value={query} onChangeText={setQuery} placeholder="Search" autoCorrect={false} returnKeyType="search" />
           </View>
         }
         renderSectionHeader={({ section }) => <Section title={section.title} count={section.data.length} />}
         renderItem={({ item }) => <TaskItem task={item} />}
         ListEmptyComponent={ready && !connection
           ? <ConnectPrompt />
-          : <T size="small" tone="faint" style={styles.empty}>{needle ? "No matches" : "Nothing here"}</T>}
+          : <T size="small" tone="faint" style={styles.empty}>{!ready || loading && !loadedAt ? "Loading tasks…" : error && !loadedAt ? "Tasks unavailable · pull down to retry" : needle ? "No matches" : "Nothing here"}</T>}
       />
     </DockScene>
   );

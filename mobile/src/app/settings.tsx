@@ -11,16 +11,18 @@ export default function Settings() {
   const [username, setUsername] = useState(connection?.username ?? "fox");
   const [password, setPassword] = useState(connection?.password ?? "");
   const [busy, setBusy] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
 
   const save = async () => {
+    setConnectionError(null);
     setBusy(true);
     try {
       await connect({ baseUrl: baseUrl.trim().replace(/\/+$/, ""), username: username.trim(), password });
       notify("Connected");
       router.back();
     } catch (cause) {
-      notify(cause instanceof Error ? cause.message : "Could not connect");
+      setConnectionError(cause instanceof Error ? cause.message : "Could not connect");
     } finally {
       setBusy(false);
     }
@@ -38,9 +40,10 @@ export default function Settings() {
   return (
     <Screen>
       <Section title="Server" />
-      <Field value={baseUrl} onChangeText={setBaseUrl} placeholder="https://focus.semyon.ie" autoCapitalize="none" autoCorrect={false} keyboardType="url" />
-      <Field value={username} onChangeText={setUsername} placeholder="Username" autoCapitalize="none" autoCorrect={false} />
-      <Field value={password} onChangeText={setPassword} placeholder="Password" secureTextEntry />
+      <Field label="Server URL" value={baseUrl} onChangeText={setBaseUrl} placeholder="https://focus.semyon.ie" autoCapitalize="none" autoCorrect={false} keyboardType="url" />
+      <Field label="Username" value={username} onChangeText={setUsername} placeholder="Username" autoCapitalize="none" autoCorrect={false} />
+      <Field label="Password" value={password} onChangeText={setPassword} placeholder="Password" secureTextEntry />
+      {connectionError ? <T tone="amber" accessibilityRole="alert" accessibilityLiveRegion="polite">{connectionError}</T> : null}
       <Actions>
         <Button
           label={busy ? "Connecting" : connection ? "Save" : "Connect"}
@@ -48,7 +51,10 @@ export default function Settings() {
           disabled={busy || !baseUrl.trim() || !username.trim() || !password}
           onPress={() => { void save(); }}
         />
-        {connection ? <Button label="Sign out" tone="quiet" onPress={() => { void connect(null); }} /> : null}
+        {connection ? <Button label="Sign out" tone="quiet" disabled={busy} onPress={() => {
+          setConnectionError(null); setBusy(true);
+          void connect(null).catch(cause => setConnectionError(cause instanceof Error ? cause.message : "Could not sign out")).finally(() => setBusy(false));
+        }} /> : null}
       </Actions>
 
       <Section title="App" />

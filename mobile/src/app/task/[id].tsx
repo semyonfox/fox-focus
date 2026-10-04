@@ -2,6 +2,7 @@ import { createJob } from "@shared/inbox-client";
 import { requestTaskPlan } from "@shared/row-client";
 import type { Priority } from "@shared/model";
 import type { TaskPlanRow } from "@shared/row-model";
+import { taskCommandStatus } from "@shared/task-command-status";
 import { useLocalSearchParams } from "expo-router";
 import { useState } from "react";
 import { Linking, StyleSheet, View } from "react-native";
@@ -34,7 +35,7 @@ export default function TaskScreen() {
 
   const facts = [
     { label: "List", value: listName(rows, task) },
-    { label: "Status", value: pending ? "Saving to Google" : done ? "Done" : "Open" },
+    { label: "Status", value: taskCommandStatus(task, action) },
     task.observed?.doOn ? { label: "Do on", value: dayLabel(task.observed.doOn) } : null,
     plan?.deadlineOn ? { label: "Deadline", value: dayLabel(plan.deadlineOn) } : null,
     plan?.plannedAt ? { label: "Planned", value: whenLabel(plan.plannedAt) } : plan?.plannedOn ? { label: "Planned", value: dayLabel(plan.plannedOn) } : null,
@@ -79,7 +80,7 @@ export default function TaskScreen() {
         <Button
           label={done ? "Reopen" : "Done"}
           tone="primary"
-          disabled={pending || !canTick(task)}
+          disabled={pending || isStuck(action) || !canTick(task)}
           onPress={() => { void run(tickTask(task, done)); }}
         />
         {!asking ? <Button label="Hand to Hermes" onPress={() => setAsking(true)} /> : null}

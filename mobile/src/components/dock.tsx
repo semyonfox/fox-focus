@@ -23,29 +23,30 @@ export function DockScene({ tab, children }: { tab: "index" | "tasks" | "inbox";
 }
 
 export function Dock({ state, descriptors, navigation }: TabBarProps) {
-  const { expanded, expand, reduceMotion, blurTargets } = useDock();
+  const { expanded, expand, reduceMotion, screenReader, blurTargets } = useDock();
   const { rows } = useStore();
   const needs = needsCount(rows);
   const insets = useSafeAreaInsets();
-  const { width } = useWindowDimensions();
+  const { width, fontScale } = useWindowDimensions();
+  const displayExpanded = expanded || reduceMotion || screenReader || fontScale > 1.2;
   const progress = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     if (reduceMotion) {
-      progress.setValue(expanded ? 1 : 0);
+      progress.setValue(displayExpanded ? 1 : 0);
       return;
     }
-    Animated.timing(progress, { toValue: expanded ? 1 : 0, duration: 280, useNativeDriver: false }).start();
-  }, [expanded, progress, reduceMotion]);
+    Animated.timing(progress, { toValue: displayExpanded ? 1 : 0, duration: 280, useNativeDriver: false }).start();
+  }, [displayExpanded, progress, reduceMotion]);
 
   useEffect(() => { expand(); }, [expand, state.index]);
 
-  const height = progress.interpolate({ inputRange: [0, 1], outputRange: [52, 64] });
+  const height = progress.interpolate({ inputRange: [0, 1], outputRange: [52, Math.max(64, 48 + Math.ceil(18 * fontScale))] });
   const dockWidth = progress.interpolate({
     inputRange: [0, 1],
     outputRange: [Math.min(width - 80, 350), Math.min(width - 28, 420)],
   });
-  const labelHeight = progress.interpolate({ inputRange: [0, 1], outputRange: [0, 16] });
+  const labelHeight = progress.interpolate({ inputRange: [0, 1], outputRange: [0, Math.ceil(18 * fontScale)] });
   const activeRoute = state.routes[state.index].name;
   const blurTarget = activeRoute === "tasks" ? blurTargets.tasks : activeRoute === "inbox" ? blurTargets.inbox : blurTargets.index;
 

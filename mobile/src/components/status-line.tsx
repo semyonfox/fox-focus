@@ -15,7 +15,7 @@ export function StatusLine() {
   return (
     <View style={styles.line}>
       <View style={[styles.pip, { backgroundColor: tone === "amber" ? colors.amber : colors.blue }]} />
-      <T size="small" tone={tone} numberOfLines={1}>{text}</T>
+      <T size="small" tone={tone} accessibilityLiveRegion="polite">{text}</T>
     </View>
   );
 }

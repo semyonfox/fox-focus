@@ -1,13 +1,15 @@
 import {
-  approveEmailSend, createGoogleTask, createJob, decideInboxItem, emailSendBlocksInboxMutation, saveOwnerDraft,
+  approveEmailSend, createJob, decideInboxItem, emailSendBlocksInboxMutation, saveOwnerDraft,
 } from "@shared/inbox-client";
-import type { InboxItemRow, InboxOutcome } from "@shared/row-model";
+import { sourceCreationNonce } from "@shared/task-creation-guard";
+import type { InboxItemRow, InboxOutcome, TaskCreateInput } from "@shared/row-model";
 import { inboxStateLabel, relativeTime } from "@shared/work-threads";
 import { router, useLocalSearchParams } from "expo-router";
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { TaskCreationPreview } from "@/components/task-creation-preview";
 import { ThreadItem } from "@/components/rows";
-import { Actions, Button, Chip, Composer, Field, Missing, Panel, Screen, Section, T } from "@/components/ui";
+import { Actions, Button, Chip, Composer, Fact, Field, Missing, Panel, Screen, Section, T } from "@/components/ui";
 import { defaultDestination, defaultPlan, oneLine, randomKey } from "@/lib/api";
 import { tomorrowMorning } from "@/lib/dates";
 import { currentDraft, jobsFor, jobThread, sendActionFor, sendState } from "@/lib/derive";
@@ -24,7 +26,8 @@ export default function InboxItemScreen() {
   const [asking, setAsking] = useState(false);
   const [tasking, setTasking] = useState(false);
   const [taskTitle, setTaskTitle] = useState("");
-  const [listId, setListId] = useState<string | null>(null);
+  const [destinationKey, setDestinationKey] = useState<string | null>(null);
+  const [creation, setCreation] = useState<{ input: TaskCreateInput; listName: string } | null>(null);
   const item = rows.inbox.find(candidate => candidate.id === id);
   if (!item) return <Missing />;
 
@@ -33,7 +36,7 @@ export default function InboxItemScreen() {
   const blocked = emailSendBlocksInboxMutation(sendActionFor(rows, item));
   const open = item.state === "open";
   const jobs = jobsFor(rows, { inboxId: item.id });
-  const destination = rows.destinations.find(entry => entry.listId === listId) ?? defaultDestination(rows);
+  const destination = rows.destinations.find(entry => `${entry.accountId}:${entry.listId}` === destinationKey) ?? defaultDestination(rows);
 
   const decide = async (decision: Decision, done: string) => {
     const ok = await run(() => decideInboxItem(item, decision), done);
@@ -46,18 +49,17 @@ export default function InboxItemScreen() {
     if (ok) setEditing(false);
   };
 
-  const makeTask = async () => {
+  const makeTask = () => {
     if (!destination) return;
-    const ok = await run(() => createGoogleTask({
+    setCreation({ listName: destination.listName, input: {
       destination: { accountId: destination.accountId, listId: destination.listId },
-      nonce: randomKey(),
+      nonce: sourceCreationNonce("inbox", item.id),
       title: oneLine(taskTitle, 1024),
       notes: "",
       doOn: null,
       plan: defaultPlan,
       inbox: { id: item.id, version: item.version },
-    }), `Added to ${destination.listName}`);
-    if (ok) router.back();
+    } });
   };
 
   const handOver = async (text: string) => {
@@ -68,6 +70,7 @@ export default function InboxItemScreen() {
 
   return (
     <Screen>
+      {creation ? <TaskCreationPreview {...creation} onClose={() => setCreation(null)} onCreated={() => { setCreation(null); router.back(); }} /> : null}
       <T size="title" bold>{item.title}</T>
       <T size="small" tone="faint">
         {[item.source.kind === "email" ? "Email" : item.source.kind === "hermes" ? "Hermes" : "Capture", relativeTime(item.createdAt),
@@ -78,9 +81,18 @@ export default function InboxItemScreen() {
       {draft ? (
         <Panel>
           <T size="tiny" tone="faint" bold>{`DRAFT ${draft.revision} · ${draft.author === "hermes" ? "HERMES" : "YOU"}`}</T>
-          <T size="small" tone="muted" style={styles.envelope}>{`To ${draft.reply.to.join(", ")}\n${draft.reply.subject}`}</T>
+          <Fact label="Account" value={draft.reply.accountId} />
+          <Fact label="From" value={draft.reply.from} />
+          <Fact label="To" value={draft.reply.to.join(", ")} />
+          <Fact label="Cc" value={draft.reply.cc.join(", ") || "None"} />
+          <Fact label="Bcc" value={draft.reply.bcc.join(", ") || "None"} />
+          <Fact label="Subject" value={draft.reply.subject} />
+          <Fact label="Thread" value={draft.reply.threadId} />
+          <Fact label="Reply to" value={draft.reply.replyToMessageId} />
+          <Fact label="In reply to" value={draft.reply.inReplyTo} />
+          <Fact label="References" value={draft.reply.references.join(", ") || "None"} />
           {editing
-            ? <Field value={body} onChangeText={setBody} multiline autoFocus />
+            ? <Field label="Reply body" value={body} onChangeText={setBody} multiline autoFocus />
             : <T size="small">{draft.reply.bodyText}</T>}
           {open && !blocked ? (
             <Actions>
@@ -102,14 +114,14 @@ export default function InboxItemScreen() {
 
       {tasking ? (
         <Panel>
-          <Field value={taskTitle} onChangeText={setTaskTitle} placeholder="Task" autoFocus />
+          <Field label="Task title" value={taskTitle} onChangeText={setTaskTitle} placeholder="Task" autoFocus />
           <View style={styles.chips}>
             {rows.destinations.map(entry => (
-              <Chip key={entry.listId} label={entry.listName} on={destination?.listId === entry.listId} onPress={() => setListId(entry.listId)} />
+              <Chip key={`${entry.accountId}:${entry.listId}`} label={`${entry.listName} · ${entry.accountId}`} on={destination?.listId === entry.listId && destination.accountId === entry.accountId} onPress={() => setDestinationKey(`${entry.accountId}:${entry.listId}`)} />
             ))}
           </View>
           <Actions>
-            <Button label={destination ? `Add to ${destination.listName}` : "No task list"} tone="primary" disabled={!destination || !taskTitle.trim()} onPress={() => { void makeTask(); }} />
+            <Button label={destination ? "Review outgoing task" : "No task list"} tone="primary" disabled={!destination || !taskTitle.trim()} onPress={() => { void makeTask(); }} />
             <Button label="Cancel" tone="quiet" onPress={() => setTasking(false)} />
           </Actions>
         </Panel>

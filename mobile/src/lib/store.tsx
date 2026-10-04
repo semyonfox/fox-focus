@@ -3,6 +3,7 @@ import { AppState, StyleSheet, Text, View } from "react-native";
 import { configureServer, emptyRows, fetchRows, type Rows } from "./api";
 import { loadConnection, saveConnection, type Connection } from "./settings";
 import { colors, font, radius, space } from "./theme";
+import { telemetry } from "./telemetry";
 
 type Store = {
   connection: Connection | null;
@@ -10,6 +11,7 @@ type Store = {
   rows: Rows;
   loading: boolean;
   error: string | null;
+  actionError: string | null;
   loadedAt: string | null;
   refresh: () => Promise<void>;
   // runs one server change, reports it, then reloads rows
@@ -32,9 +34,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [rows, setRows] = useState<Rows>(emptyRows);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [loadedAt, setLoadedAt] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const currentConnection = useRef<Connection | null>(null);
+  const connectionGeneration = useRef(0);
+  const requestGeneration = useRef(0);
+  const changingConnection = useRef(false);
+  const startupRead = useRef<Promise<void> | null>(null);
 
   const notify = useCallback((text: string) => {
     setNotice(text);
@@ -43,28 +51,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const load = useCallback(async (quiet = false) => {
+    if (!currentConnection.current || changingConnection.current) return;
+    const connectionAtStart = connectionGeneration.current;
+    const requestAtStart = ++requestGeneration.current;
+    const isCurrent = () => connectionAtStart === connectionGeneration.current &&
+      requestAtStart === requestGeneration.current;
     if (!quiet) setLoading(true);
     try {
-      setRows(await fetchRows());
+      const nextRows = await fetchRows();
+      if (!isCurrent()) return;
+      setRows(nextRows);
       setLoadedAt(new Date().toISOString());
       setError(null);
     } catch (cause) {
-      setError(message(cause, "Could not reach Fox Focus"));
+      if (isCurrent()) {
+        setError(message(cause, "Could not reach Fox Focus"));
+        telemetry.emit({ kind: "error", name: "request_failed" }, "workspace");
+      }
     } finally {
-      if (!quiet) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-    void loadConnection().then(async saved => {
+    telemetry.emit({ kind: "count", name: "app_open" }, "app");
+    startupRead.current = loadConnection().then(saved => {
       if (cancelled) return;
       configureServer(saved);
+      currentConnection.current = saved;
       setConnection(saved);
-      if (saved) await load();
-      if (!cancelled) setReady(true);
+      if (saved) {
+        void load().finally(() => { if (!cancelled) setReady(true); });
+      } else {
+        setReady(true);
+      }
+    }).catch(cause => {
+      if (!cancelled) {
+        setError(message(cause, "Could not read saved connection"));
+        setReady(true);
+      }
     });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; connectionGeneration.current++; };
   }, [load]);
 
   const inFlight = rows.actions.some(action => action.state === "queued" || action.state === "running") ||
@@ -92,48 +120,64 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [connection, load]);
 
   const run = useCallback(async (change: () => Promise<unknown>, done?: string) => {
+    setActionError(null);
+    const connectionAtStart = connectionGeneration.current;
     try {
+      if (changingConnection.current || !currentConnection.current) throw new Error("Connect to Fox Focus in Settings");
       await change();
+      if (connectionAtStart !== connectionGeneration.current) return false;
       if (done) notify(done);
       await load(true);
       return true;
     } catch (cause) {
-      notify(message(cause, "That didn't go through"));
+      if (connectionAtStart !== connectionGeneration.current) return false;
+      setActionError(message(cause, "That didn't go through"));
       void load(true);
       return false;
     }
   }, [load, notify]);
 
   const connect = useCallback(async (next: Connection | null) => {
-    if (next) {
-      // test before saving so a typo doesn't replace a working login
-      configureServer(next);
-      try {
+    if (startupRead.current) await startupRead.current;
+    if (changingConnection.current) throw new Error("Connection change already in progress");
+    changingConnection.current = true;
+    connectionGeneration.current++;
+    setLoading(false);
+    let restoreRows = false;
+    try {
+      if (next) {
+        // test before saving so a typo doesn't replace a working login
+        configureServer(next);
         await fetchRows();
-      } catch (cause) {
-        configureServer(connection);
-        throw cause;
       }
-    } else {
-      configureServer(null);
+      await saveConnection(next);
+      configureServer(next);
+      currentConnection.current = next;
+      setConnection(next);
       setRows(emptyRows);
       setLoadedAt(null);
       setError(null);
+      setActionError(null);
+    } catch (cause) {
+      configureServer(currentConnection.current);
+      restoreRows = currentConnection.current !== null;
+      throw cause;
+    } finally {
+      changingConnection.current = false;
+      if (restoreRows) void load();
     }
-    await saveConnection(next);
-    setConnection(next);
     if (next) await load();
-  }, [connection, load]);
+  }, [load]);
 
   const value = useMemo<Store>(() => ({
-    connection, ready, rows, loading, error, loadedAt, refresh, run, connect, notify,
-  }), [connection, ready, rows, loading, error, loadedAt, refresh, run, connect, notify]);
+    connection, ready, rows, loading, error, actionError, loadedAt, refresh, run, connect, notify,
+  }), [connection, ready, rows, loading, error, actionError, loadedAt, refresh, run, connect, notify]);
 
   return (
     <StoreContext.Provider value={value}>
       {children}
       {notice ? (
-        <View pointerEvents="none" style={styles.notice}>
+        <View pointerEvents="none" style={styles.notice} accessibilityLiveRegion="polite">
           <Text style={styles.noticeText}>{notice}</Text>
         </View>
       ) : null}

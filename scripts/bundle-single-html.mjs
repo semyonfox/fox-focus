@@ -87,9 +87,14 @@ const [css, script] = await Promise.all([
   readFile(assetPath(scriptReference), "utf8"),
 ]);
 
-const bundledScript = `<script>\n${script.replaceAll("</script>", "<\\/script>")}\n    </script>`;
+const favicon = await readFile(resolve(projectDirectory, "public/favicon.svg"));
+const faviconUri = `data:image/svg+xml;base64,${favicon.toString("base64")}`;
+const offlineScript = script.replaceAll('/favicon.svg', faviconUri);
+const bundledScript = `<script>\n${offlineScript.replaceAll("</script>", "<\\/script>")}\n    </script>`;
 const standaloneHtml = html
   .replace(stylesheetTag, () => `<style>\n${css}\n    </style>`)
+  .replace(/<link\b[^>]*\brel="manifest"[^>]*>/g, "")
+  .replaceAll("/favicon.svg", faviconUri)
   .replace(moduleScriptTag, "")
   .replace("</body>", () => `    ${bundledScript}\n  </body>`);
 
