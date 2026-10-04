@@ -118,6 +118,32 @@ test("orders dated due labels chronologically instead of by creation time", () =
   );
 });
 
+test("orders legacy date labels across New Year using their weekday", () => {
+  const tasks = [
+    task("january", { due: "Sat 2 Jan" }),
+    task("december", { due: "Thu 31 Dec" }),
+  ];
+  assert.deepEqual(
+    tasks.sort((first, second) => compareTasksByDue(first, second, "2026-12-30")).map(({ id }) => id),
+    ["december", "january"],
+  );
+  assert.deepEqual(
+    tasks.sort((first, second) => compareTasksByDue(first, second, "2027-01-03")).map(({ id }) => id),
+    ["december", "january"],
+  );
+});
+
+test("treats Friday as today when sorting on a Friday", () => {
+  const tasks = [
+    task("tomorrow", { due: "Tomorrow" }),
+    task("friday", { due: "Friday" }),
+  ];
+  assert.deepEqual(
+    tasks.sort((first, second) => compareTasksByDue(first, second, "2026-09-11")).map(({ id }) => id),
+    ["friday", "tomorrow"],
+  );
+});
+
 test("accepts exact calendar instants while preserving dated and time-only legacy rows", () => {
   const base = {
     id: "event-1",

@@ -839,7 +839,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const activeTasks = data.tasks.filter((task) => !task.completed);
   const activeBlock = visibleCalendarEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
   const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
-  const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
+  const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task" && !record.adoptedTaskId) ?? [];
   const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
     importedTasks.some((task) => task.provider === provider) ||
     integrations.overview?.providers.some((status) => status.provider === provider && status.connection?.state === "connected") === true;
@@ -920,13 +920,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }));
   const combinedImportedTasks = visibleImportedTasks.filter((task) =>
     !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
+  const categoryDistinctImportedTasks = categoryImportedTasks.filter((task) =>
+    !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
   const taskSourceOptions: Array<{ id: TaskSource; label: string; count: number }> = [
     { id: allTaskSources, label: "All sources", count: visibleTasks.length + visibleHermesTasks.length + combinedImportedTasks.length },
     { id: localTaskSource, label: "Fox Focus", count: visibleTasks.length },
   ];
   if (hermesBoard) taskSourceOptions.push({ id: hermesTaskSource, label: "Hermes", count: visibleHermesTasks.length });
-  if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleImportedTasks.filter((task) => task.provider === "google").length });
-  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
+  if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: combinedImportedTasks.filter((task) => task.provider === "google").length });
+  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: combinedImportedTasks.filter((task) => task.provider === "microsoft").length });
   const isExternalOnlyScope = taskSource === googleTaskSource || taskSource === microsoftTaskSource;
   const isHermesOnlyScope = taskSource === hermesTaskSource;
 
@@ -935,7 +937,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const shownImportedTasks = taskSource === allTaskSources
     ? combinedImportedTasks
     : taskSource === googleTaskSource || taskSource === microsoftTaskSource
-      ? visibleImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
+      ? combinedImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
       : [];
 
   const reminderCount = allReminders.length;
@@ -949,15 +951,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
   const selectedTaskCategoryLabel = taskCategory === allTaskCategories ? "all areas" : taskCategory === unclassifiedTaskCategory ? "uncategorised" : taskCategory;
   const taskFilterCounts: Record<TaskFilter, number> = {
-    all: categoryLocalTasks.length + categoryHermesTasks.length,
-    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length,
-    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length,
-    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length,
-    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length,
-    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length,
+    all: categoryLocalTasks.length + categoryHermesTasks.length + categoryDistinctImportedTasks.length,
+    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed").length,
+    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done" && hermesTaskDue(task, todayDate) === "Today").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed" && task.dueOn === todayDate).length,
+    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length + categoryHermesTasks.filter((task) => Boolean(task.scheduledAt) && task.status !== "done").length,
+    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done" && (task.status === "blocked" || task.localState === "waiting")).length,
+    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length + categoryDistinctImportedTasks.filter((task) => task.status === "completed").length,
   };
   const activeTaskFilterCount = Number(taskFilter !== "all") + Number(taskSource !== allTaskSources) + Number(taskSort !== "due");
-  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length;
+  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
   const todayEvents = sortedEvents.filter((event) => eventDateKey(event, todayDate) === todayDate);
   const currentTime = timeValueToMinutes(dublinTimeValue(new Date()));
   const currentEvent = todayEvents.find((event) => {
@@ -1540,6 +1542,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                   title,
                   area: eventDraft.area,
                   duration: formatDuration(nextEvent.duration),
+                  scheduledDate: eventDraft.date,
                   scheduledTime: eventDraft.time,
                   state: task.completed ? "done" : "scheduled",
                 }
@@ -1552,7 +1555,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       inboxItems: modal.inboxId
         ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
         : current.inboxItems,
-      reminders: updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt),
+      reminders: (() => {
+        const eventReminders = updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt);
+        const linkedTaskReminder = existingEvent?.taskId
+          ? current.reminders.find((reminder) => reminder.targetType === "task" && reminder.targetId === existingEvent.taskId)
+          : undefined;
+        return linkedTaskReminder && existingEvent?.taskId
+          ? updateReminder(eventReminders, existingEvent.taskId, "task", title, linkedTaskReminder.mode, startsAt)
+          : eventReminders;
+      })(),
     }));
 
     if (existingEvent?.taskId && completionUndo?.taskId === existingEvent.taskId) setCompletionUndo(null);
@@ -1577,12 +1588,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ...current,
       tasks: current.tasks.map((task) =>
         task.linkedEventId === eventToRemove.id
-          ? { ...task, linkedEventId: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
+          ? { ...task, linkedEventId: undefined, scheduledDate: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
           : task,
       ),
       events: current.events.filter((event) => event.id !== eventToRemove.id),
       inboxItems: current.inboxItems,
-      reminders: current.reminders.filter((reminder) => reminder.targetId !== eventToRemove.id),
+      reminders: current.reminders.filter((reminder) =>
+        !(reminder.targetType === "event" && reminder.targetId === eventToRemove.id) &&
+        !(reminder.targetType === "task" && current.tasks.some((task) => task.id === reminder.targetId && task.linkedEventId === eventToRemove.id))),
     }));
     if (eventToRemove.taskId && completionUndo?.taskId === eventToRemove.taskId) setCompletionUndo(null);
     setSelectedEventId(null);
@@ -1935,7 +1948,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <nav className="task-category-strip" aria-label="Task categories">{taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}</nav>
         {hermesBoard && (taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory) && taskFilter !== "all" && taskFilter !== "open" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks appear in All, Open, or Done because they do not have Fox Focus deadlines yet.</p> : null}
         <div className="task-compact-toolbar">
-          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
+          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard || googleTasksAvailable || microsoftTasksAvailable ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
           <span className="task-view-count" role="status" aria-live="polite">{shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
           {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
         </div>
@@ -1943,6 +1956,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`}>
           {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} dueLabel={taskDeadlineLabel(task, todayDate)} latestAction={latestActionByTask.get(task.id)} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} />)}
           {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} busy={adoptingHermesId === task.id} onAdopt={(candidate) => void previewHermesAdoption(candidate)} />)}
+          {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={areaForList(data.listAreas, task.provider, task.containerId, task.containerName)} />)}
           {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Change the category or filters, or add a task."}</p></div> : null}
         </div>
       </article>
