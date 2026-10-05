@@ -6,6 +6,7 @@ type DockTab = "index" | "tasks" | "inbox";
 type DockState = {
   expanded: boolean;
   reduceMotion: boolean;
+  screenReader: boolean;
   expand: () => void;
   onScroll: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
   blurTargets: Record<DockTab, RefObject<View | null>>;
@@ -16,6 +17,7 @@ const DockContext = createContext<DockState | null>(null);
 export function DockProvider({ children }: { children: ReactNode }) {
   const [expanded, setExpanded] = useState(true);
   const [reduceMotion, setReduceMotion] = useState(false);
+  const [screenReader, setScreenReader] = useState(false);
   const previousOffset = useRef(0);
   const travel = useRef(0);
   const blurTargets = useRef({
@@ -25,9 +27,11 @@ export function DockProvider({ children }: { children: ReactNode }) {
   }).current;
 
   useEffect(() => {
-    void AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion);
+    void AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion).catch(() => setReduceMotion(true));
+    void AccessibilityInfo.isScreenReaderEnabled().then(setScreenReader).catch(() => setScreenReader(true));
+    const screenReaderSubscription = AccessibilityInfo.addEventListener("screenReaderChanged", setScreenReader);
     const subscription = AccessibilityInfo.addEventListener("reduceMotionChanged", setReduceMotion);
-    return () => subscription.remove();
+    return () => { subscription.remove(); screenReaderSubscription.remove(); };
   }, []);
 
   const onScroll = (event: NativeSyntheticEvent<NativeScrollEvent>) => {
@@ -51,7 +55,7 @@ export function DockProvider({ children }: { children: ReactNode }) {
     setExpanded(true);
   }, []);
 
-  return <DockContext value={{ expanded, reduceMotion, expand, onScroll, blurTargets }}>{children}</DockContext>;
+  return <DockContext value={{ expanded, reduceMotion, screenReader, expand, onScroll, blurTargets }}>{children}</DockContext>;
 }
 
 export function useDock(): DockState {

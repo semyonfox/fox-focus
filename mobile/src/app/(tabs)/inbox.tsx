@@ -17,7 +17,7 @@ const titles: Record<WorkThreadGroup, string> = { needs_you: "Needs you", workin
 type Collapsible = "noise" | "settled";
 
 export default function Inbox() {
-  const { rows, run, loading, refresh, connection, ready } = useStore();
+  const { rows, run, loading, refresh, connection, ready, actionError, error, loadedAt } = useStore();
   const dock = useDock();
   const [composing, setComposing] = useState(false);
   const [expanded, setExpanded] = useState<Record<Collapsible, boolean>>({ noise: false, settled: false });
@@ -56,9 +56,12 @@ export default function Inbox() {
         onScroll={dock.onScroll}
         scrollEventThrottle={16}
         refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} tintColor={colors.muted} colors={[colors.page]} progressBackgroundColor={colors.accent} />}
-        ListHeaderComponent={composing
-          ? <Composer placeholder="What should Hermes do?" submitLabel="Hand over" onSubmit={ask} onCancel={() => setComposing(false)} />
+        ListHeaderComponent={<>
+          {actionError ? <T tone="amber" accessibilityRole="alert" accessibilityLiveRegion="polite">{actionError}</T> : null}
+          {error ? <T tone="amber" accessibilityRole="alert">{error}. Pull down to retry reading Inbox.</T> : null}
+          {composing ? <Composer placeholder="What should Hermes do?" submitLabel="Hand over" onSubmit={ask} onCancel={() => setComposing(false)} />
           : <Button label="Ask Hermes" onPress={() => setComposing(true)} />}
+        </>}
         renderSectionHeader={({ section }) => (
           <Section
             title={titles[section.group]}
@@ -71,7 +74,7 @@ export default function Inbox() {
           />
         )}
         renderItem={({ item }) => <ThreadItem thread={item} />}
-        ListEmptyComponent={<T size="small" tone="faint" style={styles.empty}>Inbox zero</T>}
+        ListEmptyComponent={<T size="small" tone="faint" style={styles.empty}>{!ready || loading && !loadedAt ? "Loading Inbox…" : error && !loadedAt ? "Inbox unavailable · pull down to retry" : "Inbox is clear"}</T>}
       />
     </DockScene>
   );

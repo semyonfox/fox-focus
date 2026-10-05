@@ -130,3 +130,20 @@ Compatibility workspace, mirror, annotation, adoption, old task-action, task-sta
 - [Hermes integration contract](docs/hermes-task-sync-request.md)
 - [Provider setup and boundaries](docs/integrations.md)
 - [Self-hosting notes](docs/deployment.md)
+
+Anonymous usage collection is off by default. A web build requires both
+`VITE_ANONYMOUS_STATS_ENABLED=true` and an owner-provided
+`VITE_ANONYMOUS_STATS_ENDPOINT` ending in `/v1/events`. Use HTTPS or a relative
+path to a separately configured same-origin proxy. No endpoint is preselected.
+The Sources drawer provides an opt-out; Global Privacy Control, Do Not Track,
+and unreadable preferences also stop collection. Android collection remains off.
+
+The optional payload contains only version, app, kind, fixed event name, surface,
+and a fixed route category. It carries no task, email, account, input, URL, error
+message, stack, identifier or exact timestamp. Requests omit credentials and
+referrers, reject redirects, time out after two seconds, and have no retries or
+persistent queue. Limits are 20 events per minute, 200 per app lifetime and one
+request in flight, with repeated error categories suppressed for one minute.
+The separate collector must discard raw events and request metadata, retain only
+UTC daily aggregates for 30 days (counts) or 14 days (errors), and disable request
+logs before collection is enabled. No collector is deployed by this project.

@@ -1,17 +1,20 @@
-import { briefingReminderSuggestion, createGoogleTask } from "@shared/inbox-client";
-import type { BriefingEntry } from "@shared/row-model";
+import { briefingReminderSuggestion } from "@shared/inbox-client";
+import type { BriefingEntry, TaskCreateInput } from "@shared/row-model";
+import { sourceCreationNonce } from "@shared/task-creation-guard";
 import { useState } from "react";
 import { Linking, Pressable, StyleSheet, View } from "react-native";
-import { defaultDestination, defaultPlan, oneLine, randomKey } from "@/lib/api";
+import { defaultDestination, defaultPlan, oneLine } from "@/lib/api";
 import { dublinDateKey, whenLabel } from "@/lib/dates";
 import { useStore } from "@/lib/store";
 import { colors, space } from "@/lib/theme";
 import { Actions, Button, Panel, Section, T } from "./ui";
+import { TaskCreationPreview } from "./task-creation-preview";
 
 // today's Hermes brief: news and upcoming events, collapsed until opened
 export function BriefingCard() {
-  const { rows, run, notify } = useStore();
+  const { rows, notify } = useStore();
   const [open, setOpen] = useState(false);
+  const [creation, setCreation] = useState<{ input: TaskCreateInput; listName: string } | null>(null);
   const today = dublinDateKey();
   const briefing = rows.briefings.find(entry => entry.day === today && Date.parse(entry.expiresAt) > Date.now());
   if (!briefing?.entries.length) return null;
@@ -27,24 +30,25 @@ export function BriefingCard() {
       notify("It starts too soon for a reminder");
       return;
     }
-    void run(() => createGoogleTask({
+    setCreation({ listName: destination.listName, input: {
       destination: { accountId: destination.accountId, listId: destination.listId },
-      nonce: randomKey(),
+      nonce: sourceCreationNonce("brief", briefing.day, briefing.entries.indexOf(entry)),
       title: oneLine(entry.title, 1024),
       notes: entry.url ?? "",
       doOn: entry.startsAt ? dublinDateKey(new Date(entry.startsAt)) : null,
       plan: defaultPlan,
       ...(reminder ? { reminder: { fireAt: reminder.fireAt } } : {}),
-    }), remind ? `Reminder set in ${destination.listName}` : `Saved to ${destination.listName}`);
+    } });
   };
 
   return (
     <>
+      {creation ? <TaskCreationPreview {...creation} onClose={() => setCreation(null)} onCreated={() => setCreation(null)} /> : null}
       <Section
         title="Morning brief"
         count={briefing.entries.length}
         action={
-          <Pressable hitSlop={8} onPress={() => setOpen(current => !current)}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Morning brief" accessibilityState={{ expanded: open }} style={{ minHeight: 48, minWidth: 48, justifyContent: "center" }} onPress={() => setOpen(current => !current)}>
             <T size="tiny" tone="muted">{open ? "Hide" : "Show"}</T>
           </Pressable>
         }

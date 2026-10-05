@@ -1,5 +1,7 @@
 import { CalendarDays, CheckCircle2, Link2, ListTodo, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { browserTelemetryAllowed } from './telemetry.ts';
+import { setTelemetryAllowed, telemetry } from './web-telemetry.ts';
 import { dublinDateKey, isDateKey } from './calendar-time.ts';
 import { areaForList, filterCalendarContextByDateRange, listAreaKey } from './integration-model.ts';
 import {
@@ -290,7 +292,7 @@ function recordWhen(record: ImportedRecord): string {
 function connectionCopy(provider: ProviderStatus): string {
   if (!provider.configured) return 'Server credentials have not been mounted.';
   if (!provider.connection) return provider.provider === 'google'
-    ? 'Full Google Calendar and Tasks access is ready to connect. Calendar changes will still require an explicit approval flow in Fox Focus.'
+    ? 'Google Tasks is ready to connect. Provider calendars stay read-only; planning and calendar blocks stay local.'
     : 'Read-only calendar and task context is ready to connect.';
   if (provider.connection.state === 'needs_reconnect') return 'The saved authorization needs to be renewed.';
   if (provider.provider === 'google' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks')) {
@@ -401,6 +403,15 @@ export function IntegrationsDrawer({
   const [migrationApprovalKey, setMigrationApprovalKey] = useState('');
   const [migrationBusy, setMigrationBusy] = useState<'preview' | 'approve' | 'refresh' | null>(null);
   const [migrationHistoryLoaded, setMigrationHistoryLoaded] = useState(false);
+  const [migrationHistoryRetry, setMigrationHistoryRetry] = useState(0);
+  const [migrationHistoryFailed, setMigrationHistoryFailed] = useState(false);
+  const [statsAllowed, setStatsAllowed] = useState(browserTelemetryAllowed);
+  const migrationPreviewHeading = useRef<HTMLHeadingElement | null>(null);
+  const migrationPreviewButton = useRef<HTMLButtonElement | null>(null);
+  const previewRead = useRef<AbortController | null>(null);
+  const drawerGeneration = useRef(0);
+  const migrationApprovalInFlight = useRef(false);
+  const [submittedMigration, setSubmittedMigration] = useState<{ hash: string; key: string } | null>(null);
   const [approvingAdoption, setApprovingAdoption] = useState(false);
   const approvalInFlight = useRef(false);
   const adoptionTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -416,13 +427,19 @@ export function IntegrationsDrawer({
   }
 
   useEffect(() => {
+    drawerGeneration.current++;
+    previewRead.current?.abort();
+    previewRead.current = null;
     if (open) return;
+    if (migrationBusy === 'preview') setMigrationBusy(null);
     setAdoption(null);
     setAdoptionSourceRecord(null);
     setLinkTargetId('');
     setMessage(null);
     setConnectionResult(null);
     setMigrationHistoryLoaded(false);
+    setMigrationHistoryFailed(false);
+    if (!submittedMigration && !migrationApprovalInFlight.current) { setMigrationPreview(null); setMigrationApprovalKey(''); }
     setApprovingAdoption(false);
     approvalInFlight.current = false;
   }, [open]);
@@ -438,23 +455,32 @@ export function IntegrationsDrawer({
 
   useEffect(() => {
     if (!open || migrationHistoryLoaded) return;
-    setMigrationHistoryLoaded(true);
+    setMigrationHistoryFailed(false);
     const controller = new AbortController();
     void (async () => {
       try {
         const response = await fetch('/api/v1/task-migrations', { signal: controller.signal });
         const value: unknown = await response.json();
         if (!response.ok || !isMigrationHistoryResponse(value)) throw new Error('Invalid migration history');
-        const latest = value.migrations.find(migration => migration.state !== 'settled') ?? value.migrations[0] ?? null;
+        const latest = (submittedMigration ? value.migrations.find(migration => migration.previewHash === submittedMigration.hash) : null) ?? value.migrations.find(migration => migration.state !== 'settled') ?? value.migrations[0] ?? null;
+        if (controller.signal.aborted) return;
         setMigrationProgress(latest);
+        if (submittedMigration && latest?.previewHash === submittedMigration.hash) {
+          setSubmittedMigration(null);
+          setMigrationPreview(null);
+          setMigrationApprovalKey('');
+          setMessage('Approval found in durable history. Review its recorded progress.');
+        }
+        setMigrationHistoryLoaded(true);
       } catch (error) {
         if (!(error instanceof DOMException && error.name === 'AbortError')) {
-          setMessage('Task migration history could not be loaded.');
+          setMigrationHistoryFailed(true);
+          setMessage('Task migration history could not be loaded. Retry this read to recover.');
         }
       }
     })();
     return () => controller.abort();
-  }, [migrationHistoryLoaded, open]);
+  }, [migrationHistoryRetry, open]);
 
   useEffect(() => {
     if (!open || !migrationProgress || migrationProgress.state === 'settled' || migrationProgress.state === 'needs_review') return;
@@ -483,7 +509,8 @@ export function IntegrationsDrawer({
   }, [migrationProgress?.migrationId, migrationProgress?.state, open]);
 
   useEffect(() => {
-    if (!open || migrationProgress?.state !== 'settled') return;
+    if (!open || (migrationProgress?.state !== 'settled' && migrationProgress?.state !== 'needs_review')) return;
+    if (migrationProgress.state === 'needs_review') { setMessage('Migration needs review. Inspect unresolved items; unknown creations require reconciliation before another attempt.'); return; }
     setMessage('Task migration settled. Source mappings and approval history were preserved.');
     void refresh();
   }, [migrationProgress?.migrationId, migrationProgress?.state, open, refresh]);
@@ -560,48 +587,70 @@ export function IntegrationsDrawer({
   }
 
   async function previewMigration() {
+    if (submittedMigration || migrationApprovalInFlight.current) return;
+    const generation = drawerGeneration.current;
+    const controller = new AbortController();
+    previewRead.current?.abort();
+    previewRead.current = controller;
     setMigrationBusy('preview');
     setMessage(null);
     try {
       await beforeWorkspaceMutation?.();
-      const response = await fetch('/api/v1/task-migrations/preview');
+      if (controller.signal.aborted) return;
+      const response = await fetch('/api/v1/task-migrations/preview', { signal: controller.signal });
       const value: unknown = await response.json();
       if (!response.ok || !isMigrationPreviewResponse(value)) {
         throw new Error(isRecord(value) && typeof value.error === 'string' ? value.error : 'Could not prepare task migration.');
       }
+      if (controller.signal.aborted || generation !== drawerGeneration.current) return;
       setMigrationPreview(value.preview);
+      setMessage("Migration preview ready. Review the exact outgoing values before approval.");
+      window.requestAnimationFrame(() => { if (!controller.signal.aborted && generation === drawerGeneration.current) migrationPreviewHeading.current?.focus(); });
       setMigrationProgress(null);
       setMigrationApprovalKey(crypto.randomUUID());
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Could not prepare task migration.');
+      if (!controller.signal.aborted && generation === drawerGeneration.current) setMessage(error instanceof Error ? error.message : 'Could not prepare task migration.');
     } finally {
-      setMigrationBusy(null);
+      if (previewRead.current === controller) { previewRead.current = null; setMigrationBusy(null); }
     }
   }
 
   async function approveMigration() {
-    if (!migrationPreview || migrationPreview.blockers.length || !migrationPreview.items.length) return;
+    if (!migrationPreview || submittedMigration || migrationApprovalInFlight.current || migrationPreview.blockers.length || !migrationPreview.items.length) return;
+    migrationApprovalInFlight.current = true;
+    const approval = { hash: migrationPreview.hash, key: migrationApprovalKey || crypto.randomUUID() };
     setMigrationBusy('approve');
     setMessage(null);
     try {
       await beforeWorkspaceMutation?.();
+      setSubmittedMigration(approval);
       const response = await fetch('/api/v1/task-migrations/approve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          previewHash: migrationPreview.hash,
-          idempotencyKey: migrationApprovalKey || crypto.randomUUID(),
+          previewHash: approval.hash,
+          idempotencyKey: approval.key,
         }),
       });
       const value: unknown = await response.json();
+      if (response.status === 409 && isRecord(value) && value.error === 'Task migration sources changed or no eligible tasks remain. Review a new preview.' && isMigrationPreviewResponse(value)) {
+        setSubmittedMigration(null);
+        setMigrationPreview(null);
+        setMigrationApprovalKey('');
+        setMessage('Sources changed before approval. Prepare a fresh exact preview.');
+        window.requestAnimationFrame(() => migrationPreviewButton.current?.focus());
+        return;
+      }
       if (!response.ok || !isMigrationProgressResponse(value)) {
         throw new Error(isRecord(value) && typeof value.error === 'string' ? value.error : 'Could not approve task migration.');
       }
       setMigrationProgress(value.migration);
+      setSubmittedMigration(null);
       setMessage(value.migration.state === 'settled' ? 'Task migration settled.' : 'Task migration approved and queued.');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Could not approve task migration.');
+      setMessage('Approval response was not confirmed. Check approval history before any further approval. The exact submitted identity is retained.');
     } finally {
+      migrationApprovalInFlight.current = false;
       setMigrationBusy(null);
     }
   }
@@ -658,11 +707,19 @@ export function IntegrationsDrawer({
           <div><p className="eyebrow">Connections</p><h2>Calendars &amp; tasks</h2></div>
           <button ref={drawerCloseRef} className="close-composer" type="button" disabled={approvingAdoption} onClick={onClose} aria-label="Close connections"><X size={17} /></button>
         </div>
-        <p className="drawer-intro">Google Calendar and Tasks are connected through explicit approval boundaries. Fox Focus keeps planning and reminders; calendar changes need a dedicated owner-approved action flow.</p>
+        <p className="drawer-intro">Google owns task content and completion. Fox Focus keeps local planning and reminders. Provider calendars are read-only; calendar blocks stay local.</p>
         <div className="integration-security"><ShieldCheck size={15} /><span>Only the exact task create or status change you approve can be written. Delete and clear actions are not available.</span></div>
+        <section className="anonymous-stats" aria-labelledby="anonymous-stats-heading">
+          <h3 id="anonymous-stats-heading">Anonymous usage</h3>
+          <p>Self-hosted screen counts and fixed error categories. No visitor tracking or task, email, account, or form content.</p>
+          <label><input type="checkbox" checked={telemetry.configured && statsAllowed} disabled={!telemetry.configured} onChange={event => {
+            setStatsAllowed(setTelemetryAllowed(event.target.checked));
+          }} /> Allow anonymous counts</label>
+          <p>{telemetry.configured ? "You can turn this off at any time. Browser privacy signals also disable collection." : "Off until the owner configures self-hosted collection."}</p>
+        </section>
         {connectionResult ? <p className={`integration-message${connectionResult.failed ? ' integration-message--error' : ''}`} role="status">{connectionResult.text}</p> : null}
         {message ? <p className="integration-message" role="status" aria-live="polite" aria-atomic="true">{message}</p> : null}
-        {failed ? <p className="integration-message integration-message--error" role="status">Could not load connection status. Your provider data was not changed.</p> : null}
+        {failed ? <div className="integration-message integration-message--error" role="alert"><p>{overview ? 'Connection status could not refresh. Showing the last loaded state.' : 'Could not load connection status. Your provider data was not changed.'}</p><button className="secondary-action" type="button" disabled={loading} onClick={() => void refresh()}>Retry connection status</button></div> : null}
         {adoptionSourceRecord && !adoption ? <section className="saved-draft" aria-label="Choose task adoption destination" aria-busy={adopting === adoptionSourceRecord.id}>
           <span>Prepare adoption preview</span>
           <p><strong>Source:</strong> {adoptionSourceRecord.title} · {providerLabel(adoptionSourceRecord.provider)} · {adoptionSourceRecord.containerName}</p>
@@ -697,19 +754,21 @@ export function IntegrationsDrawer({
               </div>
               <div className="integration-provider-actions">
                 {!provider.configured ? <span className="connection-state connection-state--muted">Setup needed</span> : null}
-                {provider.configured && !provider.connection ? <a className="submit-button" href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> Connect</a> : null}
-                {provider.configured && (provider.connection?.state === 'needs_reconnect' || (provider.provider === 'google' && provider.connection?.state === 'connected' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks'))) ? <a className="submit-button" href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> {provider.connection?.state === 'needs_reconnect' ? 'Reconnect' : 'Enable task updates'}</a> : null}
-                {provider.configured && provider.connection?.state === 'connected' ? <button className="secondary-action" type="button" disabled={syncing === provider.provider || provider.sync.state === 'syncing'} onClick={() => void sync(provider.provider)}><RefreshCw size={13} /> Refresh</button> : null}
+                {provider.configured && !provider.connection ? <a className="submit-button" aria-label={`Connect ${providerLabel(provider.provider)}`} href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> Connect</a> : null}
+                {provider.configured && (provider.connection?.state === 'needs_reconnect' || (provider.provider === 'google' && provider.connection?.state === 'connected' && !provider.connection.scopes.includes('https://www.googleapis.com/auth/tasks'))) ? <a className="submit-button" aria-label={provider.connection?.state === 'needs_reconnect' ? `Reconnect ${providerLabel(provider.provider)}` : `Enable task updates for ${providerLabel(provider.provider)}`} href={`/api/v1/integrations/${provider.provider}/connect`}><Link2 size={13} /> {provider.connection?.state === 'needs_reconnect' ? 'Reconnect' : 'Enable task updates'}</a> : null}
+                {provider.configured && provider.connection?.state === 'connected' ? <button className="secondary-action" type="button" aria-label={`Refresh ${providerLabel(provider.provider)}`} disabled={syncing === provider.provider || provider.sync.state === 'syncing'} onClick={() => void sync(provider.provider)}><RefreshCw size={13} /> Refresh</button> : null}
               </div>
             </article>
           ))}
           {!overview && !loading ? <p className="empty-line">No connection status is available yet.</p> : null}
         </div>
+        {submittedMigration ? <div className="integration-message" role="status"><p>{migrationBusy === 'approve' ? 'Recording the exact approval…' : 'Approval outcome unconfirmed. New approval is blocked until its history is reconciled.'}</p><button className="secondary-action" type="button" disabled={migrationBusy === 'approve'} onClick={() => { setMigrationHistoryLoaded(false); setMigrationHistoryRetry(value => value + 1); }}>Check approval history</button></div> : null}
+        {migrationHistoryFailed ? <button className="secondary-action" type="button" onClick={() => { setMigrationHistoryLoaded(false); setMigrationHistoryRetry(value => value + 1); }}>Retry migration history</button> : null}
         <section className="task-migration-panel" aria-labelledby="task-migration-heading">
           <header>
             <span><ListTodo size={15} /><strong id="task-migration-heading">Legacy task migration</strong></span>
-            <button className="secondary-action" type="button" disabled={migrationBusy !== null || migrationProgress?.state === 'queued' || migrationProgress?.state === 'working'} onClick={() => void previewMigration()}>
-              <RefreshCw size={12} /> {migrationBusy === 'preview' ? 'Preparing…' : migrationPreview ? 'Preview again' : 'Preview'}
+            <button className="secondary-action" type="button" ref={migrationPreviewButton} disabled={submittedMigration !== null || migrationBusy !== null || migrationProgress?.state === 'queued' || migrationProgress?.state === 'working'} onClick={() => void previewMigration()}>
+              <RefreshCw size={12} /> {migrationBusy === 'preview' ? 'Preparing…' : migrationPreview ? 'Preview again' : migrationProgress?.state === 'needs_review' ? 'Review unresolved items' : 'Preview'}
             </button>
           </header>
           <p>Native Fox tasks and the <code>personal-tasks</code> board move only after this exact batch is approved.</p>
@@ -726,12 +785,14 @@ export function IntegrationsDrawer({
             {!migrationPreview && migrationProgress.mappings.length ? <div className="migration-progress-mappings">
               {migrationProgress.mappings.map(mapping => <span key={mapping.actionId ?? mapping.sourceKey}>
                 <strong>{mapping.sourceKey}</strong>
-                <small>{mapping.externalId ?? mapping.state}</small>
+                <small>{mapping.state}{mapping.externalId ? ` · Google task ${mapping.externalId}` : ''}</small>
               </span>)}
             </div> : null}
             <button className="mini-action" type="button" disabled={migrationBusy !== null} onClick={() => void refreshMigration()}>{migrationBusy === 'refresh' ? 'Refreshing…' : 'Refresh status'}</button>
           </div> : null}
           {migrationPreview ? <div className="migration-preview">
+            <h3 ref={migrationPreviewHeading} tabIndex={-1}>Exact migration preview</h3>
+            <p>Destination accounts: {[...new Set(migrationPreview.items.map(item => item.destination.accountId))].join(", ")}</p>
             <div className="migration-preview-summary">
               <span><strong>{migrationPreview.items.length}</strong> ready</span>
               <span className={migrationPreview.blockers.length ? 'migration-blocked' : ''}><strong>{migrationPreview.blockers.length}</strong> blocked</span>
@@ -743,7 +804,7 @@ export function IntegrationsDrawer({
             <div className="migration-items">
               {migrationPreview.items.map(item => {
                 const mapping = migrationProgress?.mappings.find(candidate => candidate.sourceKey === item.sourceKey);
-                return <details key={item.sourceKey}>
+                return <details open key={item.sourceKey}>
                   <summary>
                     <i className={`inbox-thread-dot inbox-thread-dot--${mapping?.state === 'succeeded' ? 'settled' : mapping && ['failed', 'conflict', 'unknown'].includes(mapping.state) ? 'needs_you' : 'working'}`} />
                     <span><strong>{item.title}</strong><small>{migrationSourceLabel(item)} · {item.destination.listName}</small></span>
@@ -757,13 +818,14 @@ export function IntegrationsDrawer({
                 </details>;
               })}
             </div>
-            {!migrationProgress ? <div className="migration-approval">
+            {!migrationProgress && !submittedMigration ? <div className="migration-approval">
               <span>{migrationPreview.blockers.length ? 'Resolve every blocker before approval.' : 'Approval stores this immutable batch before execution.'}</span>
+              <button className="secondary-action" type="button" disabled={migrationBusy !== null} onClick={() => { setMigrationPreview(null); setMigrationApprovalKey(''); setMessage('Preview discarded. No approval was submitted.'); window.requestAnimationFrame(() => migrationPreviewButton.current?.focus()); }}>Discard preview</button>
               <button className="submit-button" type="button" disabled={migrationBusy !== null || Boolean(migrationPreview.blockers.length) || !migrationPreview.items.length} onClick={() => void approveMigration()}>{migrationBusy === 'approve' ? 'Approving…' : 'Approve migration'}</button>
             </div> : null}
           </div> : null}
         </section>
-        {loading && !overview ? <p className="integration-loading">Checking connections…</p> : null}
+        {loading && !overview ? <p className="integration-loading" role="status">Checking connections…</p> : null}
         {taskLists.length ? <div className="integration-record-section integration-task-lists">
           <div><ListTodo size={15} /><strong>List routing</strong></div>
           <p className="integration-task-lists-note">Provider lists stay as projects. Choose which Fox Focus area each one belongs to.</p>
@@ -780,7 +842,7 @@ export function IntegrationsDrawer({
           </div>
           <div className="integration-record-section">
             <div><ListTodo size={15} /><strong>Imported tasks</strong></div>
-            {tasks.map(record => <article className="integration-record" key={record.id}><span><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {record.containerName} · {recordWhen(record)}{record.status === 'completed' ? ' · completed' : ''}</small></span>{record.adoptedTaskId ? <span className="connection-state"><CheckCircle2 size={13} /> In Fox Focus</span> : <button className="mini-action" type="button" disabled={approvingAdoption} onClick={(event) => { adoptionTriggerRef.current = event.currentTarget; setAdoption(null); setAdoptionSourceRecord(record); setLinkTargetId(''); setMessage(null); }}>Adopt</button>}</article>)}
+            {tasks.map(record => <article className="integration-record" key={record.id}><span><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {record.containerName} · {recordWhen(record)}{record.status === 'completed' ? ' · completed' : ''}</small></span>{record.adoptedTaskId ? <span className="connection-state"><CheckCircle2 size={13} /> In Fox Focus</span> : <button className="mini-action" type="button" disabled={approvingAdoption} aria-label={`Adopt ${record.title}`} onClick={(event) => { adoptionTriggerRef.current = event.currentTarget; setAdoption(null); setAdoptionSourceRecord(record); setLinkTargetId(''); setMessage(null); }}>Adopt</button>}</article>)}
             {overview && !tasks.length ? <p className="empty-line">No tasks imported yet.</p> : null}
           </div>
         </div>

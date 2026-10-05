@@ -6,7 +6,7 @@ import { colors, font, space } from "@/lib/theme";
 
 function SettingsLink() {
   return (
-    <Pressable onPress={() => router.push("/settings")} hitSlop={8} style={{ paddingHorizontal: space.lg }}>
+    <Pressable accessibilityRole="button" accessibilityLabel="Settings" onPress={() => router.push("/settings")} hitSlop={8} style={{ paddingHorizontal: space.lg, minHeight: 48, justifyContent: "center" }}>
       <Text style={{ color: colors.muted, fontSize: font.small }}>Settings</Text>
     </Pressable>
   );

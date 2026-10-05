@@ -1,5 +1,6 @@
 import { requestTaskStatus } from "@shared/row-client";
 import type { TaskRow } from "@shared/row-model";
+import { taskCommandStatus } from "@shared/task-command-status";
 import { relativeTime, type WorkThread } from "@shared/work-threads";
 import { router } from "expo-router";
 import { Pressable, StyleSheet, View } from "react-native";
@@ -23,28 +24,28 @@ export function tickTask(task: TaskRow, done: boolean) {
 export function TaskItem({ task }: { task: TaskRow }) {
   const { rows, run } = useStore();
   const action = latestTaskAction(rows, task.id);
-  const pending = isPending(action) || task.binding.kind === "pending";
+  const pending = isPending(action);
+  const awaitingCreation = task.binding.kind === "pending";
   const done = isDone(task);
   const when = whenKey(rows, task);
   const overdue = !done && when !== null && when < dublinDateKey();
   const meta = [listName(rows, task), dueLabel(rows, task)].filter(Boolean).join(" · ");
   return (
-    <Pressable
-      onPress={() => router.push({ pathname: "/task/[id]", params: { id: task.id } })}
-      style={({ pressed }) => [styles.row, pressed && styles.pressed]}
-    >
+    <View style={styles.row}>
       <Checkbox
+        label={`${done ? "Reopen" : "Complete"} ${taskTitle(rows, task)}`}
         checked={done}
         pending={pending}
-        disabled={!canTick(task) || pending}
+        disabled={!canTick(task) || pending || awaitingCreation || isStuck(action)}
         onPress={() => { void run(tickTask(task, done)); }}
       />
-      <View style={styles.body}>
+      <Pressable accessibilityRole="button" accessibilityLabel={`Open ${taskTitle(rows, task)}. ${taskCommandStatus(task, action)}`} onPress={() => router.push({ pathname: "/task/[id]", params: { id: task.id } })} style={styles.body}>
         <T numberOfLines={2} tone={done ? "faint" : "text"} style={done ? styles.struck : undefined}>{taskTitle(rows, task)}</T>
         {meta ? <T size="small" tone={overdue ? "amber" : "faint"} numberOfLines={1}>{meta}</T> : null}
-      </View>
+        {pending || awaitingCreation || isStuck(action) ? <T size="small" tone="amber">{taskCommandStatus(task, action)}</T> : null}
+      </Pressable>
       {isStuck(action) ? <Dot tone="amber" /> : null}
-    </Pressable>
+    </View>
   );
 }
 
