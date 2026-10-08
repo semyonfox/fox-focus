@@ -1,5 +1,5 @@
 import { isDateKey } from "./calendar-time.ts";
-import { isIsoInstant, isOneOf, isRecord, priorities, type Area, type Priority } from "./model.ts";
+import { isIsoInstant, isOneOf, isRecord, isInboxProposalContext, priorities, type Area, type Priority, type InboxProposalContext } from "./model.ts";
 
 export type Instant = string;
 export type DateOnly = string;
@@ -325,7 +325,7 @@ export type JobUpdate = {
   at: Instant;
 };
 
-export type HermesInboxUpsertInput = {
+export type HermesInboxUpsertInput = InboxProposalContext & {
   expectedVersion: number | null;
   source:
     | { kind: "email"; accountId: string; messageId: string; threadId: string }
@@ -610,7 +610,7 @@ export function isHermesInboxUpsertInput(value: unknown): value is HermesInboxUp
     )) &&
     isOneLineText(value.title, 500) && isShortText(value.summary, 10_000, true) &&
     typeof value.likelyNoise === "boolean" &&
-    (value.draft === undefined || isReplyEnvelope(value.draft));
+    (value.draft === undefined || isReplyEnvelope(value.draft)) && isInboxProposalContext(value);
 }
 
 export function isJobInstruction(value: unknown): value is {

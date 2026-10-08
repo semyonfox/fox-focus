@@ -1659,6 +1659,10 @@ export function openStore(path: string, initialData: PrototypeData = createIniti
       createdAt: now,
       updatedAt: now,
     }, now);
+    if (result.created && !result.conflict) {
+      const snapshot = read();
+      save(snapshot.revision, { ...snapshot.data, inboxItems: [item, ...snapshot.data.inboxItems.filter(existing => existing.id !== item.id)] });
+    }
     return {
       created: result.created,
       conflict: result.conflict,

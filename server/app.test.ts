@@ -1129,6 +1129,54 @@ function emptyIntegrationOverview(): ReturnType<IntegrationService['overview']> 
   };
 }
 
+test('review recommendations and exact task references remain proposals and validate at the boundary', async () => {
+  const store = openStore(':memory:', testData());
+  const token = 'test-triage-token-at-least-24-characters';
+  const app = createApp(store, password, undefined, undefined, { taskStatusToken: token });
+  const proposal = {
+    idempotencyKey: 'triage-proposal-1', title: 'Review existing assignment', summary: 'A deadline may have changed.',
+    lane: 'review', existingHermesTaskId: 'personal-task-42',
+    sourceContext: { provider: 'canvas', externalId: 'assignment-42', timing: 'confirmed', dueAt: '2026-10-09T17:00:00+01:00' },
+    recommendation: { outcome: 'existing-task-update', reason: 'A source update refers to existing work.', nextStep: 'Verify the deadline before changing the task.' },
+  };
+  const submit = (body: unknown) => app.request('/api/v1/task-proposals', { method: 'POST', headers: { authorization, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  try {
+    const before = store.read().data;
+    assert.equal((await submit(proposal)).status, 201);
+    assert.equal((await submit(proposal)).status, 200);
+    assert.equal((await submit({ ...proposal, lane: 'automation' })).status, 409);
+    assert.equal((await submit({ ...proposal, recommendation: { ...proposal.recommendation, outcome: 'execute' } })).status, 400);
+    const after = store.read().data;
+    assert.deepEqual(after.tasks, before.tasks);
+    assert.deepEqual(after.events, before.events);
+    assert.deepEqual(after.reminders, before.reminders);
+    assert.equal(after.inboxItems[0].status, 'new');
+    assert.deepEqual(after.inboxItems[0].recommendation, proposal.recommendation);
+    assert.equal(after.inboxItems[0].existingHermesTaskId, 'personal-task-42');
+    assert.equal(after.inboxItems[0].sourceContext?.dueAt, '2026-10-09T16:00:00.000Z');
+    assert.equal((await submit({ ...proposal, sourceContext: { ...proposal.sourceContext, dueAt: 'not a date' } })).status, 400);
+  } finally { store.close(); }
+});
+
+test('opening the workspace catches up expired Inbox items without changing tasks or other records', async () => {
+  const data = testData();
+  data.inboxItems.push({ id: 'expired-invite', title: 'Past event', summary: 'Event details', source: 'Hermes', actor: 'Hermes', accent: 'Personal', status: 'new', sourceContext: { provider: 'hermes', externalId: 'event-42', endsAt: '2026-10-07T12:00:00.000Z', timing: 'confirmed' } });
+  const store = openStore(':memory:', data);
+  try {
+    const app = createApp(store, password, undefined, undefined, { now: () => new Date('2026-10-08T12:00:00.000Z') });
+    const response = await app.request('/api/v1/workspace', { headers: { authorization } });
+    assert.equal(response.status, 200);
+    const saved = store.read();
+    assert.equal(saved.data.inboxItems[0].status, 'handled');
+    assert.equal(saved.data.inboxItems[0].expiryApplied?.destination, 'history');
+    assert.deepEqual(saved.data.tasks, data.tasks);
+    assert.deepEqual(saved.data.events, data.events);
+    assert.deepEqual(saved.data.reminders, data.reminders);
+    await app.request('/api/v1/workspace', { headers: { authorization } });
+    assert.equal(store.read().revision, saved.revision);
+  } finally { store.close(); }
+});
+
 test('task creation exposes fresh destinations and durably queues the approved Google command', async () => {
   const store = openStore(':memory:', testData());
   let providerCreates = 0;

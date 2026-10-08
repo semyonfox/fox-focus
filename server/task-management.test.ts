@@ -419,3 +419,15 @@ test('status projection exposes only native task planning fields', () => {
     store.close();
   }
 });
+
+test('adoption classifies Canvas and course tasks as university work before approval', () => {
+  const store = openStore(':memory:', createInitialData());
+  try {
+    connectGoogle(store);
+    store.replaceProviderRecords('google', [providerTask({ title: 'Complete CT3531 VLAN assignment' })]);
+    const preview = previewProviderTaskAdoption(store, store.listProviderRecords()[0].id, now);
+    assert.equal(preview.task.area, 'University');
+    assert.equal(store.read().data.tasks.length, 0);
+    assert.equal(preview.task.externalLinks?.[0].externalId, 'google-task-1');
+  } finally { store.close(); }
+});

@@ -7,6 +7,7 @@ import { areaForList, filterCalendarContextByDateRange, listAreaKey } from './in
 import {
   areas,
   isOneOf,
+  isIsoInstant,
   isPrototypeData,
   isTask,
   type Area,
@@ -132,10 +133,10 @@ function isImportedRecord(value: unknown): value is ImportedRecord {
     typeof value.containerId === 'string' && typeof value.containerName === 'string' &&
     typeof value.externalId === 'string' && typeof value.title === 'string' &&
     (value.status === null || typeof value.status === 'string') &&
-    (value.startsAt === null || typeof value.startsAt === 'string') &&
-    (value.endsAt === null || typeof value.endsAt === 'string') &&
-    (value.startsOn === null || typeof value.startsOn === 'string') &&
-    (value.endsOn === null || typeof value.endsOn === 'string') &&
+    (value.startsAt === null || isIsoInstant(value.startsAt)) &&
+    (value.endsAt === null || isIsoInstant(value.endsAt)) &&
+    (value.startsOn === null || isDateKey(value.startsOn)) &&
+    (value.endsOn === null || isDateKey(value.endsOn)) &&
     (value.dueOn === null || typeof value.dueOn === 'string') && typeof value.allDay === 'boolean' &&
     (value.adoptedTaskId === null || typeof value.adoptedTaskId === 'string');
 }

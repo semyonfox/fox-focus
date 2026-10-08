@@ -1,10 +1,12 @@
+import { enrichInboxSource, expireInboxItems, normalizeInboxSourceContext } from '../src/inbox-time.ts';
+import { normalizeInboxProposalContext, reviewItemFromRow } from '../src/inbox-review.ts';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { basicAuth } from 'hono/basic-auth';
 import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
-import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
+import { areas, isOneOf, isPrototypeData, isReviewRecommendation, isInboxSourceContext, isRecord, type InboxItem } from '../src/model.ts';
 import { isDateKey } from '../src/calendar-time.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput, type HermesFeed } from '../src/hermes-model.ts';
 import {
@@ -141,7 +143,15 @@ export function createApp(
   app.use('/api/*', bodyLimit({ maxSize: 512 * 1024 }));
   app.get('/healthz', (c) => c.json({ ok: true, mode: 'workspace' }));
   app.get('/app', (c) => c.redirect('/', 302));
-  app.get('/api/v1/workspace', (c) => c.json(store.read()));
+  app.get('/api/v1/workspace', (c) => {
+    const snapshot = store.read();
+    const records = store.listProviderRecords(2000);
+    const enriched = snapshot.data.inboxItems.map(item => enrichInboxSource(item, records));
+    const inboxItems = expireInboxItems(enriched, now());
+    if (JSON.stringify(inboxItems) === JSON.stringify(snapshot.data.inboxItems)) return c.json(snapshot);
+    const saved = store.save(snapshot.revision, { ...snapshot.data, inboxItems });
+    return c.json(saved ?? store.read());
+  });
   app.get('/api/v1/rows', (c) => c.json({
     capabilities: { emailSendEnabled },
     tasks: store.listTasks(),
@@ -201,6 +211,7 @@ export function createApp(
     try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
     if (!isHermesInboxUpsertInput(body)) return c.json({ error: 'Invalid Inbox upsert' }, 400);
     const input = {
+      ...normalizeInboxProposalContext(body),
       expectedVersion: body.expectedVersion,
       source: body.source,
       title: body.title.trim(),
@@ -219,6 +230,15 @@ export function createApp(
           ? 'The email thread identity changed'
           : 'Inbox item changed';
       return c.json({ error, reason: result.reason, current: result.item }, 409);
+    }
+    if (result.outcome !== 'replayed' && (input.sourceContext || input.recommendation || input.existingHermesTaskId || input.lane)) {
+      const snapshot = store.read();
+      const previous = snapshot.data.inboxItems.find(item => item.id === result.item.id);
+      const item = { ...reviewItemFromRow(result.item, previous), ...normalizeInboxProposalContext(input) };
+      if (input.sourceContext?.provider === 'canvas') item.accent = 'University';
+      // new source evidence may update recommendations, never an owner's saved choice
+      if (previous?.lane) item.lane = previous.lane;
+      store.save(snapshot.revision, { ...snapshot.data, inboxItems: [item, ...snapshot.data.inboxItems.filter(existing => existing.id !== item.id)] });
     }
     return c.json({
       outcome: result.outcome,
@@ -683,13 +703,22 @@ export function createApp(
       !isRecord(body) || typeof body.idempotencyKey !== 'string' || body.idempotencyKey.length < 8 || body.idempotencyKey.length > 200 ||
       typeof body.title !== 'string' || body.title.trim().length === 0 || body.title.length > 500 ||
       typeof body.summary !== 'string' || body.summary.trim().length === 0 || body.summary.length > 2_000 ||
-      (body.area !== undefined && !isOneOf(body.area, areas))
+      (body.area !== undefined && !isOneOf(body.area, areas)) ||
+      (body.lane !== undefined && body.lane !== "review" && body.lane !== "automation") ||
+      (body.recommendation !== undefined && !isReviewRecommendation(body.recommendation)) ||
+      (body.sourceContext !== undefined && !isInboxSourceContext(body.sourceContext)) ||
+      (body.existingHermesTaskId !== undefined && (typeof body.existingHermesTaskId !== 'string' || body.existingHermesTaskId.length === 0 || body.existingHermesTaskId.length > 200))
     ) return c.json({ error: 'Invalid task proposal' }, 400);
     const timestamp = now().toISOString();
+    const sourceContext = isInboxSourceContext(body.sourceContext) ? normalizeInboxSourceContext(body.sourceContext) : undefined;
     const normalizedProposal = {
       title: body.title.trim(),
       summary: body.summary.trim(),
-      area: body.area ?? 'Personal',
+      area: sourceContext?.provider === 'canvas' ? 'University' : body.area ?? 'Personal',
+      ...(body.lane ? { lane: body.lane } : {}),
+      ...(body.recommendation ? { recommendation: body.recommendation } : {}),
+      ...(sourceContext ? { sourceContext } : {}),
+      ...(body.existingHermesTaskId ? { existingHermesTaskId: body.existingHermesTaskId } : {}),
     };
     const requestHash = createHash('sha256').update(JSON.stringify(normalizedProposal)).digest('base64url');
     const result = store.addAgentProposal(body.idempotencyKey, requestHash, {
@@ -700,6 +729,10 @@ export function createApp(
       actor: 'Hermes',
       status: 'new',
       accent: normalizedProposal.area,
+      ...(body.lane === 'review' || body.lane === 'automation' ? { lane: body.lane } : {}),
+      ...(isReviewRecommendation(body.recommendation) ? { recommendation: body.recommendation } : {}),
+      ...(sourceContext ? { sourceContext } : {}),
+      ...(typeof body.existingHermesTaskId === 'string' ? { existingHermesTaskId: body.existingHermesTaskId } : {}),
     }, timestamp);
     if (result.conflict) return c.json({ error: 'That idempotency key was used for a different proposal' }, 409);
     return c.json({ outcome: result.created ? 'created' : 'already_received', inboxItemId: result.inboxItemId }, result.created ? 201 : 200);
@@ -878,9 +911,27 @@ export function createApp(
     }
     const data = body.data;
     const current = store.read();
-    if (JSON.stringify(data.tasks) !== JSON.stringify(current.data.tasks) ||
-      JSON.stringify(data.inboxItems) !== JSON.stringify(current.data.inboxItems)) {
-      return c.json({ error: 'Tasks and Inbox items use versioned row routes' }, 403);
+    if (JSON.stringify(data.tasks) !== JSON.stringify(current.data.tasks)) {
+      return c.json({ error: 'Tasks use versioned row routes' }, 403);
+    }
+    const currentInbox = new Map(current.data.inboxItems.map(item => [item.id, item]));
+    const rowsById = new Map(store.listInboxItems().map(item => [item.id, item]));
+    const records = store.listProviderRecords(2000);
+    const sourceContent = (item: InboxItem) => {
+      const { status, lane, expiryRule, expiryApplied, reviewDecision, ...source } = item;
+      return canonicalHash(source);
+    };
+    if (new Set(data.inboxItems.map(item => item.id)).size !== data.inboxItems.length ||
+      current.data.inboxItems.some(item => !data.inboxItems.some(next => next.id === item.id)) ||
+      data.inboxItems.some(item => {
+        const previous = currentInbox.get(item.id);
+        const row = rowsById.get(item.id);
+        if (!previous && !row) return true;
+        if (previous && sourceContent(item) === sourceContent(previous)) return false;
+        const expected = row ? reviewItemFromRow(row, previous) : previous;
+        return !expected || sourceContent(item) !== sourceContent(enrichInboxSource(expected, records));
+      })) {
+      return c.json({ error: 'Inbox source content uses versioned row routes; only local review decisions can change here' }, 403);
     }
     // Fixture calendar context stands in for authoritative imported records.
     const imported = current.data.events.filter(e => !e.editable);

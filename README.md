@@ -6,10 +6,10 @@ The four views are:
 
 - Today for the next calendar context, a short task list, deadlines, and a collapsed briefing;
 - Tasks for active and completed Google-backed tasks with local planning;
-- Calendar for read-only provider events and existing local time blocks;
-- Inbox for email threads and Hermes jobs grouped into Needs you, Working, and Settled.
+- Calendar for unified day, week, and month views of provider events and local blocks, with a current-time line on the hourly grid;
+- Inbox for manual review with a selected item’s details and controls, separate Automations and History, and explicit access to existing work threads.
 
-Each view uses the page scrollbar rather than nested scrolling panels.
+Task lists use the page scrollbar. Calendar keeps its date controls above a scrollable hourly grid.
 
 ## Ownership and safety
 
@@ -36,6 +36,16 @@ Fox Focus has no provider delete, Google move or clear, calendar write, Microsof
 - Read-only Google Calendar, Microsoft Calendar, and Microsoft To Do adapters. Microsoft controls stay hidden from daily views while unconfigured.
 - An owner-facing, resumable migration preview for native Fox tasks and `personal-tasks` board items. It is built and fixture-tested, not run against live data.
 - Web Push reminders, an installable PWA, and an offline visual bundle.
+
+## Inbox review
+
+Recommendations contain an outcome, reason, and next step. Accept saves a local review decision and optional note; it does not create a task, send a message, approve a job, or add a reminder. Existing work controls remain available separately. Review metadata is stored in the workspace against the exact Inbox row ID; source and execution records keep their current ownership.
+
+Confirmed event expiries move to local History after 24 hours by default. Per-item rules can change the expiry, grace period, or destination, or disable the move. Restoring an item disables its rule. Expiry runs while the app is open and catches up when the workspace loads. Suggested dates and overdue task deadlines never trigger it.
+
+`PUT /api/v1/inbox/:proposalKey` and the compatibility `POST /api/v1/task-proposals` accept optional `lane` (`review` or `automation`), `recommendation` (`outcome`, `reason`, `nextStep`), and `existingHermesTaskId`. Outcomes are `noise-reference`, `awareness`, `proposed-commitment`, `existing-task-update`, and `needs-decision`. Existing Personal Tasks references are displayed only when verified against the connected feed.
+
+Optional `sourceContext` includes `provider`, `externalId`, `timing` (`confirmed` or `suggested`), and optional `startsAt`, `endsAt`, `dueAt`, `dueOn`, `expiresAt`, and short `evidence`. Instants are normalized to UTC. Exact Google/Microsoft matching also requires `containerId` and `connectionId`; refreshed event boundaries replace stale times without title matching. A distinct confirmed expiry is retained.
 
 ## Run locally
 
