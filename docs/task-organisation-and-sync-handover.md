@@ -1,188 +1,155 @@
-# Task ownership and sync handover
+# Task ownership and workflow handover
 
-Status: approved product direction, updated 13 September 2026. This approves implementation against fixtures and local data. It does not approve a live Hermes migration or unattended provider writes.
+Status: approved product direction, updated 14 September 2026. The implementation and fixture tests are complete. This does not approve a live `personal-tasks` migration, real email sending, or any other unattended provider write.
 
-## Current implementation
+## Product decision
 
-- Today, Tasks, Calendar, and Inbox are separate views. Each uses the document scrollbar.
-- Native tasks, local calendar blocks, completion history, Inbox decisions, reminders, and provider links persist in SQLite with revision checks.
-- The calendar has day and upcoming modes. Local intervals use UTC instants and render in `Europe/Dublin`; invalid or ambiguous DST input is rejected.
-- Google and Microsoft records import as provider-owned context. List-to-area mapping controls where imported task context appears.
-- A Google, Microsoft, or Hermes task becomes native only through an explicit adoption preview and approval.
-- An adopted Google link can request only completion or reopening through an exact preview, version check, approval, patch, and readback. No provider create, delete, clear, move, or general edit route exists.
-- The mounted Hermes board remains a read-only mirror for unadopted tasks. Fox Focus stores local annotations, and the optional legacy action bridge can complete one unadopted task after confirmation. It is disabled unless its plugin, private endpoint, separate token, and full completion effects have been reviewed.
-- Hermes can read the safe Fox Focus task-status projection and submit idempotent proposals to Inbox through a separate token.
-- Opted-in Web Push reminders use persisted subscriptions and delivery records. In-tab reminders remain available when push is unavailable.
+Google Tasks is the home for all task content and completion, including new manual, Inbox-derived, and briefing-derived tasks. Fox Focus is the working view and owns priority, waiting, deadlines, planning, reminders, Inbox decisions, jobs, approvals, and action history.
 
-Code support does not grant permission to migrate live tasks or enable an external write. The board and each provider remain authoritative for every record Fox Focus has not adopted.
+A pending Google create is a durable command awaiting confirmation. It is not a second local task home. Cached Google tasks remain readable during an outage, and pending or conflicted actions stay visible.
 
-## The decision
+The existing Hermes `personal-tasks` board remains canonical until the owner approves and verifies its live migration. Building the migration flow and viewing a preview do not move ownership.
 
-Fox Focus is the native home for personal tasks. It must still work in full when Google, Hermes, Microsoft, Gmail, and Canvas are unavailable.
+## Daily workflow
 
-Imported data can add provenance, dates, and external links. It cannot define the core task model or force new features to depend on a provider.
+Fox Focus has four compact views:
 
-The existing Hermes `personal-tasks` board remains canonical until explicit migration approvals begin. Approving a Hermes adoption cuts over that one task without changing the board. Hermes remains canonical for every task not yet adopted until the final checked migration completes. After cutover, Hermes reads task status from Fox Focus and sends proposed work to Inbox.
-
-## The app should feel small
-
-Use four real views instead of one long dashboard:
-
-| View | Purpose |
+| View | Use |
 | --- | --- |
-| Today | A short home with the current or next calendar item, about five useful tasks, due-soon work, and Inbox decisions. |
-| Tasks | The complete task browser with filtering, sorting, history, and task detail. |
-| Calendar | Day and upcoming schedule context. |
-| Inbox | One decision at a time for captures and agent proposals. |
+| Today | Current calendar context, a short task list, deadlines, and a collapsed daily briefing |
+| Tasks | Full active and completed task browser with task detail |
+| Calendar | Read-only provider context and existing local time blocks |
+| Inbox | Email decisions and Hermes work handed forward and back |
 
-Each view uses the document scrollbar. Do not put the task list inside a fixed-height scroller.
+Each view uses one page scrollbar. Task rows keep the title, area, date, state, and quiet source context. The checkbox changes completion; the rest of the row opens detail. On a phone, dates stay visible and secondary controls move into detail.
 
-In Tasks, keep the information already useful in a row: title, category, deadline or planned time, state, and quiet source context. The checkbox completes or reopens the task. Clicking the rest of the row opens the task detail or editor. Edit and Schedule do not need to appear as full buttons on every row.
+Area comes from the task's Google list through `listAreas`. Fox Focus does not store a second area value on the task. Local planning remains attached to the stable internal task ID even if Google is temporarily unavailable.
 
-On a phone, the deadline stays visible. Secondary metadata can move into the opened task. Connection instructions stay hidden unless there is an error, conflict, or action that needs attention.
+## Completing and reopening
 
-## Task model
+The task row and explicit checkbox are the preview. Clicking it is the owner's approval. There is no confirmation dialog unless Google has changed the remote record or Hermes proposed the change.
 
-The core task is provider-independent:
+On click, Fox Focus atomically records:
 
-```text
-task
-  id
-  title
-  area
-  state
-  completed
-  deadlineDate
-  scheduledDate
-  scheduledTime
-  duration
-  priority
-  createdAt
-  completedAt
-```
+- the task version and newer local intent;
+- the Google account, list, task ID, and expected ETag;
+- exact before and after status;
+- owner identity, readable approval text, and time;
+- a queued durable action.
 
-Provider information is optional:
+The worker leases the action, conditionally patches status, and reads the same Google task back. A stale ETag becomes a conflict for review. A newer click supersedes an older queued or failed intent, but never an operation that may already have reached Google. Completion never deletes a task, and completed history remains visible.
+
+## Creating tasks
+
+Before creation, Fox Focus shows the chosen Google account and list with the exact title, notes, and do-on date. The area-to-list mapping selects the destination. If there is no mapping, Fox Focus can fall back only when it discovers one fresh list named exactly My Tasks for that account; otherwise the owner must choose. It never substitutes another account or list after approval.
+
+The durable create action includes a random nonce. Fox Focus adds this exact notes line:
 
 ```text
-external_link
-  provider
-  connectionId
-  containerId
-  externalId
-  sourceVersion
-  sourceStatus
-  sourceUpdatedAt
-  policy
-  linkedAt
+Fox-Focus-ID: <nonce>
 ```
 
-The link is embedded in its native task. `connectionId` is an opaque Fox Focus authorization reference, not a verified provider account name or email. `policy` is `read_only` or `completion_only`. A missing link means a normal native task, not an incomplete record.
+It submits once and verifies the returned task. If the response is lost, it reconciles by the exact nonce. One match binds the pending row. Several matches need review. No match stays unknown. None permits automatic reinsertion.
 
-Keep these ideas separate:
+Google's due field is date-only despite its timestamp-shaped API value. Fox Focus maps it to `doOn`, not a deadline or timed reminder.
 
-- Area says what the task concerns, using one of the app's shallow local choices such as `University` or `Personal`.
-- Provenance says where it came from.
-- An external link says which legacy provider record may receive an approved status change.
-- Related material links to email, Canvas, a calendar event, or an agent run without copying its private body into the task.
+## Local task planning
 
-## Local task behaviour
+Fox Focus keeps these local fields in a separate versioned plan:
 
-- New tasks are created only in Fox Focus.
-- Editing a native task changes only Fox Focus.
-- Completing a task records its completion locally and keeps it in Done.
-- Reopening it changes the local state back to active.
-- Deletion is a separate deliberate action. A checkbox never deletes a record.
-- Provider refreshes cannot recreate, duplicate, or resurrect an adopted task.
-- A task keeps working if every optional external link is removed.
+- priority;
+- waiting;
+- deadline date;
+- planned date or UTC planned instant;
+- estimate in minutes.
 
-There is no default Google or Microsoft task home. Do not create a dedicated provider list just because a local task exists.
+Reminders use separate versioned rows. Fox Focus does not copy plans or reminders back to Google. A reminder at a specific time remains local because Google Tasks cannot preserve that time.
 
-## Adopting legacy tasks
+## Inbox
 
-Adoption changes ownership. It is not ordinary synchronization.
+Inbox is one T3 Code-style thread list:
 
-1. Import remote tasks as a read-only shadow using stable container and task IDs.
-2. Reconcile duplicates, completion state, dates, and records missing stable IDs.
-3. Show an adoption preview with the source record and the native task that Fox Focus will create.
-4. When the record belongs to an existing native task, select that task as `targetTaskId` and preview adding the source link instead of creating a duplicate.
-5. Record approval, then create the local task or add its optional external link once.
-6. Keep the durable adopted-source mapping so later refreshes never create a second local task.
-7. Export or back up the old canonical store before the live ownership cutover.
+- Needs you contains new email, `needs_you` jobs, and work ready for review.
+- Working contains queued or active jobs and pending sends.
+- Settled is collapsed.
+- Likely noise is collapsed but never hidden.
 
-Adopting a Google task can grant its link the `completion_only` policy. Adopting a Hermes task does not create a Hermes write path. Once the Hermes migration cuts over, the old board becomes an archived source rather than an editable mirror.
+The detail pane shows the summary, current email draft where relevant, update timeline, and bottom actions. Email actions are Send, Edit draft, Ask Hermes, Make task, Snooze, Done, Not interested, and Noise. Task detail also offers Hand to Hermes.
 
-The owner creates the preview with `POST /api/v1/task-adoptions/preview` and approves its returned ID with `POST /api/v1/task-adoptions/:id/approve`. A provider preview may include `targetTaskId` to add its link to an existing Fox Focus task, including one adopted from Hermes. The preview expires after 15 minutes. Repeated approval or a second preview cannot create another native task for the same stable source identity. Fox Focus refuses to guess when the same provider IDs were linked under an older connection generation, so the user must select the existing task and approve the relink.
+Email items use account plus message ID as their identity. Thread ID is context only. A later message in a resolved thread therefore appears as a new item.
 
-## Google completion bridge
+Drafts are immutable revisions. Hermes can offer a later draft until the owner edits it. After an owner edit or send approval, Hermes cannot replace that wording. Owner decisions use expected versions, so an old tab cannot silently overwrite a newer state.
 
-Only an explicitly adopted Google task may use the bridge. It supports two operations against the same external task ID:
+## Jobs
 
-- `needsAction` to `completed`
-- `completed` to `needsAction`
+A job has a one-line title, short instruction, optional linked task or Inbox item, and an immutable update timeline.
 
-The operation does not send the title, notes, due day, order, parent, or list back to Google. It never creates, deletes, clears, or moves a Google task.
+1. The owner hands it to Hermes in `queued`.
+2. Hermes claims it and moves it to `working`.
+3. Hermes adds short progress entries.
+4. Hermes either asks one question or submits a result.
+5. The owner answers, accepts, drops, or sends it back with one line.
 
-Before a write, Fox Focus creates an action request that records:
+Hermes cannot settle a job. Accepting a result linked to an open task is the owner's completion click and uses the same normal Google action path. Sending work back returns it to `queued`; dropping it settles without changing a task.
 
-- provider, opaque connection reference, list ID, task ID, and requested operation;
-- exact human-readable before and after values;
-- expected version or ETag;
-- approval state and expiry;
-- a stable idempotency key;
-- attempts, verified result status and version, and any error or conflict.
+## Email approval
 
-The preview names the native task, opaque connection reference, provider list, provider task title and ID, current and requested statuses, and expected ETag. After approval, Fox Focus fetches the remote record again. A changed version stops the write and creates a conflict. An unchanged record receives one status patch, followed by a readback of the same task ID.
+Send is an owner-only action for the current draft revision. Approval records the complete account, thread, reply target, message references, sender, recipients, subject, and body text, plus a deterministic payload hash. Fox Focus stores no MIME and has no Gmail access.
 
-The owner uses `POST /api/v1/task-actions/preview`, followed by `POST /api/v1/task-actions/:id/approve`. `GET /api/v1/task-actions` reports the recent stored states or filters them by `taskId`. An eligible failure can use `POST /api/v1/task-actions/:id/retry`.
+Hermes claims the action and builds MIME from the stored envelope. Its receipt must echo the hash and identify the new message in the approved thread. If a lease expires after dispatch might have begun, the action becomes unknown and every later claim is reconciliation-only. Fox Focus never sends or authorizes the message again.
 
-The local completion is not rolled back when Google is unavailable or rejects the write. A retryable failure can use the same action and idempotency key. A conflict or non-retryable failure needs a fresh preview of the current local state after any required refresh or reconnection. Every retry reads first. If Google already has the desired status, that read completes the action without another mutation.
+While a send is queued, running, or unknown, neither side can change its draft, settle the Inbox another way, or turn it into a task.
 
-Do not call Google Tasks `clear`. It hides completed tasks across a list and is wider than the approved action. Do not call delete. The importer detects assigned Docs or Chat tasks and gives them a read-only link, so the completion bridge rejects them.
+`EMAIL_SEND_ENABLED` is off by default and requires the Hermes bearer token when enabled. Do not enable it against a real mailbox until the executor passes the hash, MIME, receipt, and unknown-send checks in [the Hermes integration contract](hermes-task-sync-request.md).
 
-## Hermes boundary
+## Briefing
 
-Hermes has two narrow jobs after cutover:
+Hermes publishes at most one versioned briefing for a Dublin date. News and event entries have short summaries, optional HTTPS source links, optional UTC event times, and an expiry. Today shows the briefing as a small collapsed card. It does not add entries to Inbox.
 
-1. Read `GET /api/v1/task-status`.
-2. Submit proposed work through `POST /api/v1/task-proposals` with an idempotency key.
+Save as task opens the normal Google destination and field approval. Remind me does the same and adds a local timed reminder atomically with the pending task and create action.
 
-The status projection contains only fields needed to answer questions such as what is active, due soon, planned, completed, or blocked. It does not expose notes, source bodies, provider tokens, filesystem paths, sessions, approval secrets, or raw provider payloads.
+## Provider boundaries
 
-Hermes does not complete, reopen, edit, or delete Fox Focus tasks. It does not receive Google credentials. If Hermes thinks something should change, it submits an Inbox proposal for the user to review.
+- Google Tasks owns task content and completion. Fox Focus writes only owner-approved creates and status changes.
+- Google Calendar remains read-only.
+- Gmail owns messages. Fox Focus receives structured proposals from Hermes and stores approved envelopes and receipts, but never calls Gmail.
+- Microsoft Calendar and To Do remain read-only. Keep the adapter; hide its controls from daily views while unconfigured.
+- Canvas remains authoritative. Fox Focus has no submission route.
+- Noise and dismissal never delete, archive, mark spam, or create sender rules in Gmail.
+- Fox Focus never writes the Hermes SQLite database.
 
-The current read-only Hermes SQLite adapter is a temporary migration aid. Never add a direct SQLite write path.
+There is no provider delete, Google move or clear, calendar write, Microsoft write, or general task edit bridge.
 
-`HERMES_STATUS_TOKEN_FILE` points to the owner-only bearer-token file. That token works only on the two Hermes routes. Owner Basic authentication still works across the private API, and there are no public discovery endpoints.
+## Migration status
 
-## Rollout
+The owner-facing migration flow is built but has not been run against live data. It previews native Fox tasks and `personal-tasks` board items, binds exact existing Google mirrors, and creates unmatched tasks through the nonce recovery path. The approved batch records source versions, source-to-target mappings, outgoing values, plans, reminders, and resumable actions.
 
-1. The code now has real Today, Tasks, Calendar, and Inbox views with one scrollbar per page.
-2. Native tasks, completion history, optional external links, adoption previews, and durable action requests persist locally.
-3. Next, run shadow imports and reconciliation against selected read-only live sources.
-4. Preview and approve adoption records. Verify that refreshes cannot duplicate adopted tasks.
-5. Back up the Hermes board, briefly freeze task changes, reconcile once more, and request explicit cutover approval.
-6. Make Fox Focus canonical and switch Hermes to the implemented read-only status and Inbox proposal routes.
-7. Reconnect Google for the full Tasks scope, then test failure, retry, stale ETag, and readback before relying on the completion bridge.
+Run it only after a separate owner decision:
 
-Steps 5 and 7 affect live external state. They each need a separate human decision with the exact target and impact.
+1. Back up and validate the Fox Focus database and Hermes board.
+2. Refresh all sources and resolve every preview blocker.
+3. Approve the exact batch and briefly freeze legacy writers.
+4. Execute resumably and resolve every unknown create.
+5. Verify each Google readback, mapping, local plan, reminder, and Hermes context entry.
+
+Keep the read-only Hermes mirror, local annotations, completion bridge, and `fox-focus-sync` plugin until the final verification. After cutover, archive mappings and approval history, remove those active paths, and retire the board from active use.
 
 ## Acceptance checks
 
-- The Today view fits its core information without scrolling through the full task list.
-- Desktop and phone layouts have one vertical scrollbar.
-- The task title area opens details and the checkbox changes completion.
-- New local tasks cause no Google or Hermes request.
-- Repeating an adoption request does not create a duplicate task.
-- Completing an adopted Google task changes only its status and only after approval.
-- A stale ETag causes a conflict, not an overwrite.
-- A failed upstream write leaves the local state intact and exposes an eligible retry or a fresh preview.
-- A provider refresh never resurrects a completed or deleted local task.
-- Hermes can read the safe status projection but cannot mutate tasks.
-- Retrying the same Hermes proposal creates one Inbox item.
-- Imported calendar, Gmail, Canvas, Microsoft, and unadopted Google records remain source-owned.
+- A new manual, Inbox, or briefing task names its Google destination before approval.
+- Repeating a create or migration approval does not create a duplicate task.
+- A lost create response never causes another blind insert.
+- One checkbox click records approval, uses the imported ETag, and verifies readback.
+- A stale ETag produces a conflict rather than an overwrite.
+- A later email message in a resolved thread appears separately.
+- Hermes cannot replace owner wording, settle a job, tick a task, or call an owner route with its bearer token.
+- An expired email send can only reconcile.
+- A briefing creates no Inbox item.
+- Google Calendar, Gmail, Canvas, and Microsoft remain authoritative for their records.
+- No provider delete, move, clear, calendar write, Microsoft write, direct Gmail call, or Hermes database write occurs.
 
 ## Related documents
 
-- [Architecture and delivery plan](architecture-plan.md)
-- [Hermes task handover](hermes-task-sync-request.md)
-- [Google and Microsoft connections](integrations.md)
+- [Architecture](architecture-plan.md)
+- [Hermes integration contract](hermes-task-sync-request.md)
+- [Provider setup and boundaries](integrations.md)

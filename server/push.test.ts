@@ -5,6 +5,9 @@ import {
   deliverDuePushNotifications,
   deliveryKey,
   dueReminders,
+  formatPushReminderTime,
+  mergeReminderSources,
+  projectRowReminder,
   subscriptionDeliveryKey,
   type StoredPushSubscription,
 } from './push.ts';
@@ -32,6 +35,34 @@ const secondSubscription: StoredPushSubscription = {
   endpoint: 'https://push.example.test/second',
   keys: { p256dh: 'second-public-key', auth: 'second-auth-secret' },
 };
+
+test('reminder sources keep the canonical workspace row when migrated row IDs overlap', () => {
+  const workspace = { ...baseReminder, title: 'Workspace title' };
+  const migratedRow = { ...baseReminder, title: 'Migrated row title' };
+  const rowOnly = { ...baseReminder, id: 'row-only', title: 'Row only' };
+
+  assert.deepEqual(mergeReminderSources([workspace], [migratedRow, rowOnly]), [workspace, rowOnly]);
+});
+
+test('scheduled row reminders project into push delivery without changing their identity', () => {
+  const row = {
+    id: 'row-reminder', version: 1, target: { kind: 'task' as const, id: 'task-1' },
+    fireAt: '2026-09-11T09:55:00.000Z', state: 'scheduled' as const,
+    createdAt: '2026-09-10T09:00:00.000Z', updatedAt: '2026-09-10T09:00:00.000Z',
+  };
+  assert.deepEqual(projectRowReminder(row, 'Start assignment', '11 Sep, 10:55'), {
+    id: 'row-reminder', title: 'Start assignment', when: '11 Sep, 10:55',
+    state: 'scheduled', fireAt: row.fireAt,
+  });
+  assert.equal(projectRowReminder({ ...row, state: 'cancelled' }, 'Start assignment', 'Later'), null);
+});
+
+test('row reminder labels render Europe Dublin across both DST boundaries', () => {
+  assert.match(formatPushReminderTime('2026-03-29T00:30:00.000Z'), /00:30/);
+  assert.match(formatPushReminderTime('2026-03-29T01:30:00.000Z'), /02:30/);
+  assert.match(formatPushReminderTime('2026-10-25T00:30:00.000Z'), /01:30/);
+  assert.match(formatPushReminderTime('2026-10-25T01:30:00.000Z'), /01:30/);
+});
 
 test('selects reminders due in the last 24 hours through now', () => {
   const reminders = [

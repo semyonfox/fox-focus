@@ -12,9 +12,12 @@ services:
       HERMES_KANBAN_DB: ${HERMES_KANBAN_DB:-}
       HERMES_ACTION_API_URL: ${HERMES_ACTION_API_URL:-}
       HERMES_ACTION_TOKEN_FILE: ${HERMES_ACTION_TOKEN_FILE:-}
-      # Setting the host file opts Hermes into its own read/proposal token.
+      # Setting the host file enables Hermes's six scoped API routes.
       # The empty default leaves the endpoint protected by owner Basic auth.
       HERMES_STATUS_TOKEN_FILE: ${HERMES_STATUS_TOKEN_FILE_HOST:+/run/secrets/fox-focus/hermes-status-token}
+      # Keep mail dispatch off until the Hermes executor is verified. Enabling
+      # it also requires HERMES_STATUS_TOKEN_FILE_HOST.
+      EMAIL_SEND_ENABLED: ${EMAIL_SEND_ENABLED:-false}
       # OAuth configuration is read from individual read-only files. Keep the
       # host files outside this repository and never mount a whole credential
       # directory such as Hermes's provider state.

@@ -8,8 +8,9 @@ export const reviewOutcomeLabels: Record<ReviewOutcome, string> = {
   'proposed-commitment': 'Proposed commitment', 'existing-task-update': 'Existing-task update', 'needs-decision': 'Needs decision',
 };
 
-export function ReviewDecision({ item, existingTask, onSave, onDismiss }: {
+export function ReviewDecision({ item, existingTask, onSave, onDismiss, onAsk }: {
   item: InboxItem; existingTask?: HermesTask; onSave: (outcome: ReviewOutcome, note: string) => void; onDismiss: () => void;
+  onAsk?: () => void;
 }) {
   const suggestion = suggestReview(item, Boolean(existingTask));
   const [outcome, setOutcome] = useState<ReviewOutcome>(item.reviewDecision?.outcome ?? suggestion.outcome);
@@ -37,7 +38,7 @@ export function ReviewDecision({ item, existingTask, onSave, onDismiss }: {
       <label className="review-note-label" htmlFor="review-reason">Review note</label>
       <textarea id="review-reason" value={note} onChange={event => setNote(event.target.value)} placeholder="What matters, or what still needs checking…" maxLength={2000} />
     </details>
-    <div className="review-hermes"><button type="button" className="secondary-action" disabled title="Hermes chat is not connected">Ask Hermes</button><span>Chat not connected</span></div>
+    <div className="review-hermes"><button type="button" className="secondary-action" disabled={!onAsk} onClick={onAsk} title={onAsk ? 'Prepare a request for Hermes' : 'Hermes is not connected'}>Ask Hermes</button><span>{onAsk ? 'Review the request before sending' : 'Not connected'}</span></div>
     <div className="review-decision-footer">
       <button type="button" className="page-primary-action" onClick={() => onSave(outcome, note.trim())}>{item.reviewDecision ? 'Save decision' : 'Accept'}</button>
       <button type="button" className="secondary-action" onClick={onDismiss}>{item.status === 'handled' ? 'Return to review' : 'Dismiss'}</button>

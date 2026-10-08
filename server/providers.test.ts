@@ -1,6 +1,8 @@
+import { taskCompletionFingerprint } from './task-completion-fingerprint.ts';
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  createGoogleTask,
   listGoogleCalendarEvents,
   listGoogleCalendarChanges,
   listGoogleCalendars,
@@ -9,6 +11,7 @@ import {
   listMicrosoftCalendarView,
   listMicrosoftCalendars,
   listMicrosoftTodoTasks,
+  reconcileGoogleTaskCreate,
   updateGoogleTaskStatus,
   type ProviderFetch,
   type ProviderReadClient,
@@ -199,7 +202,7 @@ test("Google calendar snapshots establish a cursor without bounded-window parame
   assertReadOnly(transport.requests);
 });
 
-test("Google Tasks follows pagination and requests completed, hidden, and deleted tasks without notes", async () => {
+test("Google Tasks keeps notes, hierarchy, position, and a safe source URL across pagination", async () => {
   const transport = queuedFetch(
     json({
       items: [{
@@ -210,7 +213,6 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
         due: "2026-09-12T00:00:00.000Z",
         completed: "2026-09-11T08:00:00Z",
         updated: "2026-09-11T08:00:00Z",
-        notes: "private task note",
       }, {
         id: "assigned",
         etag: '"assigned-v1"',
@@ -221,7 +223,23 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       }],
       nextPageToken: "next",
     }),
-    json({ items: [{ id: "deleted", etag: '"deleted-v1"', title: "Old item", deleted: true }] }),
+    json({
+      items: [{
+        id: "nested",
+        title: "File renewal receipt",
+        status: "needsAction",
+        notes: "Renew through the library portal",
+        parent: "admin",
+        position: "00000000000000000001",
+        webViewLink: "https://tasks.google.com/task/nested",
+        body: "unrelated provider body",
+      }, {
+        id: "deleted",
+        etag: '"deleted-v1"',
+        title: "Old item",
+        deleted: true,
+      }],
+    }),
   );
 
   const result = await listGoogleTasks(client(transport.fetch), { taskListId: "list/with slash" });
@@ -234,6 +252,10 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       taskListId: "list/with slash",
       externalId: "done",
       title: "Renew library book",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
       state: "completed",
       sourceState: "completed",
       dueDate: "2026-09-12",
@@ -247,6 +269,10 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       taskListId: "list/with slash",
       externalId: "assigned",
       title: "Source-managed assignment",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
       state: "open",
       sourceState: "needsAction",
       dueDate: null,
@@ -259,8 +285,29 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
     {
       provider: "google",
       taskListId: "list/with slash",
+      externalId: "nested",
+      title: "File renewal receipt",
+      notes: "Renew through the library portal",
+      parentId: "admin",
+      position: "00000000000000000001",
+      sourceUrl: "https://tasks.google.com/task/nested",
+      state: "open",
+      sourceState: "needsAction",
+      dueDate: null,
+      completedAt: null,
+      updatedAt: null,
+      version: null,
+      isDeleted: false,
+    },
+    {
+      provider: "google",
+      taskListId: "list/with slash",
       externalId: "deleted",
       title: "Old item",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
       state: "open",
       sourceState: "deleted",
       dueDate: null,
@@ -270,7 +317,7 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
       isDeleted: true,
     },
   ]);
-  assert.ok(!JSON.stringify(result).includes("private task note"));
+  assert.ok(!JSON.stringify(result).includes("unrelated provider body"));
   const first = new URL(transport.requests[0].url);
   assert.equal(first.pathname, "/tasks/v1/lists/list%2Fwith%20slash/tasks");
   assert.equal(first.searchParams.get("showAssigned"), "true");
@@ -279,9 +326,322 @@ test("Google Tasks follows pagination and requests completed, hidden, and delete
   assert.equal(first.searchParams.get("showDeleted"), "true");
   assert.ok(first.searchParams.get("fields")?.includes("etag"));
   assert.ok(first.searchParams.get("fields")?.includes("assignmentInfo"));
-  assert.ok(!first.searchParams.get("fields")?.includes("notes"));
+  assert.ok(first.searchParams.get("fields")?.includes("notes"));
+  assert.ok(first.searchParams.get("fields")?.includes("parent"));
+  assert.ok(first.searchParams.get("fields")?.includes("position"));
+  assert.ok(first.searchParams.get("fields")?.includes("webViewLink"));
+  assert.ok(!first.searchParams.get("fields")?.includes("body"));
   assert.equal(new URL(transport.requests[1].url).searchParams.get("pageToken"), "next");
   assertReadOnly(transport.requests);
+});
+
+test("Google Tasks rejects an untrusted task source URL", async () => {
+  const transport = queuedFetch(json({
+    items: [{
+      id: "task-1",
+      title: "Review notes",
+      status: "needsAction",
+      webViewLink: "https://tasks.google.com.example.test/task/task-1",
+    }],
+  }));
+
+  const result = await listGoogleTasks(client(transport.fetch), { taskListId: "list-1" });
+
+  assert.deepEqual(result, {
+    status: "invalid-response",
+    provider: "google",
+    operation: "google.tasks",
+  });
+  assertReadOnly(transport.requests);
+});
+
+test("Google task create sends the approved fields once and verifies an exact readback", async () => {
+  const notes = "Created from Inbox\n\nFox-Focus-ID: nonce_123";
+  const transport = queuedFetch(
+    json({ id: "created/task" }, 201),
+    json({
+      id: "created/task",
+      etag: '"created-v1"',
+      title: "Submit registration",
+      notes,
+      status: "needsAction",
+      due: "2026-10-25T00:00:00.000Z",
+      updated: "2026-09-14T11:00:00Z",
+      position: "0001",
+    }),
+  );
+
+  const result = await createGoogleTask(client(transport.fetch), {
+    taskListId: "admin/list",
+    title: "Submit registration",
+    notes,
+    dueOn: "2026-10-25",
+  });
+
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.equal(result.value.taskId, "created/task");
+  assert.equal(result.value.task.title, "Submit registration");
+  assert.equal(result.value.task.notes, notes);
+  assert.equal(result.value.task.dueDate, "2026-10-25");
+  assert.equal(result.value.task.version, '"created-v1"');
+  assert.deepEqual(transport.requests.map(request => request.init.method), ["POST", "GET"]);
+  const insert = transport.requests[0];
+  const insertUrl = new URL(insert.url);
+  assert.equal(insertUrl.pathname, "/tasks/v1/lists/admin%2Flist/tasks");
+  assert.equal(insertUrl.searchParams.get("fields"), "id");
+  assert.deepEqual(JSON.parse(String(insert.init.body)), {
+    title: "Submit registration",
+    notes,
+    due: "2026-10-25T00:00:00.000Z",
+  });
+  assert.equal(headers(insert).get("authorization"), "Bearer test-access-token");
+  assert.equal(headers(insert).get("content-type"), "application/json");
+  const readback = new URL(transport.requests[1].url);
+  assert.equal(readback.pathname, "/tasks/v1/lists/admin%2Flist/tasks/created%2Ftask");
+  assert.equal(readback.searchParams.get("fields"),
+    "id,title,notes,parent,position,webViewLink,status,due,completed,updated,deleted,etag,assignmentInfo");
+});
+
+test("Google task create treats every ambiguous post-dispatch failure as unknown", async () => {
+  const cases: Array<{
+    name: string;
+    fetch: ProviderFetch;
+    phase: "dispatch" | "readback";
+    candidateTaskId?: string;
+  }> = [
+    {
+      name: "lost response",
+      fetch: async () => { throw new TypeError("socket closed"); },
+      phase: "dispatch",
+    },
+    {
+      name: "server error",
+      fetch: queuedFetch(json({}, 503)).fetch,
+      phase: "dispatch",
+    },
+    {
+      name: "request timeout response",
+      fetch: queuedFetch(json({}, 408)).fetch,
+      phase: "dispatch",
+    },
+    {
+      name: "malformed success",
+      fetch: queuedFetch(json({ unexpected: true }, 201)).fetch,
+      phase: "dispatch",
+    },
+    {
+      name: "lost readback",
+      fetch: queuedFetch(json({ id: "candidate" }, 201), json({}, 503)).fetch,
+      phase: "readback",
+      candidateTaskId: "candidate",
+    },
+  ];
+
+  for (const scenario of cases) {
+    const result = await createGoogleTask(client(scenario.fetch), {
+      taskListId: "list-1",
+      title: "Created once",
+      notes: "Fox-Focus-ID: nonce_456",
+      dueOn: null,
+    });
+    assert.deepEqual(result, {
+      status: "unknown",
+      provider: "google",
+      operation: "google.task-create",
+      phase: scenario.phase,
+      ...(scenario.candidateTaskId ? { candidateTaskId: scenario.candidateTaskId } : {}),
+    }, scenario.name);
+  }
+});
+
+test("Google task create does not confirm an incomplete or unwritable readback", async () => {
+  const readbacks = [{
+    id: "candidate", title: "Created once", notes: "Fox-Focus-ID: nonce_guard",
+    status: "needsAction",
+  }, {
+    id: "candidate", etag: '"v1"', title: "Created once", notes: "Fox-Focus-ID: nonce_guard",
+    status: "needsAction", completed: "2026-09-14T12:00:00Z",
+  }, {
+    id: "candidate", etag: '"v1"', title: "Created once", notes: "Fox-Focus-ID: nonce_guard",
+    status: "needsAction", assignmentInfo: { surfaceType: "DOCUMENT" },
+  }];
+
+  for (const readback of readbacks) {
+    const transport = queuedFetch(json({ id: "candidate" }, 201), json(readback));
+    const result = await createGoogleTask(client(transport.fetch), {
+      taskListId: "list-1",
+      title: "Created once",
+      notes: "Fox-Focus-ID: nonce_guard",
+      dueOn: null,
+    });
+    assert.deepEqual(result, {
+      status: "unknown",
+      provider: "google",
+      operation: "google.task-create",
+      phase: "readback",
+      candidateTaskId: "candidate",
+    });
+  }
+});
+
+test("Google task create returns a definitive rejection without a readback", async () => {
+  const transport = queuedFetch(json({ error: "rate limit" }, 429, { "retry-after": "7" }));
+
+  const result = await createGoogleTask(client(transport.fetch), {
+    taskListId: "list-1",
+    title: "Created once",
+    notes: "Fox-Focus-ID: nonce_789",
+    dueOn: null,
+  });
+
+  assert.deepEqual(result, {
+    status: "failed",
+    provider: "google",
+    operation: "google.task-create",
+    failure: "rate-limited",
+    phase: "rejected",
+    httpStatus: 429,
+    retryAfterSeconds: 7,
+  });
+  assert.equal(transport.requests.length, 1);
+  assert.equal(transport.requests[0].init.method, "POST");
+});
+
+test("Google task create rejects invalid input before dispatch", async () => {
+  const transport = queuedFetch();
+  const invalidTitle = await createGoogleTask(client(transport.fetch), {
+    taskListId: "list-1",
+    title: " trailing space ",
+    notes: "Fox-Focus-ID: nonce",
+    dueOn: null,
+  });
+  const missingNonce = await createGoogleTask(client(transport.fetch), {
+    taskListId: "list-1",
+    title: "Valid title",
+    notes: "No recovery marker",
+    dueOn: null,
+  });
+  const expected = {
+    status: "failed",
+    provider: "google",
+    operation: "google.task-create",
+    failure: "invalid-request",
+    phase: "pre-dispatch",
+  } as const;
+  assert.deepEqual(invalidTitle, expected);
+  assert.deepEqual(missingNonce, expected);
+  assert.equal(transport.requests.length, 0);
+});
+
+test("Google create reconciliation scans every page for one exact nonce marker", async () => {
+  const transport = queuedFetch(
+    json({
+      items: [{
+        id: "similar",
+        title: "Wrong marker",
+        notes: "prefix Fox-Focus-ID: nonce_abc",
+        status: "needsAction",
+      }],
+      nextPageToken: "page-2",
+    }),
+    json({
+      items: [{
+        id: "deleted",
+        title: "Deleted marker",
+        notes: "Fox-Focus-ID: nonce_abc",
+        deleted: true,
+      }, {
+        id: "reconciled",
+        etag: '"reconciled-v1"',
+        title: "Recovered task",
+        notes: "Context\r\nFox-Focus-ID: nonce_abc\r\n",
+        status: "needsAction",
+        updated: "2026-09-14T12:00:00Z",
+      }],
+    }),
+  );
+
+  const result = await reconcileGoogleTaskCreate(client(transport.fetch), {
+    taskListId: "list-1",
+    nonce: "nonce_abc",
+    candidateTaskId: "reconciled",
+  });
+
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.equal(result.value.taskId, "reconciled");
+  assert.equal(result.value.task.notes, "Context\r\nFox-Focus-ID: nonce_abc\r\n");
+  assert.equal(transport.requests.length, 2);
+  assert.equal(new URL(transport.requests[1].url).searchParams.get("pageToken"), "page-2");
+  assertReadOnly(transport.requests);
+});
+
+test("Google create reconciliation reports safe candidates for duplicate or mismatched markers", async () => {
+  const transport = queuedFetch(json({ items: [{
+    id: "first",
+    etag: '"v1"',
+    title: "First candidate",
+    notes: "private detail\nFox-Focus-ID: nonce_dup",
+    status: "needsAction",
+    updated: "2026-09-14T12:00:00Z",
+  }, {
+    id: "second",
+    etag: '"v2"',
+    title: "Second candidate",
+    notes: "Fox-Focus-ID: nonce_dup",
+    status: "completed",
+    completed: "2026-09-14T12:05:00Z",
+  }] }));
+
+  const result = await reconcileGoogleTaskCreate(client(transport.fetch), {
+    taskListId: "list-1",
+    nonce: "nonce_dup",
+    candidateTaskId: "missing-candidate",
+  });
+
+  assert.equal(result.status, "conflict");
+  if (result.status !== "conflict") return;
+  assert.equal(result.candidateTaskId, "missing-candidate");
+  assert.deepEqual(result.candidates.map(candidate => candidate.externalId), ["first", "second"]);
+  assert.ok(!("notes" in result.candidates[0]));
+  assert.ok(!JSON.stringify(result).includes("private detail"));
+});
+
+test("Google create reconciliation keeps no-match outcomes unknown", async () => {
+  const transport = queuedFetch(json({ items: [] }));
+  const result = await reconcileGoogleTaskCreate(client(transport.fetch), {
+    taskListId: "list-1",
+    nonce: "nonce_missing",
+  });
+
+  assert.deepEqual(result, {
+    status: "unknown",
+    provider: "google",
+    operation: "google.task-create-reconcile",
+    failure: "not-found",
+  });
+});
+
+test("Google create reconciliation does not confirm a match without an ETag", async () => {
+  const transport = queuedFetch(json({ items: [{
+    id: "candidate",
+    title: "Created once",
+    notes: "Fox-Focus-ID: nonce_no_etag",
+    status: "needsAction",
+  }] }));
+  const result = await reconcileGoogleTaskCreate(client(transport.fetch), {
+    taskListId: "list-1",
+    nonce: "nonce_no_etag",
+  });
+
+  assert.deepEqual(result, {
+    status: "unknown",
+    provider: "google",
+    operation: "google.task-create-reconcile",
+    failure: "invalid-response",
+    candidateTaskId: "candidate",
+  });
 });
 
 test("Google task completion patches only status with an ETag and verifies an exact readback", async () => {
@@ -319,6 +679,10 @@ test("Google task completion patches only status with an ETag and verifies an ex
         taskListId: "list/with slash",
         externalId: "task/id",
         title: "Renew library book",
+        notes: null,
+        parentId: null,
+        position: null,
+        sourceUrl: null,
         state: "completed",
         sourceState: "completed",
         dueDate: null,
@@ -349,7 +713,7 @@ test("Google task completion patches only status with an ETag and verifies an ex
   assert.equal(readbackUrl.pathname, patchUrl.pathname);
   assert.equal(
     readbackUrl.searchParams.get("fields"),
-    "id,title,status,due,completed,updated,deleted,etag,assignmentInfo",
+    "id,title,notes,parent,position,webViewLink,status,due,completed,updated,deleted,etag,assignmentInfo",
   );
   assert.equal(headers(readback).get("if-match"), null);
 });
@@ -431,8 +795,56 @@ test("Google task status update reports an ETag conflict before writing", async 
     operation: "google.task-status-update",
     phase: "preflight",
     httpStatus: 412,
+    currentTask: {
+      provider: "google",
+      taskListId: "list-1",
+      externalId: "task-1",
+      title: "Changed upstream",
+      notes: null,
+      parentId: null,
+      position: null,
+      sourceUrl: null,
+      state: "open",
+      sourceState: "needsAction",
+      dueDate: null,
+      completedAt: null,
+      updatedAt: "2026-09-13T09:00:00.000Z",
+      version: '"fresh"',
+      isDeleted: false,
+    },
   });
   assert.equal(transport.requests.length, 1);
+});
+
+test("Google reads the current task after a conditional PATCH conflict", async () => {
+  const transport = queuedFetch(
+    json({
+      id: "task-1", etag: '"imported"', title: "Before race", status: "needsAction",
+      updated: "2026-09-13T09:00:00Z",
+    }),
+    new Response(null, { status: 412 }),
+    json({
+      id: "task-1", etag: '"phone-edit"', title: "Changed on phone", notes: "Current notes",
+      status: "needsAction", due: "2026-09-16T00:00:00.000Z", updated: "2026-09-13T09:01:00Z",
+    }),
+  );
+
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: "list-1",
+    taskId: "task-1",
+    state: "completed",
+    expectedEtag: '"imported"',
+  });
+
+  assert.equal(result.status, "conflict");
+  if (result.status !== "conflict") return;
+  assert.equal(result.phase, "update");
+  assert.equal(result.httpStatus, 412);
+  assert.equal(result.currentTask?.title, "Changed on phone");
+  assert.equal(result.currentTask?.notes, "Current notes");
+  assert.equal(result.currentTask?.dueDate, "2026-09-16");
+  assert.equal(result.currentTask?.version, '"phone-edit"');
+  assert.deepEqual(transport.requests.map(request => request.init.method), ["GET", "PATCH", "GET"]);
 });
 
 test("Google task status update fails verification when readback does not match", async () => {
@@ -603,6 +1015,10 @@ test("Microsoft To Do requests no body fields, maps task states, and rejects unt
     taskListId: "tasks-list",
     externalId: "todo-1",
     title: "Submit assignment",
+    notes: null,
+    parentId: null,
+    position: null,
+    sourceUrl: null,
     state: "completed",
     sourceState: "completed",
     dueDate: "2026-09-18",
@@ -666,4 +1082,49 @@ test("malformed provider records fail the whole response instead of being silent
     provider: "google",
     operation: "google.calendar-events",
   });
+});
+
+test('Google completion tolerates an ETag-only change and uses the fresh conditional version', async () => {
+  const baseline = { title: 'Review project', notes: 'Check references', state: 'open' as const, dueOn: '2026-09-21', parentId: null };
+  const transport = queuedFetch(
+    json({ id: 'task-1', title: baseline.title, notes: baseline.notes, status: 'needsAction', due: '2026-09-21T00:00:00.000Z', etag: '"fresh"', position: 'changed-position' }),
+    json({ id: 'task-1', status: 'completed', etag: '"done"' }),
+    json({ id: 'task-1', title: baseline.title, notes: baseline.notes, status: 'completed', due: '2026-09-21T00:00:00.000Z', etag: '"done"', completed: '2026-09-15T20:00:00Z' }),
+  );
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: 'list-1', taskId: 'task-1', state: 'completed', expectedEtag: '"stale"',
+    expectedContentHash: taskCompletionFingerprint(baseline),
+  });
+  assert.equal(result.status, 'ok');
+  assert.deepEqual(transport.requests.map(request => request.init.method), ['GET', 'PATCH', 'GET']);
+  assert.equal(new Headers(transport.requests[1].init.headers).get('If-Match'), '"fresh"');
+  assert.equal(transport.requests[1].init.body, '{"status":"completed"}');
+});
+
+for (const [field, changed] of Object.entries({ title: 'Renamed task', notes: 'Different instructions', due: '2026-09-22T00:00:00.000Z', parent: 'new-parent' })) {
+  test(`Google completion still rejects a changed ${field} after approval`, async () => {
+    const baseline = { title: 'Review project', notes: 'Check references', state: 'open' as const, dueOn: '2026-09-21', parentId: null };
+    const transport = queuedFetch(json({ id: 'task-1', title: baseline.title, notes: baseline.notes, status: 'needsAction', due: '2026-09-21T00:00:00.000Z', etag: '"fresh"', [field]: changed }));
+    const result = await updateGoogleTaskStatus(client(transport.fetch), {
+      taskListId: 'list-1', taskId: 'task-1', state: 'completed', expectedEtag: '"stale"',
+      expectedContentHash: taskCompletionFingerprint(baseline),
+    });
+    assert.equal(result.status, 'conflict');
+    assert.equal(transport.requests.length, 1, 'a meaningful edit must not be overwritten');
+  });
+}
+
+test('Google completion still rejects an edit racing the rebased conditional write', async () => {
+  const baseline = { title: 'Review project', notes: null, state: 'open' as const, dueOn: null, parentId: null };
+  const transport = queuedFetch(
+    json({ id: 'task-1', title: baseline.title, status: 'needsAction', etag: '"fresh"' }),
+    new Response(null, { status: 412 }),
+    json({ id: 'task-1', title: 'Changed during write', status: 'needsAction', etag: '"raced"' }),
+  );
+  const result = await updateGoogleTaskStatus(client(transport.fetch), {
+    taskListId: 'list-1', taskId: 'task-1', state: 'completed', expectedEtag: '"stale"',
+    expectedContentHash: taskCompletionFingerprint(baseline),
+  });
+  assert.equal(result.status, 'conflict');
+  assert.equal(transport.requests.filter(request => request.init.method === 'PATCH').length, 1);
 });

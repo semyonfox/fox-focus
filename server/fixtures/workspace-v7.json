@@ -1,0 +1,60 @@
+{
+  "tasks": [
+    {
+      "id": "legacy-open",
+      "title": "Plan autumn term",
+      "area": "University",
+      "state": "scheduled",
+      "duration": "45 min",
+      "due": "Tomorrow",
+      "priority": "high",
+      "completed": false,
+      "scheduledTime": "09:30",
+      "scheduledDate": "2026-10-24",
+      "origin": "manual",
+      "createdAt": "2026-09-01T08:00:00.000Z"
+    },
+    {
+      "id": "legacy-completed",
+      "title": "Renew membership",
+      "area": "Admin",
+      "state": "done",
+      "duration": "30 min",
+      "due": "No deadline",
+      "priority": "medium",
+      "completed": true,
+      "scheduledTime": null,
+      "origin": "migration",
+      "createdAt": "2026-08-10T12:00:00.000Z",
+      "completedAt": "2026-09-12T17:40:00.000Z"
+    }
+  ],
+  "events": [],
+  "inboxItems": [
+    {
+      "id": "legacy-inbox",
+      "title": "Reply to club",
+      "summary": "A reply is waiting for review.",
+      "source": "Hermes proposal",
+      "actor": "Hermes",
+      "status": "draft-ready",
+      "accent": "University",
+      "draft": "Thanks, I can help."
+    }
+  ],
+  "reminders": [
+    {
+      "id": "legacy-reminder",
+      "targetId": "legacy-open",
+      "targetType": "task",
+      "title": "Plan autumn term",
+      "mode": "one-hour",
+      "when": "1 hour before",
+      "state": "scheduled",
+      "fireAt": "2026-10-24T07:30:00.000Z"
+    }
+  ],
+  "listAreas": {
+    "google:id:uni-list": "University"
+  }
+}

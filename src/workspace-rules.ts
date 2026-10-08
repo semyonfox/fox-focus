@@ -8,9 +8,9 @@ export function isUniversityWork(...evidence: Array<string | null | undefined>):
 
 export function importedTaskArea(
   listAreas: Record<string, Area> | undefined,
-  task: { provider: string; containerId: string; containerName: string; title: string },
+  task: { provider: string; containerId: string; containerName: string; title: string; notes?: string | null; sourceUrl?: string | null },
 ): Area {
-  if (isUniversityWork(task.containerName, task.title)) return 'University';
+  if (isUniversityWork(task.containerName, task.title, task.notes, task.sourceUrl)) return 'University';
   return areaForList(listAreas, task.provider, task.containerId, task.containerName);
 }
 
@@ -36,6 +36,6 @@ export function suggestReview(item: InboxItem, hasVerifiedTask = false) {
   if (hasVerifiedTask) return { outcome: 'existing-task-update' as const, reason: 'The supplied task ID matches an existing Personal Tasks record.', nextStep: 'Review the existing task before proposing any change.' };
   if (item.recommendation) return item.recommendation;
   if (inboxLane(item) === 'automation') return { outcome: 'awareness' as const, reason: 'This looks like a recurring Hermes job. Its presence alone does not need a new commitment.', nextStep: 'Does this run need your attention, or can it stay in Automations?' };
-  if (isUniversityWork(item.title, item.source)) return { outcome: 'proposed-commitment' as const, reason: 'The source identifies university work. Check whether it is already on Personal Tasks.', nextStep: 'Is this a new commitment, or part of an existing assignment?' };
+  if (isUniversityWork(item.title, item.source, item.sourceContext?.provider)) return { outcome: 'proposed-commitment' as const, reason: 'The source identifies university work. Check whether it is already on Personal Tasks.', nextStep: 'Is this a new commitment, or part of an existing assignment?' };
   return { outcome: 'needs-decision' as const, reason: 'The supplied summary does not establish whether you want to act on this.', nextStep: 'Is there something here you want to follow through on?' };
 }

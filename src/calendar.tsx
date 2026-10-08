@@ -7,11 +7,12 @@ import type { ImportedRecord, OverviewState } from './integrations.tsx';
 import { importedTaskArea } from './workspace-rules.ts';
 import './calendar.css';
 
-type Entry = {
+export type CalendarEntry = {
   id: string; title: string; date: string; time: string; duration: number;
   startsAt?: string; allDay: boolean; endDate?: string; area: Area; source: string;
   local?: TimelineEvent;
 };
+type Entry = CalendarEntry;
 type Mode = 'day' | 'week' | 'month';
 
 export function calendarEntries(events: TimelineEvent[], records: ImportedRecord[], today: string): Entry[] {
@@ -36,9 +37,10 @@ export function calendarEntries(events: TimelineEvent[], records: ImportedRecord
   ];
 }
 
-export function Calendar({ events, overview, date, onDate, selectedId, onEdit, onAdd, onSources }: {
+export function Calendar({ events, overview, date, onDate, selectedId, onEdit, onAdd, onSources, onAsk }: {
   events: TimelineEvent[]; overview: OverviewState; date: string; onDate: (date: string) => void;
   selectedId: string | null; onEdit: (event: TimelineEvent) => void; onAdd: () => void; onSources: () => void;
+  onAsk?: (entry: CalendarEntry) => void;
 }) {
   const [mode, setMode] = useState<Mode>('day');
   const [now, setNow] = useState(() => new Date());
@@ -55,6 +57,7 @@ export function Calendar({ events, overview, date, onDate, selectedId, onEdit, o
   const nowMinute = minuteOfDay(dublinTimeValue(now));
   const allDayOn = (entry: Entry, day: string) => entry.allDay && entry.date <= day && (entry.endDate ? day < entry.endDate : day === entry.date);
   useEffect(() => { const timer = window.setInterval(() => setNow(new Date()), 30_000); return () => window.clearInterval(timer); }, []);
+  useEffect(() => { setSelection(selectedId); }, [selectedId]);
   useEffect(() => {
     const event = entries.find(entry => entry.id === selectedId);
     if (scroller.current) scroller.current.scrollTop = Math.max(0, (event ? minuteOfDay(event.time) : dates.includes(today) ? nowMinute : 480) - 120);
@@ -97,6 +100,6 @@ export function Calendar({ events, overview, date, onDate, selectedId, onEdit, o
       </>}
       <footer className="calendar-footnote"><span>Europe/Dublin · Imported calendars are read-only</span><button className="pane-link" onClick={onSources}><Link2 size={12} /> Sources</button></footer>
     </div>
-    {selected ? <div className="calendar-selection" role="region" aria-label="Event details"><div><span className="eyebrow">{selected.source}</span><h2>{selected.title}</h2><p>{formatDublinDateKey(selected.date)} · {selected.allDay ? 'All day' : selected.time} · {selected.area}</p></div>{selected.local?.editable ? <button className="secondary-action" onClick={() => selected.local && onEdit(selected.local)}>Edit block</button> : <span className="source-chip">Read-only</span>}<button className="calendar-step" aria-label="Close event details" onClick={() => setSelection(null)}><X size={16} /></button></div> : null}
+    {selected ? <div className="calendar-selection" role="region" aria-label="Event details"><div><span className="eyebrow">{selected.source}</span><h2>{selected.title}</h2><p>{formatDublinDateKey(selected.date)} · {selected.allDay ? 'All day' : selected.time} · {selected.area}</p></div>{selected.local?.editable ? <button className="secondary-action" onClick={() => selected.local && onEdit(selected.local)}>Edit block</button> : <span className="source-chip">Read-only</span>}{onAsk ? <button className="secondary-action" onClick={() => onAsk(selected)}>Ask Hermes</button> : null}<button className="calendar-step" aria-label="Close event details" onClick={() => setSelection(null)}><X size={16} /></button></div> : null}
   </section>;
 }

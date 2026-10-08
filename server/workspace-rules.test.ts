@@ -11,6 +11,7 @@ test('university evidence survives generic Google list names and legacy adoption
   assert.equal(localTaskArea({ ...task, title: 'Read chapter', source: 'Hermes · Canvas' }), 'University');
   assert.equal(localTaskArea({ ...task, areaOverride: true }), 'Personal');
   assert.equal(localTaskArea({ ...task, origin: 'manual', source: undefined }), 'Personal');
+  assert.equal(importedTaskArea(undefined, { provider: 'google', containerId: 'personal', containerName: 'Personal', title: 'Draft report', notes: 'From Canvas assignment 42' }), 'University');
   assert.equal(importedTaskArea({}, { provider: 'google', containerId: 'p', containerName: 'Personal', title: 'CT318 assignment' }), 'University');
   assert.equal(importedTaskArea({ 'google:id:p': 'Work' }, { provider: 'google', containerId: 'p', containerName: 'Personal', title: 'Client follow-up' }), 'Work');
   assert.equal(importedTaskArea({}, { provider: 'google', containerId: 'p', containerName: 'Canvas', title: 'Read chapter' }), 'University');

@@ -5,7 +5,13 @@ export const DEFAULT_INBOX_GRACE_MINUTES = 24 * 60;
 
 export function normalizeInboxSourceContext(context: InboxSourceContext): InboxSourceContext {
   return {
-    ...context,
+    provider: context.provider,
+    externalId: context.externalId,
+    timing: context.timing,
+    ...(context.containerId !== undefined ? { containerId: context.containerId } : {}),
+    ...(context.connectionId !== undefined ? { connectionId: context.connectionId } : {}),
+    ...(context.dueOn !== undefined ? { dueOn: context.dueOn } : {}),
+    ...(context.evidence !== undefined ? { evidence: context.evidence } : {}),
     ...(context.startsAt ? { startsAt: new Date(context.startsAt).toISOString() } : {}),
     ...(context.endsAt ? { endsAt: new Date(context.endsAt).toISOString() } : {}),
     ...(context.dueAt ? { dueAt: new Date(context.dueAt).toISOString() } : {}),
@@ -56,7 +62,7 @@ export function enrichInboxSource(item: InboxItem, records: readonly SourceRecor
   const sourceContext = normalizeInboxSourceContext({
     ...context,
     startsAt: record.startsAt ?? (record.startsOn ? dublinDateTimeToInstant(record.startsOn, '00:00') ?? undefined : undefined),
-    expiresAt: undefined,
+    expiresAt: context.timing === 'confirmed' ? context.expiresAt : undefined,
     dueAt: undefined,
     endsAt: endsAt ?? undefined,
     dueOn: record.dueOn ?? undefined,

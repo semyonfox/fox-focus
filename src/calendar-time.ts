@@ -183,3 +183,20 @@ export function dublinTimeValue(instant: string | Date): string {
   if (parts === null) throw new RangeError("Expected a valid instant");
   return `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
 }
+
+/** UTC bounds for one Dublin calendar day. Handles 23 and 25 hour DST days. */
+export function dublinDayBounds(dateKey: string): { start: string; end: string } | null {
+  if (!isDateKey(dateKey)) return null;
+  const start = dublinDateTimeToInstant(dateKey, "00:00");
+  const end = dublinDateTimeToInstant(addCalendarDays(dateKey, 1), "00:00");
+  return start && end ? { start, end } : null;
+}
+
+/** Elapsed fraction of a running event, using exact instants across DST changes. */
+export function currentEventProgress(startsAt: string, durationMinutes: number, now: Date): number | null {
+  const elapsed = now.getTime() - Date.parse(startsAt);
+  const duration = durationMinutes * 60_000;
+  return Number.isFinite(elapsed) && Number.isFinite(duration) && duration > 0 && elapsed >= 0 && elapsed < duration
+    ? elapsed / duration
+    : null;
+}

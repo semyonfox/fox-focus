@@ -12,7 +12,7 @@ The first startup creates a random password at `/data/workspace-password` with m
 
 - `/` is the password-protected workspace.
 - `/app` redirects to `/` for older bookmarks.
-- Workspace, integration, task-status, proposal, adoption, and action APIs require authentication.
+- All application-data APIs require authentication. Owner routes use Basic authentication; the six Hermes routes also accept the scoped bearer token described below.
 - `/healthz` is public and returns no workspace data.
 
 ## Hermes task mirror
@@ -21,7 +21,7 @@ Mount the Hermes Personal Tasks board directory read-only and set `HERMES_KANBAN
 
 Hermes owns each unadopted task's title and completion status. Fox Focus can store area, due label, duration, planning, and reminder annotations against that stable ID. Google-backed cards use their `google-task:<external ID>` provenance to join the read-only provider record when the match is unambiguous. Fox Focus never deduplicates them by title.
 
-The codebase also contains one optional legacy remote write for unadopted Hermes tasks. It uses a dedicated action route, a separately scoped bearer token, optimistic version checking, an idempotency key, a persisted approval record, and readback. If an HTTP result is lost while Hermes is waiting on its database, Fox Focus leaves the checkbox unchanged and reconciles the durable action receipt on later polls. An adopted task cannot use this route.
+The codebase also contains one optional legacy remote write for unadopted Hermes tasks. It uses a dedicated action route, a separately scoped bearer token, optimistic version checking, an idempotency key, a persisted approval record, and readback. If an HTTP result is lost while Hermes is waiting on its database, Fox Focus leaves the checkbox unchanged and reconciles the durable action receipt on later polls. A task covered by an approved migration or legacy adoption cannot use this route.
 
 To configure the bridge, install [`integrations/hermes/fox-focus-sync`](../integrations/hermes/fox-focus-sync/README.md) as the Hermes user plugin, then set:
 
@@ -35,26 +35,37 @@ The token must carry only `kanban:personal-tasks:complete`. Do not reuse a dashb
 
 Deploying the Fox Focus image alone does not enable legacy completion. The plugin runs in Hermes, and Jenkins uses an operator-owned production Compose file. Install and validate the plugin, token, private endpoint, firewall rule, environment values, and read-only token mount as one separate runtime change. The approval preview must describe every completion effect in the installed Hermes version, including run, dependency, workspace cleanup, and lifecycle hook effects. Leave the bridge off if it does not.
 
-## Hermes status and proposal token
+## Hermes API token
 
-Keep the Hermes credential separate from the browser password. Set `HERMES_STATUS_TOKEN_FILE` to an owner-only file containing at least 24 characters. The server accepts that bearer token only for `GET /api/v1/task-status` and `POST /api/v1/task-proposals`. Supply the same token to Hermes through its own secret configuration. This repository configures only the Fox Focus side. The owner can use Basic authentication on every private route.
+Keep the Hermes credential separate from the browser password. Set `HERMES_STATUS_TOKEN_FILE` to an owner-only file containing at least 24 characters. The server accepts that bearer token only for these exact method and path pairs:
+
+- `GET /api/v1/context`;
+- `GET /api/v1/changes`;
+- `PUT /api/v1/inbox/:proposalKey`;
+- `POST /api/v1/requests/:id/claim`;
+- `POST /api/v1/requests/:id/result`;
+- `PUT /api/v1/briefings/:day`.
+
+The owner can use Basic authentication on every private route. The compatibility routes `/api/v1/task-status` and `/api/v1/task-proposals` are Basic-only. Supply the bearer token to Hermes through its own secret configuration; this repository configures only the Fox Focus side.
 
 For the supplied Compose file, set `HERMES_STATUS_TOKEN_FILE_HOST` to the absolute host path. Compose mounts it read-only and sets the internal `HERMES_STATUS_TOKEN_FILE` path. For a direct container deployment, mount that one file read-only and set `HERMES_STATUS_TOKEN_FILE` to its container path. Do not pass the token value in the environment. Fox Focus publishes no API catalog, OpenAPI document, MCP endpoint, or `llms.txt`.
+
+`EMAIL_SEND_ENABLED` defaults to `false` in Compose and the server. Set it to `true` only after verifying the Hermes hash, MIME, receipt, and reconciliation contract. Startup fails closed if sending is enabled without `HERMES_STATUS_TOKEN_FILE`. A timed-out send becomes `unknown`; disabling new sends does not disable reconciliation claims. See [Hermes integration contract](hermes-task-sync-request.md).
 
 ## Hermes migration boundary
 
 The optional Hermes SQLite mount is a transitional read-only source. Mount the selected board directory read-only and point `HERMES_KANBAN_DB` at its database. The adapter must never open that database for writing or return task bodies, filesystem paths, sessions, provider tokens, or result text.
 
-The existing `personal-tasks` board remains canonical until a separate cutover approval. Approving an adoption cuts over only that task and blocks it from the legacy completion route. Every unadopted task stays Hermes-owned. Do not change the board mount or status as part of an ordinary application deploy.
+The existing `personal-tasks` board remains canonical until the owner approves and verifies a live migration. An approved migration freezes each covered item from the legacy completion route and records its source-to-target mapping. Do not change the board mount or status as part of an ordinary application deploy.
 
 Before cutover:
 
-1. Run shadow import and reconcile stable task IDs and states.
+1. Refresh both sources and review the migration preview, stable IDs, states, plans, and reminders.
 2. Create and validate a recoverable board backup.
-3. Briefly freeze task changes and run a final comparison.
-4. Show the exact adoption set and request approval.
+3. Resolve every blocker, then briefly freeze legacy task writers and refresh the preview.
+4. Approve the exact batch, run it resumably, and reconcile every unknown create before cutover.
 
-After the final cutover, remove the board and legacy action plugin from the writable workflow. Hermes reads `GET /api/v1/task-status` and submits new suggestions through `POST /api/v1/task-proposals`. The read-only board mount can remain for a short audit period, then be removed in a separate deployment change.
+After the final cutover, remove the board and legacy action plugin from the writable workflow. Hermes then uses only the six scoped routes above for context, changes, Inbox work, claims, results, and briefings. The read-only board mount can remain for a short audit period, then be removed in a separate deployment change.
 
 ## Provider secrets
 
@@ -68,13 +79,13 @@ Provider OAuth stays disabled unless `APP_BASE_URL`, an owner-only token-encrypt
 
 Each path is a read-only file bind, not a directory. If the deployment contract requires a provider target while that provider is disabled, mount a non-secret `{}` placeholder. Never mount or reuse Hermes refresh tokens.
 
-Connected providers poll every 15 minutes. Scheduled refreshes read a bounded calendar window and complete task-list snapshots. They never trigger Google status write-through. A refresh-token failure marks that provider as needing reconnection without changing the workspace or another connection.
+Connected providers poll every 15 minutes. Google publishes each bounded calendar read and complete paginated task-list snapshot independently; a failed Google scope keeps its previous rows. Microsoft retains its provider-wide read-only refresh. Imports never trigger Google writes. A refresh-token failure marks that provider as needing reconnection without changing task intent or another connection.
 
 The production callback host must be the configured HTTPS origin. Do not derive it from the request Host header. A reused OAuth registration must be a Web client with the exact Fox Focus callback.
 
-Google Calendar and Microsoft connections remain read-only. The current Google connection requests the full `https://www.googleapis.com/auth/tasks` scope because the guarded completion bridge is implemented. Its two calendar scopes remain read-only. Existing Google connections with only `tasks.readonly` need to reconnect. A reconnect creates a new opaque connection generation, and any older import that finishes late is discarded. See [Google and Microsoft connections](integrations.md).
+Full Google Calendar access is requested at `https://www.googleapis.com/auth/calendar`, alongside full `https://www.googleapis.com/auth/tasks` access for approved task creation, completion, and reopening. This grant covers all calendars available to the connected account, including calendar configuration and sharing. The app still has no calendar-write endpoint or executor: future event or calendar writes must use an exact owner-approved action flow. Existing Google connections with only `tasks.readonly`, `calendar.events`, or `calendar.events.readonly` need to reconnect. A reconnect creates a new opaque connection generation, and any older import that finishes late is discarded. See [Provider connections](integrations.md).
 
-The wider OAuth grant does not widen server behavior. Google writes still require an adopted task, `POST /api/v1/task-actions/preview`, and owner approval through `POST /api/v1/task-actions/:id/approve`. Test it first with a disposable task and inspect the recorded request. New native tasks must not produce a provider request.
+The wider OAuth grant does not widen server behavior. New tasks require the destination and exact outgoing fields to be visible before `POST /api/v1/tasks`. Completing or reopening the displayed task through `POST /api/v1/tasks/:taskId/status` is the owner's approval. The worker changes status only, uses the imported ETag when present, and reads the task back. Test both paths with disposable tasks and inspect the recorded action and result.
 
 The first run of this release authenticates an older token envelope and immediately reseals it against the new opaque connection generation. Rolling back to an image from before that migration cannot open the resealed token. The workspace and provider records remain intact, but Google and Microsoft may need to be reconnected after that rollback. Treat this as an explicit first-rollout tradeoff and verify connection state after any rollback. Jenkins reports the provider state after an automatic rollback when the older image exposes the integrations endpoint; otherwise inspect it manually.
 
@@ -90,7 +101,7 @@ The workspace opens SQLite with WAL mode, full synchronous writes, and a five-se
 
 Back up a running database through SQLite's online backup API or `VACUUM INTO`. Validate the result with `PRAGMA quick_check`. Copying only `focus.sqlite` while WAL is active can omit recent transactions.
 
-The database contains native task history, adoption decisions, provider mirror records, opaque connection generations, and external action records. It does not establish a verified provider account name or email. The separate token-encryption key is required to use encrypted OAuth tokens after restore, so back it up through the existing secret-management process. Do not put it in the same archive as a database shared for debugging.
+The database contains Google task rows, local plans and reminders, Inbox and job history, immutable approved command payloads, action receipts, compatibility records, provider records, and opaque connection generations. It does not establish a verified provider account name or email. The separate token-encryption key is required to use encrypted OAuth tokens after restore, so back it up through the existing secret-management process. Do not put it in the same archive as a database shared for debugging.
 
 Before a destructive restore or volume deletion, stop the container and make a verified copy. `docker compose down -v` deletes the workspace volume and generated password.
 
@@ -107,13 +118,13 @@ On iPhone and iPad, add Fox Focus to the Home Screen before enabling device noti
 After deploying a new image:
 
 1. Check `/healthz` locally.
-2. Verify anonymous workspace and task-status requests receive `401`.
-3. If `HERMES_STATUS_TOKEN_FILE` is configured, verify its bearer token can read task status and submit a proposal but receives `401` from adoption and action routes.
-4. Sign in and make one local task edit.
-5. Confirm the task survives a restart and that no provider request occurred.
-6. Inspect integration freshness and any pending, failed, or conflicting action.
-7. If the Google bridge changed, repeat the disposable-task approval and readback test before using a real adopted task.
-8. If the legacy Hermes bridge is configured, verify an approved unadopted completion and confirm an adopted task receives `409` from that route.
+2. Verify anonymous `/api/v1/rows` and context requests receive `401`.
+3. If `HERMES_STATUS_TOKEN_FILE` is configured, verify its bearer token can read context and changes but receives `401` from `/api/v1/rows`, task creation, task status, job settlement, and the compatibility task-status and task-proposal routes.
+4. Sign in, inspect row state, and confirm it survives a restart.
+5. Inspect integration freshness and any pending, failed, conflicting, or unknown action.
+6. If Google task handling changed, test an approved create and a checkbox status change with disposable tasks. Confirm nonce reconciliation, ETag handling, and readback.
+7. If email sending is disabled, confirm `/api/v1/rows` reports `emailSendEnabled: false`. If it is enabled, run the exact-hash, receipt replay, and unknown-send reconciliation checks before using a real message.
+8. If the legacy Hermes bridge is configured, verify an approved unadopted completion and confirm a migrated task receives `409` from that route.
 9. If Web Push changed, subscribe a disposable browser, fire one reminder, and confirm the same reminder is not delivered twice.
 
 GitHub Actions validates source independently. Jenkins remains the release authority. A `main` push reaches it through a GitHub webhook, with a ten-minute source poll as a missed-webhook fallback. Jenkins builds its own image, runs tests, checks an isolated candidate, and replaces only the app container. It does not depend on an image published to GitHub Container Registry.

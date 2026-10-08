@@ -86,7 +86,7 @@ pipeline {
             exit 1
           fi
           docker exec "$candidate" node -e "Promise.all(['/', '/app', '/api/v1/workspace', '/api/v1/hermes', '/api/v1/integrations', '/api/v1/task-status'].map(p=>fetch('http://127.0.0.1:8789'+p).then(r=>r.status))).then(s=>{if(s.join(',')!=='401,401,401,401,401,401')process.exit(1)})"
-          docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const response=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers:{authorization:'Bearer '+token}}); const status=await response.json(); process.exit(response.ok&&Number.isInteger(status.revision)&&Array.isArray(status.tasks)?0:1);"
+          docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const headers={authorization:'Bearer '+token}; const context=await fetch('http://127.0.0.1:8789/api/v1/context?from=2026-01-01&to=2026-12-31',{headers}); const body=await context.json(); const legacy=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers}); process.exit(context.ok&&Number.isInteger(body.cursor)&&Array.isArray(body.tasks)&&legacy.status===401?0:1);"
           docker exec "$candidate" node --input-type=module -e "import { readFileSync } from 'node:fs'; try { const password=readFileSync('/data/workspace-password','utf8').trim(); const authorization='Basic '+Buffer.from('fox:'+password).toString('base64'); const response=await fetch('http://127.0.0.1:8789/api/v1/integrations',{headers:{authorization}}); const overview=await response.json(); const google=overview.providers?.find(provider=>provider.provider==='google'); process.exit(response.ok&&google?.configured===true?0:1); } catch { process.exit(1); }"
         '''
       }
@@ -162,7 +162,7 @@ pipeline {
                 [ "$http_status" = 401 ] || return 1
               done
               if [ "$capability_level" = current ] && [ "$hermes_status_required" = true ]; then
-                docker exec fox-focus-app-1 node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const response=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers:{authorization:'Bearer '+token}}); const status=await response.json(); process.exit(response.ok&&Number.isInteger(status.revision)&&Array.isArray(status.tasks)?0:1);" || return 1
+                docker exec fox-focus-app-1 node --input-type=module -e "import { readFileSync } from 'node:fs'; const token=readFileSync('/run/secrets/fox-focus/hermes-status-token','utf8').trim(); const headers={authorization:'Bearer '+token}; const context=await fetch('http://127.0.0.1:8789/api/v1/context?from=2026-01-01&to=2026-12-31',{headers}); const body=await context.json(); const legacy=await fetch('http://127.0.0.1:8789/api/v1/task-status',{headers}); process.exit(context.ok&&Number.isInteger(body.cursor)&&Array.isArray(body.tasks)&&legacy.status===401?0:1);" || return 1
               fi
             }
             assert_integration_runtime() {
