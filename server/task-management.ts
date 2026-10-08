@@ -1,3 +1,4 @@
+import { importedTaskArea, isUniversityWork } from '../src/workspace-rules.ts';
 import { randomUUID } from 'node:crypto';
 import { addCalendarDays, dublinDateKey, formatDublinDateKey } from '../src/calendar-time.ts';
 import type { HermesFeed, HermesTask } from '../src/hermes-model.ts';
@@ -72,7 +73,7 @@ function googleOrMicrosoftTask(record: StoredRecord, now: Date): Task {
   return {
     id: `task-${randomUUID()}`,
     title: record.title,
-    area: 'Personal',
+    area: importedTaskArea(undefined, record),
     state: completed ? 'done' : 'up-next',
     duration: '30 min',
     due: dueLabel(record.dueOn, now),
@@ -99,7 +100,7 @@ function hermesTask(task: HermesTask, board: { slug: string; name: string }, now
   return {
     id: `task-${randomUUID()}`,
     title: task.title,
-    area: 'Personal',
+    area: task.annotationUpdatedAt ? task.area : isUniversityWork(task.source, task.title, task.sourceContainerName) ? 'University' : task.area,
     state: completed ? 'done' : task.status === 'scheduled' ? 'scheduled' : task.status === 'blocked' ? 'waiting' : 'up-next',
     duration: '30 min',
     due: completed ? 'No deadline' : task.status === 'blocked' ? 'Waiting' : 'No deadline',
@@ -154,6 +155,7 @@ export function previewProviderTaskAdoption(
   const record = store.getProviderRecord(recordId);
   if (!record || record.kind !== 'task') throw new TaskManagementError('not_found', 'Imported task was not found.');
   const importedTask = googleOrMicrosoftTask(record, now);
+  importedTask.area = importedTaskArea(store.read().data.listAreas, record);
   const link = importedTask.externalLinks?.[0];
   if (!link) throw new TaskManagementError('invalid_source', 'The imported task has no stable identifier.');
   const snapshot = store.read();

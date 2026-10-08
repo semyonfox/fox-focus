@@ -22,6 +22,7 @@ COPY --from=build --chown=node:node /app/server/app.ts /app/server/index.ts /app
 COPY --from=build --chown=node:node /app/src/model.ts ./src/model.ts
 COPY --from=build --chown=node:node /app/src/calendar-time.ts ./src/calendar-time.ts
 COPY --from=build --chown=node:node /app/src/hermes-model.ts ./src/hermes-model.ts
+COPY --from=build --chown=node:node /app/src/inbox-time.ts /app/src/workspace-rules.ts /app/src/integration-model.ts ./src/
 COPY --from=build --chown=node:node /app/package.json ./package.json
 USER node
 EXPOSE 8789

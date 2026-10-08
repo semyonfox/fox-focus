@@ -43,6 +43,7 @@ export type Task = {
   completedAt?: string;
   /** Optional provenance. Native task behaviour never depends on this being present. */
   externalLinks?: TaskExternalLink[];
+  areaOverride?: boolean;
 };
 
 export type TaskExternalLink = {
@@ -77,6 +78,50 @@ export type TimelineEvent = TimelineEventBase & (
   | { startsAt?: never; start: string; date?: string }
 );
 
+export const reviewOutcomes = ['noise-reference', 'awareness', 'proposed-commitment', 'existing-task-update', 'needs-decision'] as const;
+export type ReviewOutcome = (typeof reviewOutcomes)[number];
+export type ReviewRecommendation = { outcome: ReviewOutcome; reason: string; nextStep: string };
+
+export function isReviewRecommendation(value: unknown): value is ReviewRecommendation {
+  return isRecord(value) && isOneOf(value.outcome, reviewOutcomes) &&
+    typeof value.reason === 'string' && value.reason.trim().length > 0 && value.reason.length <= 2000 &&
+    typeof value.nextStep === 'string' && value.nextStep.trim().length > 0 && value.nextStep.length <= 500;
+}
+
+export type InboxSourceContext = {
+  provider: 'google' | 'microsoft' | 'canvas' | 'hermes' | 'capture';
+  externalId: string;
+  containerId?: string;
+  connectionId?: string;
+  startsAt?: string;
+  endsAt?: string;
+  dueAt?: string;
+  dueOn?: string;
+  expiresAt?: string;
+  timing: 'confirmed' | 'suggested';
+  evidence?: string;
+};
+export type InboxExpiryRule = { enabled: boolean; at?: string; graceMinutes: number; destination: 'history' | 'automation' };
+
+export function isInboxSourceContext(value: unknown): value is InboxSourceContext {
+  return isRecord(value) && isOneOf(value.provider, ['google', 'microsoft', 'canvas', 'hermes', 'capture'] as const) &&
+    typeof value.externalId === 'string' && value.externalId.length > 0 && value.externalId.length <= 500 &&
+    (value.containerId === undefined || typeof value.containerId === 'string' && value.containerId.length <= 500) &&
+    (value.connectionId === undefined || typeof value.connectionId === 'string' && value.connectionId.length <= 500) &&
+    ['startsAt', 'endsAt', 'dueAt', 'expiresAt'].every(key => value[key] === undefined || isIsoInstant(value[key])) &&
+    (value.startsAt === undefined || value.endsAt === undefined || Date.parse(String(value.endsAt)) >= Date.parse(String(value.startsAt))) &&
+    (value.dueOn === undefined || isDateKey(value.dueOn)) &&
+    (value.timing === 'confirmed' || value.timing === 'suggested') &&
+    (value.evidence === undefined || typeof value.evidence === 'string' && value.evidence.length <= 500);
+}
+
+export function isInboxExpiryRule(value: unknown): value is InboxExpiryRule {
+  return isRecord(value) && typeof value.enabled === 'boolean' &&
+    (value.at === undefined || isIsoInstant(value.at)) &&
+    typeof value.graceMinutes === 'number' && Number.isSafeInteger(value.graceMinutes) && value.graceMinutes >= 0 && value.graceMinutes <= 43_200 &&
+    (value.destination === 'history' || value.destination === 'automation');
+}
+
 export type InboxItem = {
   id: string;
   title: string;
@@ -87,6 +132,13 @@ export type InboxItem = {
   accent: Area;
   draft?: string;
   moreWork?: string;
+  lane?: "review" | "automation";
+  recommendation?: ReviewRecommendation;
+  existingHermesTaskId?: string;
+  sourceContext?: InboxSourceContext;
+  expiryRule?: InboxExpiryRule;
+  expiryApplied?: { at: string; destination: 'history' | 'automation' };
+  reviewDecision?: { outcome: ReviewOutcome; note: string; savedAt: string };
 };
 
 export type Reminder = {
@@ -218,6 +270,7 @@ export function isTask(value: unknown): value is Task {
     (value.createdAt === undefined || isIsoInstant(value.createdAt)) &&
     (value.deadlineDate === undefined || isDateKey(value.deadlineDate)) &&
     (value.completedAt === undefined || isIsoInstant(value.completedAt)) &&
+    (value.areaOverride === undefined || typeof value.areaOverride === "boolean") &&
     (value.externalLinks === undefined || (
       Array.isArray(value.externalLinks) &&
       value.externalLinks.length <= 8 &&
@@ -271,16 +324,22 @@ function taskDueTimestamp(due: string, referenceDate: string | undefined): numbe
   if (due === "Today") return reference.getTime();
   if (due === "Tomorrow") return reference.getTime() + 86_400_000;
   if (due === "Friday") {
-    const daysUntilFriday = (5 - reference.getUTCDay() + 7) % 7 || 7;
+    const daysUntilFriday = (5 - reference.getUTCDay() + 7) % 7;
     return reference.getTime() + daysUntilFriday * 86_400_000;
   }
-  const match = due.match(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/);
+  const match = due.match(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/);
   if (!match) return null;
-  const [, dayText, monthText] = match;
+  const [, weekday, dayText, monthText] = match;
   const day = Number(dayText);
   const month = monthIndex[monthText];
-  const candidate = new Date(Date.UTC(reference.getUTCFullYear(), month, day));
-  return candidate.getUTCMonth() === month && candidate.getUTCDate() === day ? candidate.getTime() : null;
+  const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const candidates = [-1, 0, 1]
+    .map(offset => new Date(Date.UTC(reference.getUTCFullYear() + offset, month, day)))
+    .filter(candidate => candidate.getUTCMonth() === month && candidate.getUTCDate() === day &&
+      weekdays[candidate.getUTCDay()] === weekday);
+  candidates.sort((first, second) => Math.abs(first.getTime() - reference.getTime()) -
+    Math.abs(second.getTime() - reference.getTime()));
+  return candidates[0]?.getTime() ?? null;
 }
 
 /** Sorts earlier/current deadlines first, then newest-created, then task ID. */
@@ -343,7 +402,14 @@ export function isInboxItem(value: unknown): value is InboxItem {
     isOneOf(value.status, inboxStatuses) &&
     isOneOf(value.accent, areas) &&
     (value.draft === undefined || typeof value.draft === "string") &&
-    (value.moreWork === undefined || typeof value.moreWork === "string")
+    (value.moreWork === undefined || typeof value.moreWork === "string") &&
+    (value.lane === undefined || value.lane === "review" || value.lane === "automation") &&
+    (value.recommendation === undefined || isReviewRecommendation(value.recommendation)) &&
+    (value.sourceContext === undefined || isInboxSourceContext(value.sourceContext)) &&
+    (value.expiryRule === undefined || isInboxExpiryRule(value.expiryRule)) &&
+    (value.expiryApplied === undefined || isRecord(value.expiryApplied) && isIsoInstant(value.expiryApplied.at) && (value.expiryApplied.destination === 'history' || value.expiryApplied.destination === 'automation')) &&
+    (value.existingHermesTaskId === undefined || typeof value.existingHermesTaskId === 'string' && value.existingHermesTaskId.length > 0 && value.existingHermesTaskId.length <= 200) &&
+    (value.reviewDecision === undefined || isRecord(value.reviewDecision) && isOneOf(value.reviewDecision.outcome, reviewOutcomes) && typeof value.reviewDecision.note === 'string' && value.reviewDecision.note.length <= 2000 && isIsoInstant(value.reviewDecision.savedAt))
   );
 }
 

@@ -1,9 +1,13 @@
+import { enrichInboxSource, expireInboxItems } from './inbox-time.ts';
+import { InboxTiming } from './inbox-timing.tsx';
+import { ReviewDecision } from './review-decision.tsx';
+import { Calendar, calendarEntries } from './calendar.tsx';
+import { inboxLane, importedTaskArea, isUniversityWork, localTaskArea, type InboxLane } from './workspace-rules.ts';
 import "@fontsource-variable/instrument-sans";
 import {
   Bell,
   Bot,
   CalendarDays,
-  CalendarRange,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -24,12 +28,11 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 import {
   addCalendarDays,
-  calendarDateWindow,
   dublinDateKey,
   dublinDateTimeToInstant,
   dublinTimeValue,
@@ -38,7 +41,7 @@ import {
 } from "./calendar-time.ts";
 import { hermesLabels, useHermesFeed } from "./hermes-feed.tsx";
 import { deduplicatedProviderIdentity, type HermesTask, type HermesTaskAnnotationInput } from "./hermes-model.ts";
-import { IntegrationCalendarContext, IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord } from './integrations.tsx';
+import { IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord } from './integrations.tsx';
 import { areaForList } from './integration-model.ts';
 
 import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
@@ -160,7 +163,6 @@ function compareCalendarEvents(first: TimelineEvent, second: TimelineEvent, lega
     first.title.localeCompare(second.title);
 }
 
-type CalendarMode = "day" | "upcoming";
 type WorkspaceView = Exclude<SectionAnchor, "signals">;
 
 function workspaceViewFromLocation(): WorkspaceView {
@@ -376,7 +378,7 @@ function ImportedTaskRow({ task, area }: { task: ImportedRecord; area: Area }) {
   );
 }
 
-function HermesTaskRow({ task, onAdopt, busy }: { task: HermesTask; onAdopt: (task: HermesTask) => void; busy: boolean }) {
+function HermesTaskRow({ task, area, onAdopt, busy }: { task: HermesTask; area: Area; onAdopt: (task: HermesTask) => void; busy: boolean }) {
   const updatedAt = formatCreatedAt(task.updatedAt);
 
   return (
@@ -385,7 +387,7 @@ function HermesTaskRow({ task, onAdopt, busy }: { task: HermesTask; onAdopt: (ta
       <div className="task-copy">
         <strong className={task.status === "done" ? "task-title--done" : undefined}>{task.title}</strong>
         <span>
-          <em className="source-chip source-chip--hermes">Hermes</em>
+          <span>{area}</span><em className="source-chip source-chip--hermes">Hermes</em>
           <em className={`hermes-task-status hermes-task-status--${task.status}`}>{hermesLabels[task.status]}</em>
           {task.priority > 0 ? <em className="task-created">Priority {task.priority}</em> : null}
           {task.parentTitle ? <em className="task-created" title={`Part of ${task.parentTitle}`}>Part of {task.parentTitle}</em> : null}
@@ -462,6 +464,7 @@ function providerTaskSource(provider: ImportedRecord["provider"]): TaskSource {
 
 function hermesTaskArea(task: HermesTask, listAreas: Record<string, Area> | undefined): Area {
   if (task.annotationUpdatedAt) return task.area;
+  if (isUniversityWork(task.source, task.title, task.sourceContainerName)) return "University";
   if (task.sourceMatchUnique && task.sourceProvider && task.sourceContainerId && task.sourceContainerName) {
     return areaForList(listAreas, task.sourceProvider, task.sourceContainerId, task.sourceContainerName);
   }
@@ -521,14 +524,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [eventDraft, setEventDraft] = useState<EventDraft>(defaultEventDraft);
   const [draftText, setDraftText] = useState("");
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [inboxView, setInboxView] = useState<InboxLane | "history">("review");
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("open");
   const [taskSource, setTaskSource] = useState<TaskSource>(allTaskSources);
   const [taskCategory, setTaskCategory] = useState<TaskCategory>(allTaskCategories);
   const [taskSort, setTaskSort] = useState<TaskSort>("due");
-  const [calendarMode, setCalendarMode] = useState<CalendarMode>("day");
   const [selectedDate, setSelectedDate] = useState(() => dublinDateKey(new Date()));
-  const [calendarAnchor, setCalendarAnchor] = useState(() => dublinDateKey(new Date()));
   const [showTaskDetails, setShowTaskDetails] = useState(false);
   const [showReminderTray, setShowReminderTray] = useState(false);
   const [activeReminderId, setActiveReminderId] = useState<string | null>(null);
@@ -553,9 +555,26 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [agentRequest, setAgentRequest] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("");
+  const [clockNow, setClockNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockNow(new Date()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (!statusMessage) return;
+    const timer = window.setTimeout(() => setStatusMessage(""), 6_000);
+    return () => window.clearTimeout(timer);
+  }, [statusMessage]);
+  useEffect(() => {
+    setData(current => {
+      const records = integrations.overview?.records ?? [];
+      const enriched = current.inboxItems.map(item => enrichInboxSource(item, records));
+      const inboxItems = expireInboxItems(enriched, clockNow);
+      return JSON.stringify(inboxItems) === JSON.stringify(current.inboxItems) ? current : { ...current, inboxItems };
+    });
+  }, [clockNow, integrations.overview]);
   const [modalError, setModalError] = useState("");
   const focusBeforeOverlay = useRef<HTMLElement | null>(null);
-  const calendarTabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const firedHermesReminderIds = useRef(new Set<string>());
   const hermesBoard = hermes.feed && hermes.feed.state !== "unavailable" ? hermes.feed.board : null;
   const adoptedHermesIds = new Set(data.tasks.flatMap((task) => task.externalLinks ?? [])
@@ -791,7 +810,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return () => window.clearTimeout(timeout);
   }, [reviewUndo]);
 
-  const todayDate = dublinDateKey(new Date());
+  const todayDate = dublinDateKey(clockNow);
   const hermesPlannedEvents = useMemo<TimelineEvent[]>(() => hermesTasks.flatMap(task => {
     const area = hermesTaskArea(task, data.listAreas) ?? "Personal";
     return task.scheduledAt && task.status !== "done"
@@ -813,33 +832,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     () => [...data.events, ...hermesPlannedEvents].sort((first, second) => compareCalendarEvents(first, second, todayDate)),
     [data.events, hermesPlannedEvents, todayDate],
   );
-  const calendarDays = useMemo(() => calendarDateWindow(calendarAnchor, 3, 3), [calendarAnchor]);
-  const calendarRangeStart = selectedDate;
-  const calendarRangeEnd = calendarMode === "day" ? selectedDate : addCalendarDays(selectedDate, 6);
-  const visibleCalendarEvents = useMemo(
-    () => sortedEvents.filter((event) => {
-      const date = eventDateKey(event, todayDate);
-      return date >= calendarRangeStart && date <= calendarRangeEnd;
-    }),
-    [calendarRangeEnd, calendarRangeStart, sortedEvents, todayDate],
-  );
-  const taskById = useMemo(() => new Map(data.tasks.map((task) => [task.id, task])), [data.tasks]);
   const eventById = useMemo(() => new Map(data.events.map((event) => [event.id, event])), [data.events]);
-  const selectedEvent = visibleCalendarEvents.find((event) => event.id === selectedEventId) ?? visibleCalendarEvents[0] ?? null;
-  const selectedEventTask = selectedEvent?.taskId ? taskById.get(selectedEvent.taskId) : undefined;
-  const selectedEventHermesTask = selectedEvent?.taskId?.startsWith("hermes:")
-    ? hermesTasks.find(task => `hermes:${task.id}` === selectedEvent.taskId)
-    : undefined;
-  const reviewItems = useMemo(
-    () => [...data.inboxItems].sort((first, second) => Number(first.status === "handled") - Number(second.status === "handled")),
-    [data.inboxItems],
-  );
+  const reviewItems = data.inboxItems.filter(item => inboxView === "history" ? item.status === "handled" : item.status !== "handled" && inboxLane(item) === inboxView);
+  const localTasks = data.tasks.map(task => ({ ...task, area: localTaskArea(task) }));
   const selectedInbox = reviewItems.find((item) => item.id === selectedInboxId) ?? reviewItems[0] ?? null;
   const selectedInboxIndex = selectedInbox ? reviewItems.findIndex((item) => item.id === selectedInbox.id) : -1;
-  const activeTasks = data.tasks.filter((task) => !task.completed);
-  const activeBlock = visibleCalendarEvents.find((event) => event.editable && !taskById.get(event.taskId ?? "")?.completed) ?? null;
+  const activeTasks = localTasks.filter((task) => !task.completed);
   const activeReminder = allReminders.find((reminder) => reminder.id === activeReminderId) ?? null;
-  const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task") ?? [];
+  const importedTasks = integrations.overview?.records.filter((record) => record.kind === "task" && !record.adoptedTaskId) ?? [];
   const providerIsAvailable = (provider: ImportedRecord["provider"]) =>
     importedTasks.some((task) => task.provider === provider) ||
     integrations.overview?.providers.some((status) => status.provider === provider && status.connection?.state === "connected") === true;
@@ -850,10 +850,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (!latestActionByTask.has(action.taskId)) latestActionByTask.set(action.taskId, action);
   }
   const categoryLocalTasks = taskCategory === allTaskCategories
-    ? data.tasks
+    ? localTasks
     : taskCategory === unclassifiedTaskCategory
       ? []
-      : data.tasks.filter((task) => task.area === taskCategory);
+      : localTasks.filter((task) => task.area === taskCategory);
   const categoryHermesTasks = taskCategory === allTaskCategories
     ? hermesTasks
     : taskCategory === unclassifiedTaskCategory
@@ -863,7 +863,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     ? importedTasks
     : taskCategory === unclassifiedTaskCategory
       ? []
-      : importedTasks.filter((task) => areaForList(data.listAreas, task.provider, task.containerId, task.containerName) === taskCategory);
+      : importedTasks.filter((task) => importedTaskArea(data.listAreas, task) === taskCategory);
   const taskCategoryOptions: Array<{ id: TaskCategory; label: string }> = [
     { id: allTaskCategories, label: "All" },
     ...areas.map((area) => ({ id: area, label: area })),
@@ -920,13 +920,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }));
   const combinedImportedTasks = visibleImportedTasks.filter((task) =>
     !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
+  const categoryDistinctImportedTasks = categoryImportedTasks.filter((task) =>
+    !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`));
   const taskSourceOptions: Array<{ id: TaskSource; label: string; count: number }> = [
     { id: allTaskSources, label: "All sources", count: visibleTasks.length + visibleHermesTasks.length + combinedImportedTasks.length },
     { id: localTaskSource, label: "Fox Focus", count: visibleTasks.length },
   ];
   if (hermesBoard) taskSourceOptions.push({ id: hermesTaskSource, label: "Hermes", count: visibleHermesTasks.length });
-  if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: visibleImportedTasks.filter((task) => task.provider === "google").length });
-  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: visibleImportedTasks.filter((task) => task.provider === "microsoft").length });
+  if (googleTasksAvailable) taskSourceOptions.push({ id: googleTaskSource, label: "Google Tasks", count: combinedImportedTasks.filter((task) => task.provider === "google").length });
+  if (microsoftTasksAvailable) taskSourceOptions.push({ id: microsoftTaskSource, label: "Microsoft To Do", count: combinedImportedTasks.filter((task) => task.provider === "microsoft").length });
   const isExternalOnlyScope = taskSource === googleTaskSource || taskSource === microsoftTaskSource;
   const isHermesOnlyScope = taskSource === hermesTaskSource;
 
@@ -935,11 +937,12 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const shownImportedTasks = taskSource === allTaskSources
     ? combinedImportedTasks
     : taskSource === googleTaskSource || taskSource === microsoftTaskSource
-      ? visibleImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
+      ? combinedImportedTasks.filter((task) => providerTaskSource(task.provider) === taskSource)
       : [];
 
   const reminderCount = allReminders.length;
-  const reviewCount = data.inboxItems.filter((item) => item.status !== "handled").length;
+  const reviewCount = data.inboxItems.filter((item) => item.status !== "handled" && inboxLane(item) === "review").length;
+  const automationCount = data.inboxItems.filter(item => item.status !== "handled" && inboxLane(item) === "automation").length;
   const plannedTaskCount = activeTasks.filter((task) => Boolean(task.linkedEventId && eventById.has(task.linkedEventId))).length +
     hermesTasks.filter(task => task.status !== "done" && Boolean(task.scheduledAt)).length;
   const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
@@ -949,22 +952,22 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
   const selectedTaskCategoryLabel = taskCategory === allTaskCategories ? "all areas" : taskCategory === unclassifiedTaskCategory ? "uncategorised" : taskCategory;
   const taskFilterCounts: Record<TaskFilter, number> = {
-    all: categoryLocalTasks.length + categoryHermesTasks.length,
-    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length,
-    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length,
-    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length,
-    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length,
-    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length,
+    all: categoryLocalTasks.length + categoryHermesTasks.length + categoryDistinctImportedTasks.length,
+    open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed").length,
+    "due-today": categoryLocalTasks.filter((task) => (task.deadlineDate ? task.deadlineDate === todayDate : task.due === "Today") && !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done" && hermesTaskDue(task, todayDate) === "Today").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed" && task.dueOn === todayDate).length,
+    planned: categoryLocalTasks.filter((task) => Boolean(task.scheduledTime) && !task.completed).length + categoryHermesTasks.filter((task) => Boolean(task.scheduledAt) && task.status !== "done").length,
+    waiting: categoryLocalTasks.filter((task) => task.state === "waiting" && !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done" && (task.status === "blocked" || task.localState === "waiting")).length,
+    done: categoryLocalTasks.filter((task) => task.completed).length + categoryHermesTasks.filter((task) => task.status === "done").length + categoryDistinctImportedTasks.filter((task) => task.status === "completed").length,
   };
   const activeTaskFilterCount = Number(taskFilter !== "all") + Number(taskSource !== allTaskSources) + Number(taskSort !== "due");
-  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length;
-  const todayEvents = sortedEvents.filter((event) => eventDateKey(event, todayDate) === todayDate);
-  const currentTime = timeValueToMinutes(dublinTimeValue(new Date()));
+  const shownTaskCount = shownLocalTasks.length + shownHermesTasks.length + shownImportedTasks.length;
+  const todayEvents = calendarEntries(sortedEvents, integrations.overview?.records ?? [], todayDate).filter(event => event.date === todayDate && !event.allDay).sort((a, b) => a.time.localeCompare(b.time));
+  const currentTime = timeValueToMinutes(dublinTimeValue(clockNow));
   const currentEvent = todayEvents.find((event) => {
-    const startsAt = timeValueToMinutes(eventTimeValue(event));
+    const startsAt = timeValueToMinutes(event.time);
     return startsAt <= currentTime && startsAt + event.duration > currentTime;
   });
-  const nextEvents = todayEvents.filter((event) => timeValueToMinutes(eventTimeValue(event)) >= currentTime && event.id !== currentEvent?.id);
+  const nextEvents = todayEvents.filter((event) => timeValueToMinutes(event.time) >= currentTime && event.id !== currentEvent?.id);
   const todayFocusEvents = [...(currentEvent ? [currentEvent] : []), ...nextEvents].slice(0, 3);
   const priorityOrder: Record<Priority, number> = { high: 0, medium: 1, low: 2 };
   const attentionDueOrder: Record<string, number> = { Today: 0, Tomorrow: 1, Friday: 2, Waiting: 4, "No deadline": 5 };
@@ -1024,43 +1027,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function changeListArea(key: string, area: Area) {
     setData((current) => ({ ...current, listAreas: { ...current.listAreas, [key]: area } }));
-  }
-
-  function selectCalendarDate(date: string) {
-    setSelectedDate(date);
-    setCalendarAnchor(date);
-    setCalendarMode("day");
-    setSelectedEventId(null);
-  }
-
-  function moveCalendarDate(delta: number) {
-    const nextDate = addCalendarDays(selectedDate, delta);
-    setSelectedDate(nextDate);
-    setCalendarAnchor(nextDate);
-    setCalendarMode("day");
-    setSelectedEventId(null);
-  }
-
-  function returnCalendarToToday() {
-    setSelectedDate(todayDate);
-    setCalendarAnchor(todayDate);
-    setCalendarMode("day");
-    setSelectedEventId(null);
-  }
-
-  function handleCalendarTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, index: number) {
-    let nextIndex = index;
-    if (event.key === "ArrowRight" || event.key === "ArrowDown") nextIndex = Math.min(index + 1, calendarDays.length - 1);
-    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") nextIndex = Math.max(index - 1, 0);
-    else if (event.key === "Home") nextIndex = 0;
-    else if (event.key === "End") nextIndex = calendarDays.length - 1;
-    else return;
-
-    const nextDate = calendarDays[nextIndex];
-    if (!nextDate) return;
-    event.preventDefault();
-    selectCalendarDate(nextDate);
-    window.requestAnimationFrame(() => calendarTabRefs.current[3]?.focus({ preventScroll: true }));
   }
 
   function openHermesTaskEditor(task: HermesTask) {
@@ -1276,7 +1242,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : undefined;
     setTaskDraft({
       title: task?.title ?? inboxItem?.title ?? "",
-      area: task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal"),
+      area: (task ? localTaskArea(task) : undefined) ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal"),
       priority: task?.priority ?? "medium",
       due: task?.due ?? "No deadline",
       deadlineDate: task?.deadlineDate ?? (task ? legacyDeadlineDate(task.due, todayDate) : ""),
@@ -1379,8 +1345,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
     const date = eventDateKey(linkedEvent, todayDate);
     setSelectedDate(date);
-    setCalendarAnchor(date);
-    setCalendarMode("day");
     setSelectedEventId(task.linkedEventId);
     openWorkspaceView("agenda");
   }
@@ -1437,6 +1401,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       id: taskId,
       title,
       area: taskDraft.area,
+      areaOverride: true,
       state: existingTask?.completed ? "done" : taskDraft.scheduledTime ? "scheduled" : taskDraft.state,
       duration: taskDraft.duration,
       due: taskDraft.deadlineDate ? deadlineDateLabel(taskDraft.deadlineDate, todayDate) : "No deadline",
@@ -1480,8 +1445,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (completionUndo?.taskId === taskId) setCompletionUndo(null);
     if (linkedEventId) {
       setSelectedDate(scheduledDate);
-      setCalendarAnchor(scheduledDate);
-      setCalendarMode("day");
       setSelectedEventId(linkedEventId);
     }
     if (inboxItem) {
@@ -1540,6 +1503,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
                   title,
                   area: eventDraft.area,
                   duration: formatDuration(nextEvent.duration),
+                  scheduledDate: eventDraft.date,
                   scheduledTime: eventDraft.time,
                   state: task.completed ? "done" : "scheduled",
                 }
@@ -1552,13 +1516,19 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       inboxItems: modal.inboxId
         ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
         : current.inboxItems,
-      reminders: updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt),
+      reminders: (() => {
+        const eventReminders = updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt);
+        const linkedTaskReminder = existingEvent?.taskId
+          ? current.reminders.find((reminder) => reminder.targetType === "task" && reminder.targetId === existingEvent.taskId)
+          : undefined;
+        return linkedTaskReminder && existingEvent?.taskId
+          ? updateReminder(eventReminders, existingEvent.taskId, "task", title, linkedTaskReminder.mode, startsAt)
+          : eventReminders;
+      })(),
     }));
 
     if (existingEvent?.taskId && completionUndo?.taskId === existingEvent.taskId) setCompletionUndo(null);
     setSelectedDate(eventDraft.date);
-    setCalendarAnchor(eventDraft.date);
-    setCalendarMode("day");
     setSelectedEventId(eventId);
     if (inboxItem) {
       setSelectedInboxId(reviewItems.find((item) => item.id !== inboxItem.id && item.status !== "handled")?.id ?? inboxItem.id);
@@ -1577,12 +1547,14 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ...current,
       tasks: current.tasks.map((task) =>
         task.linkedEventId === eventToRemove.id
-          ? { ...task, linkedEventId: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
+          ? { ...task, linkedEventId: undefined, scheduledDate: undefined, scheduledTime: null, state: task.completed ? "done" : "up-next" }
           : task,
       ),
       events: current.events.filter((event) => event.id !== eventToRemove.id),
       inboxItems: current.inboxItems,
-      reminders: current.reminders.filter((reminder) => reminder.targetId !== eventToRemove.id),
+      reminders: current.reminders.filter((reminder) =>
+        !(reminder.targetType === "event" && reminder.targetId === eventToRemove.id) &&
+        !(reminder.targetType === "task" && current.tasks.some((task) => task.id === reminder.targetId && task.linkedEventId === eventToRemove.id))),
     }));
     if (eventToRemove.taskId && completionUndo?.taskId === eventToRemove.taskId) setCompletionUndo(null);
     setSelectedEventId(null);
@@ -1605,7 +1577,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const nextStatus: InboxStatus = item.status === "handled" ? "new" : "handled";
     setData((current) => ({
       ...current,
-      inboxItems: current.inboxItems.map((candidate) => candidate.id === item.id ? { ...candidate, status: nextStatus } : candidate),
+      inboxItems: current.inboxItems.map((candidate) => candidate.id === item.id ? { ...candidate, status: nextStatus, ...(nextStatus === "new" && candidate.expiryApplied ? { expiryApplied: undefined, expiryRule: { enabled: false, graceMinutes: candidate.expiryRule?.graceMinutes ?? 1440, destination: candidate.expiryRule?.destination ?? "history" } } : {}) } : candidate),
     }));
     setReviewUndo({ itemId: item.id, status: item.status });
     setCompletionUndo(null);
@@ -1783,47 +1755,20 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     return linkedEvent ? eventDateKey(linkedEvent, todayDate) : task.scheduledDate;
   }
 
-  function renderScheduleRow(event: TimelineEvent, showDate = false) {
-    const linkedTask = event.taskId ? taskById.get(event.taskId) : undefined;
-    const linkedTaskDone = linkedTask?.completed === true;
-    const date = eventDateKey(event, todayDate);
-    const time = eventTimeValue(event);
-
-    return (
-      <button
-        className={`schedule-row${showDate ? " schedule-row--dated" : ""}${event.id === selectedEvent?.id ? " schedule-row--selected" : ""}${linkedTaskDone ? " schedule-row--done" : ""}${event.editable ? "" : " schedule-row--imported"}`}
-        key={event.id}
-        type="button"
-        aria-pressed={event.id === selectedEvent?.id}
-        onClick={() => setSelectedEventId(event.id)}
-      >
-        <time dateTime={event.startsAt ?? time}>
-          {showDate ? <><span>{formatDublinDateKey(date, { weekday: "short", day: "numeric" })}</span><small>{time}</small></> : time}
-        </time>
-        <i className={`area-dot area-dot--${areaClass(event.area)}`} />
-        <span className="schedule-row-copy">
-          <strong>{event.title}</strong>
-          <small>{!event.editable ? <em className="agenda-origin agenda-origin--imported">Imported</em> : null}{event.subtitle}</small>
-        </span>
-        <span className="schedule-duration">{formatDuration(event.duration)}</span>
-        <ChevronRight className="schedule-arrow" size={14} />
-      </button>
-    );
-  }
-
-  function openTodayEvent(event: TimelineEvent) {
-    returnCalendarToToday();
+  function openTodayEvent(event: { id: string; date: string }) {
+    setSelectedDate(event.date);
     setSelectedEventId(event.id);
     openWorkspaceView("agenda");
   }
 
   function openTodayInbox(item: InboxItem) {
+    setInboxView("review");
     selectInbox(item);
     openWorkspaceView("review");
   }
 
   function renderTodayView() {
-    const openReviewItems = reviewItems.filter((item) => item.status !== "handled").slice(0, 3);
+    const openReviewItems = data.inboxItems.filter(item => item.status !== "handled" && inboxLane(item) === "review").slice(0, 2);
 
     return <section className="workspace-page workspace-page--today" aria-labelledby="today-heading">
       <header className="workspace-heading today-heading">
@@ -1837,19 +1782,29 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       {initial && hermes.failed ? <p className="workspace-alert"><Bot size={14} /> Hermes could not refresh. Your Fox Focus tasks are still available.</p> : null}
 
       <div className="today-grid">
+        <div className="today-column">
         <article className="pane today-card today-card--schedule">
           <PaneHeader eyebrow="Calendar" title={currentEvent ? "Now and next" : "Next today"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("agenda")}>Full calendar <ChevronRight size={12} /></button>} />
           <div className="today-event-list">
             {todayFocusEvents.map((event, index) => <button className="today-event-row" type="button" key={event.id} onClick={() => openTodayEvent(event)}>
-              <time dateTime={event.startsAt ?? eventTimeValue(event)}><span>{event.id === currentEvent?.id ? "Now" : index === 0 ? "Next" : "Then"}</span><strong>{eventTimeValue(event)}</strong></time>
+              <time dateTime={event.startsAt ?? event.time}><span>{event.id === currentEvent?.id ? "Now" : index === (currentEvent ? 1 : 0) ? "Next" : "Then"}</span><strong>{event.time}</strong></time>
               <i className={`calendar-event-mark calendar-event-mark--${areaClass(event.area)}`} />
-              <span><strong>{event.title}</strong><small>{event.subtitle || `${formatDuration(event.duration)} · ${event.area}`}</small></span>
+              <span><strong>{event.title}</strong><small>{event.local?.subtitle || event.source}</small></span>
               <ChevronRight size={14} />
             </button>)}
             {!todayFocusEvents.length ? <div className="today-empty"><CalendarDays size={17} /><span><strong>Nothing else on today</strong><small>Add a block only if it helps.</small></span></div> : null}
           </div>
         </article>
 
+        <article className="pane today-card today-card--inbox">
+          <PaneHeader eyebrow="Needs review" title={reviewCount ? `Inbox · ${reviewCount}` : "Inbox is clear"} action={<button className="pane-link" type="button" onClick={() => { setInboxView("review"); openWorkspaceView("review"); }}>Open Inbox <ChevronRight size={12} /></button>} />
+          <div className="today-inbox-list">
+            {openReviewItems.map((item) => <button type="button" key={item.id} onClick={() => openTodayInbox(item)}><i className={`area-dot area-dot--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><ChevronRight size={14} /></button>)}
+            {!openReviewItems.length ? <div className="today-empty"><Inbox size={17} /><span><strong>Inbox is clear</strong><small>New proposals will appear here.</small></span></div> : null}
+          </div>
+        </article>
+        </div>
+        <div className="today-column">
         <article className="pane today-card today-card--tasks">
           <PaneHeader eyebrow="Attention" title={attentionTasks.length ? `${attentionTasks.length} task${attentionTasks.length === 1 ? "" : "s"}` : "All clear"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("tasks")}>All tasks <ChevronRight size={12} /></button>} />
           <div className="task-browser-list today-task-list">
@@ -1858,22 +1813,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           </div>
         </article>
 
-        <article className="pane today-card today-card--due">
-          <PaneHeader eyebrow="Due soon" title="What is coming" />
-          <div className="today-stat-list">
-            <button type="button" onClick={() => { selectTaskFilter("due-today"); openWorkspaceView("tasks"); }}><span>Today</span><strong>{dueTodayCount}</strong></button>
-            <button type="button" onClick={() => { selectTaskFilter("open"); openWorkspaceView("tasks"); }}><span>Tomorrow</span><strong>{dueTomorrowCount}</strong></button>
-            <button type="button" onClick={() => { selectTaskFilter("waiting"); openWorkspaceView("tasks"); }}><span>Waiting</span><strong>{waitingTaskCount}</strong></button>
-          </div>
-        </article>
-
-        <article className="pane today-card today-card--inbox">
-          <PaneHeader eyebrow="Inbox" title={reviewCount ? `${reviewCount} decision${reviewCount === 1 ? "" : "s"}` : "Nothing waiting"} action={<button className="pane-link" type="button" onClick={() => openWorkspaceView("review")}>Open Inbox <ChevronRight size={12} /></button>} />
-          <div className="today-inbox-list">
-            {openReviewItems.map((item) => <button type="button" key={item.id} onClick={() => openTodayInbox(item)}><i className={`area-dot area-dot--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><ChevronRight size={14} /></button>)}
-            {!openReviewItems.length ? <div className="today-empty"><Inbox size={17} /><span><strong>Inbox is clear</strong><small>New proposals will appear here.</small></span></div> : null}
-          </div>
-        </article>
+        <div className="today-task-summary"><button type="button" onClick={() => { selectTaskFilter("due-today"); openWorkspaceView("tasks"); }}>{dueTodayCount} due today</button><span>{dueTomorrowCount} due tomorrow</span><button type="button" onClick={() => { selectTaskFilter("waiting"); openWorkspaceView("tasks"); }}>{waitingTaskCount} waiting</button></div>
+        </div>
       </div>
 
       <div className="today-tools" aria-label="Workspace tools">
@@ -1884,47 +1825,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function renderCalendarView() {
-    return <section className="workspace-page workspace-page--calendar" aria-labelledby="calendar-heading">
-      <header className="workspace-heading">
-        <div><p className="eyebrow">Calendar / Dublin time</p><h1 id="calendar-heading">Calendar</h1><p>See your time, then add a local block when it is useful.</p></div>
-        <button className="page-primary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Add block</button>
-      </header>
-      <article className="pane calendar-workspace">
-        <PaneHeader eyebrow={calendarMode === "day" ? "Selected day" : "Seven day view"} title={calendarMode === "day" ? formatDublinDateKey(selectedDate) : "Upcoming seven days"} />
-        <div className="calendar-view-bar">
-          <div className="calendar-view-switch" role="group" aria-label="Calendar view">
-            <button className={calendarMode === "day" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "day"} onClick={() => setCalendarMode("day")}><CalendarDays size={13} /> Day</button>
-            <button className={calendarMode === "upcoming" ? "calendar-view-option calendar-view-option--active" : "calendar-view-option"} type="button" aria-pressed={calendarMode === "upcoming"} onClick={() => setCalendarMode("upcoming")}><CalendarRange size={13} /> Upcoming</button>
-          </div>
-          <button className="calendar-today-action" type="button" onClick={returnCalendarToToday} disabled={selectedDate === todayDate && calendarMode === "day"}>Today</button>
-          <span className="calendar-range-copy">{calendarMode === "day" ? `${visibleCalendarEvents.length} local block${visibleCalendarEvents.length === 1 ? "" : "s"}` : `${formatDublinDateKey(calendarRangeStart, { day: "numeric", month: "short" })} to ${formatDublinDateKey(calendarRangeEnd, { day: "numeric", month: "short" })}`}</span>
-        </div>
-        <div className="calendar-date-shell">
-          <button className="calendar-step" type="button" onClick={() => moveCalendarDate(-1)} aria-label="Previous day"><ChevronLeft size={16} /></button>
-          <div className="calendar-date-strip" role="tablist" aria-label="Choose a day">
-            {calendarDays.map((date, index) => {
-              const localCount = sortedEvents.filter((event) => eventDateKey(event, todayDate) === date).length;
-              const fullLabel = formatDublinDateKey(date, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
-              return <button className={`calendar-date-tab${date === selectedDate ? " calendar-date-tab--selected" : ""}${date === todayDate ? " calendar-date-tab--today" : ""}`} id={`calendar-date-${date}`} key={date} type="button" role="tab" aria-controls="calendar-day-panel" aria-current={date === todayDate ? "date" : undefined} aria-label={`${fullLabel}${date === todayDate ? ", today" : ""}, ${localCount} local ${localCount === 1 ? "block" : "blocks"}`} aria-selected={date === selectedDate} tabIndex={date === selectedDate ? 0 : -1} ref={(element) => { calendarTabRefs.current[index] = element; }} onClick={() => selectCalendarDate(date)} onKeyDown={(event) => handleCalendarTabKeyDown(event, index)}>
-                <span>{formatDublinDateKey(date, { weekday: "short" })}</span><strong>{formatDublinDateKey(date, { day: "numeric" })}</strong><small>{date === todayDate ? "Today" : localCount ? `${localCount} local` : "No local"}</small>
-              </button>;
-            })}
-          </div>
-          <button className="calendar-step" type="button" onClick={() => moveCalendarDate(1)} aria-label="Next day"><ChevronRight size={16} /></button>
-        </div>
-        {initial ? <IntegrationCalendarContext overviewState={integrations} onOpen={() => setShowIntegrations(true)} startDate={calendarRangeStart} endDate={calendarRangeEnd} /> : null}
-        {activeBlock ? <div className={`active-block lifeboard-active-block selected-run--${areaClass(activeBlock.area)}`}><div className="active-block-copy"><span className="live-label"><span /> Local block in this view</span><strong>{activeBlock.title}</strong><small>{eventTimeValue(activeBlock)} · {formatDuration(activeBlock.duration)} · {activeBlock.taskId ? "linked task" : "local block"}</small></div><button className="open-note" type="button" onClick={() => setSelectedEventId(activeBlock.id)}>Inspect <ChevronRight size={12} /></button></div> : null}
-        <div className="schedule-list agenda-list" id="calendar-day-panel" role="tabpanel" aria-labelledby={`calendar-date-${selectedDate}`}>
-          {calendarMode === "day" ? visibleCalendarEvents.map((event) => renderScheduleRow(event)) : calendarDateWindow(selectedDate, 0, 6).map((date) => {
-            const dayEvents = visibleCalendarEvents.filter((event) => eventDateKey(event, todayDate) === date);
-            if (!dayEvents.length) return null;
-            return <section className="agenda-day-group" key={date}><button className="agenda-day-heading" type="button" onClick={() => selectCalendarDate(date)}><span>{date === todayDate ? "Today" : formatDublinDateKey(date, { weekday: "long" })}</span><strong>{formatDublinDateKey(date, { day: "numeric", month: "long" })}</strong><ChevronRight size={13} /></button>{dayEvents.map((event) => renderScheduleRow(event, true))}</section>;
-          })}
-          {!visibleCalendarEvents.length ? <div className="calendar-empty"><CalendarDays size={17} /><span>{calendarMode === "day" ? "No local blocks on this day." : "No local blocks in these seven days."}</span></div> : null}
-        </div>
-        {selectedEvent ? <div className="agenda-detail"><div className="agenda-detail-main"><i className={`area-dot area-dot--${areaClass(selectedEvent.area)}`} /><span><em className={`agenda-origin${selectedEvent.editable ? " agenda-origin--local" : " agenda-origin--imported"}${selectedEventTask?.completed ? " agenda-origin--done" : ""}`}>{selectedEventTask?.completed ? "Completed task" : selectedEvent.editable ? "Local block" : "Imported calendar"}</em><strong>{selectedEvent.title}</strong><small>{formatDublinDateKey(eventDateKey(selectedEvent, todayDate), { weekday: "short", day: "numeric", month: "short" })} · {eventTimeValue(selectedEvent)} · {formatDuration(selectedEvent.duration)} · {selectedEvent.area}</small></span></div><div className="agenda-detail-actions">{selectedEventTask ? <button className="mini-action" type="button" onClick={() => openTaskComposer(selectedEventTask)}><Pencil size={12} /> Edit linked task</button> : null}{selectedEvent.editable ? <button className="secondary-action" type="button" onClick={() => openEventComposer(selectedEvent)}><Pencil size={13} /> Edit</button> : <button className="secondary-action" type="button" onClick={() => openEventComposer()}><Plus size={13} /> Capture local</button>}</div></div> : null}
-      </article>
-    </section>;
+    return <Calendar events={sortedEvents} overview={integrations} date={selectedDate} onDate={setSelectedDate} selectedId={selectedEventId} onEdit={event => { const task = hermesTasks.find(task => event.taskId === `hermes:${task.id}`); if (task) openHermesTaskEditor(task); else openEventComposer(event); }} onAdd={() => openEventComposer()} onSources={() => setShowIntegrations(true)} />;
   }
 
   function renderTasksView() {
@@ -1935,14 +1836,15 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         <nav className="task-category-strip" aria-label="Task categories">{taskCategoryOptions.map((category) => <button className={`task-category-tab${taskCategory === category.id ? " task-category-tab--active" : ""}`} type="button" aria-pressed={taskCategory === category.id} key={category.id} onClick={() => selectTaskCategory(category.id)}>{category.id !== allTaskCategories && category.id !== unclassifiedTaskCategory ? <i className={`area-dot area-dot--${areaClass(category.id)}`} /> : null}{category.label}</button>)}</nav>
         {hermesBoard && (taskCategory === allTaskCategories || taskCategory === unclassifiedTaskCategory) && taskFilter !== "all" && taskFilter !== "open" && taskFilter !== "done" && activeHermesTaskCount ? <p className="task-filter-boundary"><Bot size={13} /> Hermes tasks appear in All, Open, or Done because they do not have Fox Focus deadlines yet.</p> : null}
         <div className="task-compact-toolbar">
-          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
+          <details className="task-filter-menu"><summary><SlidersHorizontal size={14} /><span>Filter &amp; sort</span>{activeTaskFilterCount ? <b aria-label={`${activeTaskFilterCount} active filters`}>{activeTaskFilterCount}</b> : null}<ChevronDown className="filter-chevron" size={13} /></summary><div className="task-filter-popover"><label><span>Show</span><select value={taskFilter} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskFilters)) selectTaskFilter(value); }}>{taskFilters.map((filter) => <option value={filter} key={filter}>{taskFilterLabel(filter)} · {taskFilterCounts[filter]}</option>)}</select></label>{hermesBoard || googleTasksAvailable || microsoftTasksAvailable ? <label><span>Source</span><select value={taskSource} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSources)) setTaskSource(value); }}>{taskSourceOptions.map((source) => <option value={source.id} key={source.id} disabled={source.id === hermesTaskSource && source.count === 0}>{source.label} · {source.count}</option>)}</select></label> : null}<label><span>Order local tasks</span><select value={taskSort} disabled={isHermesOnlyScope} onChange={(event) => { const value = event.target.value; if (isOneOf(value, taskSorts)) setTaskSort(value); }}>{taskSorts.map((sort) => <option value={sort} key={sort}>{taskSortLabel(sort)}</option>)}</select></label>{isHermesOnlyScope ? <p>Hermes keeps source priority order.</p> : null}<button className="task-filter-reset" type="button" disabled={!activeTaskFilterCount} onClick={resetTaskFilters}><RotateCcw size={12} /> Reset</button></div></details>
           <span className="task-view-count" role="status" aria-live="polite">{shownTaskCount} task{shownTaskCount === 1 ? "" : "s"}</span>
           {initial && hermesBoard ? <button className="mini-action task-refresh" type="button" disabled={hermes.loading} onClick={hermes.refresh}>{hermes.loading ? "Refreshing…" : "Refresh Hermes"}</button> : null}
         </div>
         <p className="planned-note"><CalendarDays size={13} /> {plannedTaskCount ? `${plannedTaskCount} planned task${plannedTaskCount === 1 ? "" : "s"} on the local calendar.` : "Open a task to give it calendar time."}</p>
         <div className="task-browser-list task-browser-list--lifeboard" id="task-browser-panel" role="region" aria-label={`${taskFilterLabel(taskFilter)} tasks`}>
           {shownLocalTasks.map((task) => <TaskRow key={task.id} task={task} dueLabel={taskDeadlineLabel(task, todayDate)} latestAction={latestActionByTask.get(task.id)} plannedDate={plannedDateForTask(task)} onToggle={toggleTask} onEdit={openTaskComposer} />)}
-          {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} busy={adoptingHermesId === task.id} onAdopt={(candidate) => void previewHermesAdoption(candidate)} />)}
+          {shownHermesTasks.map((task) => <HermesTaskRow key={task.id} task={task} area={hermesTaskArea(task, data.listAreas)} busy={adoptingHermesId === task.id} onAdopt={(candidate) => void previewHermesAdoption(candidate)} />)}
+          {shownImportedTasks.map((task) => <ImportedTaskRow key={`${task.provider}:${task.id}`} task={task} area={importedTaskArea(data.listAreas, task)} />)}
           {!shownTaskCount ? <div className="empty-state"><ListTodo size={20} /><strong>{taskFilter === "done" ? "No completed tasks yet" : "Nothing in this view"}</strong><p>{taskFilter === "done" ? "Completed tasks stay here for review." : "Change the category or filters, or add a task."}</p></div> : null}
         </div>
       </article>
@@ -1951,14 +1853,44 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function renderReviewView() {
     return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
-      <header className="workspace-heading"><div><p className="eyebrow">One decision at a time</p><h1 id="review-heading">Inbox</h1><p>Turn a proposal into a task, a calendar block, a draft, or nothing.</p></div><span className="review-page-count">{reviewCount} open</span></header>
+      <header className="workspace-heading"><div><h1 id="review-heading">Inbox</h1><p>{reviewCount ? `${reviewCount} item${reviewCount === 1 ? "" : "s"} to review` : "You're caught up"}</p></div></header>
       <article className="pane review-workspace">
         <div className="review-workbench">
-          <div className="inbox-list inbox-list--lifeboard">
-            {reviewItems.map((item) => <div className={`inbox-list-row${item.status === "handled" ? " inbox-list-row--handled" : ""}`} key={item.id}><button className={`inbox-list-item${selectedInbox?.id === item.id ? " inbox-list-item--selected" : ""}`} type="button" aria-pressed={selectedInbox?.id === item.id} onClick={() => selectInbox(item)}><span className={`calendar-event-mark calendar-event-mark--${areaClass(item.accent)}`} /><span><strong>{item.title}</strong><small>{item.source}</small></span><span className={`review-status review-status--${item.status}`}>{formatStatus(item.status)}</span></button><button className={`inbox-complete${item.status === "handled" ? " inbox-complete--done" : ""}`} type="button" onClick={() => toggleInboxHandled(item)} aria-label={`${item.status === "handled" ? "Return" : "Mark"} ${item.title} ${item.status === "handled" ? "to review" : "as handled"}`}>{item.status === "handled" ? <Check size={13} /> : <Circle size={15} />}</button></div>)}
-            {!reviewItems.length ? <p className="empty-line">Inbox is clear.</p> : null}
+          <div className="review-inbox-column">
+            <div className="review-lanes" role="group" aria-label="Inbox views">
+              {([{ id: "review", label: "Inbox", count: reviewCount }, { id: "automation", label: "Automations", count: automationCount }, { id: "history", label: "History", count: data.inboxItems.filter(item => item.status === "handled").length }] as const).map(lane => <button key={lane.id} type="button" aria-pressed={inboxView === lane.id} onClick={() => { setInboxView(lane.id); setSelectedInboxId(null); }}>{lane.label}<span>{lane.count}</span></button>)}
+            </div>
+            <div className="inbox-list inbox-list--lifeboard" aria-label="Inbox items">
+              {reviewItems.map(item => <button className={`inbox-list-item${selectedInbox?.id === item.id ? " inbox-list-item--selected" : ""}`} key={item.id} type="button" aria-pressed={selectedInbox?.id === item.id} onClick={() => selectInbox(item)}>
+                <span className={`calendar-event-mark calendar-event-mark--${areaClass(item.accent)}`} />
+                <span><strong>{item.title}</strong><small>{item.source}{item.reviewDecision ? " · Decision saved" : ""}</small></span>
+                <ChevronRight size={14} />
+              </button>)}
+              {!reviewItems.length ? <div className="today-empty"><Inbox size={18} /><span><strong>{inboxView === "automation" ? "No automations" : inboxView === "history" ? "No history yet" : "Inbox is clear"}</strong><small>{inboxView === "review" ? "New items will appear here." : "Choose another view to continue."}</small></span></div> : null}
+            </div>
           </div>
-          {selectedInbox ? <div className="review-detail"><div className="review-queue-nav"><span>{selectedInboxIndex + 1} of {reviewItems.length}</span><div><button type="button" onClick={() => moveInboxSelection(-1)} disabled={selectedInboxIndex <= 0} aria-label="Previous review item"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveInboxSelection(1)} disabled={selectedInboxIndex >= reviewItems.length - 1} aria-label="Next review item"><ChevronRight size={14} /></button></div></div><div className="review-item-meta"><i className={`area-dot area-dot--${areaClass(selectedInbox.accent)}`} /><span>{selectedInbox.actor}</span><span className={`review-status review-status--${selectedInbox.status}`}>{formatStatus(selectedInbox.status)}</span></div><h3>{selectedInbox.title}</h3><p>{selectedInbox.summary}</p><div className="evidence-card evidence-card--compact"><span>Source evidence</span><strong>{selectedInbox.source}</strong><p>No connected email body is available in this review surface.</p></div>{selectedInbox.draft ? <div className="saved-draft"><span>Saved draft · not sent</span><pre>{selectedInbox.draft}</pre></div> : null}{selectedInbox.moreWork ? <div className="saved-request"><span>Feedback note · not delivered</span><p>{selectedInbox.moreWork}</p></div> : null}<div className="review-next-step"><span>Choose the next step</span><p>Local outcomes happen now. Nothing is sent back to its source.</p></div>{selectedInbox.status === "handled" ? <div className="review-detail-actions"><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><RotateCcw size={13} /> Return to review</button></div> : <div className="review-detail-actions"><button className="page-primary-action" type="button" onClick={() => acceptInbox("task")}><ListTodo size={13} /> Create task</button><button className="secondary-action" type="button" onClick={() => openDraft(selectedInbox)}><Pencil size={13} /> Draft reply</button><button className="secondary-action" type="button" onClick={() => acceptInbox("event")}><CalendarDays size={13} /> Schedule block</button><button className="secondary-action" type="button" onClick={() => toggleInboxHandled(selectedInbox)}><CheckCircle2 size={13} /> No action</button></div>}<div className="agent-request agent-request--compact"><label htmlFor="more-work">Feedback note</label><textarea id="more-work" value={agentRequest} onChange={(event) => setAgentRequest(event.target.value)} placeholder="What should Hermes check or change later?" /><button className="quiet-panel-action" type="button" onClick={saveMoreWork}>Save note</button></div></div> : null}
+          {selectedInbox ? <div className="review-detail">
+            <div className="review-queue-nav"><span>{selectedInboxIndex + 1} of {reviewItems.length}</span><div><button type="button" onClick={() => moveInboxSelection(-1)} disabled={selectedInboxIndex <= 0} aria-label="Previous review item"><ChevronLeft size={14} /></button><button type="button" onClick={() => moveInboxSelection(1)} disabled={selectedInboxIndex >= reviewItems.length - 1} aria-label="Next review item"><ChevronRight size={14} /></button></div></div>
+            <div className="review-selected-heading"><span className="eyebrow">{selectedInbox.source}</span><h3>{selectedInbox.title}</h3><p>{selectedInbox.summary}</p></div>
+            <InboxTiming key={`timing:${selectedInbox.id}`} item={selectedInbox} onSave={expiryRule => {
+              setData(current => ({ ...current, inboxItems: current.inboxItems.map(item => item.id === selectedInbox.id ? { ...item, expiryRule, expiryApplied: undefined } : item) }));
+              setStatusMessage("Expiry rule saved.");
+            }} />
+            <ReviewDecision key={selectedInbox.id} item={selectedInbox} existingTask={hermes.feed?.state === "connected" && hermes.feed.board.slug === "personal-tasks" ? hermes.feed.board.tasks.find(task => task.id === selectedInbox.existingHermesTaskId) : undefined} onSave={(outcome, note) => {
+              setData(current => ({ ...current, inboxItems: current.inboxItems.map(item => item.id === selectedInbox.id ? { ...item, reviewDecision: { outcome, note, savedAt: new Date().toISOString() } } : item) }));
+              setStatusMessage("Review decision saved. No task or external source was changed.");
+            }} onDismiss={() => toggleInboxHandled(selectedInbox)} />
+            <details className="review-context" key={`context:${selectedInbox.id}`}><summary>More options &amp; context</summary>
+              <p>From {selectedInbox.actor} · {formatStatus(selectedInbox.status)}</p>
+              {selectedInbox.draft ? <div className="saved-draft"><span>Saved draft · not sent</span><pre>{selectedInbox.draft}</pre></div> : null}
+              {selectedInbox.moreWork ? <div className="saved-request"><span>Saved note · not delivered</span><p>{selectedInbox.moreWork}</p></div> : null}
+              <button className="pane-link" type="button" onClick={() => {
+                const lane: InboxLane = inboxLane(selectedInbox) === "automation" ? "review" : "automation";
+                setData(current => ({ ...current, inboxItems: current.inboxItems.map(item => item.id === selectedInbox.id ? { ...item, lane } : item) }));
+                setSelectedInboxId(null);
+              }}>Move to {inboxLane(selectedInbox) === "automation" ? "Needs review" : "Automations"}</button>
+            </details>
+          </div> : <div className="review-detail review-detail--empty"><Inbox size={24} /><p>Select an item to review it here.</p></div>}
         </div>
       </article>
     </section>;
@@ -1999,7 +1931,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <button className={activeSection === "today" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "today" ? "page" : undefined} onClick={() => openWorkspaceView("today")}><Clock3 size={14} /><span>Today</span></button>
           <button className={activeSection === "agenda" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "agenda" ? "page" : undefined} onClick={() => openWorkspaceView("agenda")}><CalendarDays size={14} /><span>Calendar</span></button>
           <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "tasks" ? "page" : undefined} onClick={() => openWorkspaceView("tasks")}><ListTodo size={14} /><span>Tasks</span></button>
-          <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => openWorkspaceView("review")}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
+          <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => { setInboxView("review"); openWorkspaceView("review"); }}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
         </nav>
         <div className="command-actions">
           <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} /><b>{reminderCount}</b><span>Reminders</span></button>
@@ -2011,6 +1943,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       {saveError || statusMessage || completionUndo || reviewUndo ? <div className={`status-footer${saveError ? " status-footer--error" : ""}`} role={saveError ? "alert" : "status"} aria-live={saveError ? "assertive" : "polite"} aria-hidden={isOverlayOpen}>
         <span />
         <p>{saveError ?? statusMessage}</p>
+        {!saveError ? <button className="calendar-step" type="button" aria-label="Dismiss notification" onClick={() => { setStatusMessage(""); setCompletionUndo(null); setReviewUndo(null); }}><X size={13} /></button> : null}
         {completionUndo ? <button className="status-undo" type="button" onClick={undoTaskCompletion}>Undo</button> : reviewUndo ? <button className="status-undo" type="button" onClick={undoInboxChange}>Undo</button> : null}
       </div> : null}
       <main aria-hidden={isOverlayOpen}>{renderWorkspaceView()}</main>

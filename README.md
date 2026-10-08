@@ -6,10 +6,10 @@ It is intentionally smaller than a project manager. There are four working views
 
 - **Today** shows the current or next calendar item, roughly five useful tasks, due-soon work, and Inbox decisions.
 - **Tasks** is the full task browser. A checkbox completes a task. Opening the rest of the row shows its details and editing controls.
-- **Calendar** shows the day and upcoming schedule without mixing task management into the same long page.
-- **Inbox** holds captures and agent proposals until you decide what they become.
+- **Calendar** puts imported events and local blocks in day, week, and month views. The time grid positions events and the current-time line in Europe/Dublin.
+- **Inbox** separates manual review, recurring automations, and history. Suggestions explain an outcome and next step; decisions stay local and actionable items remain proposals.
 
-Each view owns the page scrollbar. Task lists do not trap the user inside a second scrolling panel.
+Task lists use the page scrollbar. Calendar has a scrollable hourly grid beneath its date controls.
 
 ## Task ownership
 
@@ -39,7 +39,7 @@ The existing Hermes `personal-tasks` board stays canonical until explicit live m
 - Create, edit, schedule, prioritise, reopen, and complete local tasks.
 - Keep completed tasks in local history.
 - Add and edit local calendar blocks with Dublin-aware time handling.
-- Capture an Inbox item, review it, and turn it into a task, calendar block, draft request, or no action.
+- Review Inbox proposals, save a decision and note locally, or dismiss them. Review does not create tasks, messages, calendar blocks, or reminders. Confirmed event expiries move to History after 24 hours by default. Per-item rules can change the expiry, grace period, or destination, or disable the move. Overdue task deadlines stay visible.
 - Store the workspace in SQLite with revision checks that stop one browser tab from silently overwriting another.
 - Deliver opted-in Web Push reminders to subscribed devices, with in-tab reminders when push is unavailable.
 - Install as a PWA on supported browsers.
@@ -151,7 +151,9 @@ The owner uses HTTP Basic authentication in this first self-hosted release. That
 - `GET /api/v1/integrations/:provider/connect` starts OAuth; its callback consumes a one-time server state.
 - `POST /api/v1/integrations/:provider/sync` performs an authenticated, read-only provider refresh.
 - `GET /api/v1/task-status` returns the safe read-only projection used by Hermes.
-- `POST /api/v1/task-proposals` adds an idempotent Hermes proposal to Inbox.
+- `POST /api/v1/task-proposals` adds an idempotent Hermes proposal to Inbox. Optional `lane` is `review` or `automation`. Optional `recommendation` contains `outcome`, `reason`, and `nextStep`; outcomes are `noise-reference`, `awareness`, `proposed-commitment`, `existing-task-update`, and `needs-decision`. An optional `existingHermesTaskId` is shown as an existing task reference only when it matches the connected `personal-tasks` feed. Suggestions never approve or execute work. Hermes chat is not connected.
+- Proposals can include `sourceContext` with `provider`, `externalId`, `timing` (`confirmed` or `suggested`), and optional `startsAt`, `endsAt`, `dueAt`, `dueOn`, `expiresAt`, and a short `evidence` excerpt. Instants are normalized to UTC. Include `containerId` and `connectionId` for exact Google/Microsoft record matching; refreshed source times replace stale timing. Suggested dates and task deadlines never cause automatic dismissal. Only confirmed `endsAt`/`expiresAt`, or an explicit local expiry rule, can do that.
+- Inbox expiry runs while the app is open and catches up when the workspace is loaded. It preserves the item in History or Automations. Restoring an automatically archived item disables its expiry rule.
 - `POST /api/v1/task-adoptions/preview` and `POST /api/v1/task-adoptions/:id/approve` adopt one imported task.
 - `GET /api/v1/task-actions` lists status-write requests.
 - `POST /api/v1/task-actions/preview` creates the exact completion or reopen preview.

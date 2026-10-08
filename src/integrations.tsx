@@ -5,6 +5,7 @@ import { areaForList, filterCalendarContextByDateRange, listAreaKey } from './in
 import {
   areas,
   isOneOf,
+  isIsoInstant,
   isPrototypeData,
   isTask,
   type Area,
@@ -47,6 +48,8 @@ export type ImportedRecord = {
   status: string | null;
   startsAt: string | null;
   startsOn: string | null;
+  endsAt?: string | null;
+  endsOn?: string | null;
   dueOn: string | null;
   allDay: boolean;
   adoptedTaskId: string | null;
@@ -104,8 +107,10 @@ function isImportedRecord(value: unknown): value is ImportedRecord {
     typeof value.containerId === 'string' && typeof value.containerName === 'string' &&
     typeof value.externalId === 'string' && typeof value.title === 'string' &&
     (value.status === null || typeof value.status === 'string') &&
-    (value.startsAt === null || typeof value.startsAt === 'string') &&
-    (value.startsOn === null || typeof value.startsOn === 'string') &&
+    (value.startsAt === null || isIsoInstant(value.startsAt)) &&
+    (value.startsOn === null || isDateKey(value.startsOn)) &&
+    (value.endsAt === undefined || value.endsAt === null || isIsoInstant(value.endsAt)) &&
+    (value.endsOn === undefined || value.endsOn === null || isDateKey(value.endsOn)) &&
     (value.dueOn === null || typeof value.dueOn === 'string') && typeof value.allDay === 'boolean' &&
     (value.adoptedTaskId === null || typeof value.adoptedTaskId === 'string');
 }

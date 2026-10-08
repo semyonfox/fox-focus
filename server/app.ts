@@ -1,10 +1,11 @@
+import { enrichInboxSource, expireInboxItems, normalizeInboxSourceContext } from '../src/inbox-time.ts';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { basicAuth } from 'hono/basic-auth';
 import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { HTTPException } from 'hono/http-exception';
-import { areas, isOneOf, isPrototypeData, isRecord } from '../src/model.ts';
+import { areas, isOneOf, isPrototypeData, isReviewRecommendation, isInboxSourceContext, isRecord } from '../src/model.ts';
 import { isHermesCompletionInput, isHermesTaskAnnotationInput } from '../src/hermes-model.ts';
 import { isPushSubscription } from './push.ts';
 import type { Store } from './store.ts';
@@ -108,7 +109,15 @@ export function createApp(
   app.use('/api/*', bodyLimit({ maxSize: 512 * 1024 }));
   app.get('/healthz', (c) => c.json({ ok: true, mode: 'workspace' }));
   app.get('/app', (c) => c.redirect('/', 302));
-  app.get('/api/v1/workspace', (c) => c.json(store.read()));
+  app.get('/api/v1/workspace', (c) => {
+    const snapshot = store.read();
+    const records = store.listProviderRecords(2000);
+    const enriched = snapshot.data.inboxItems.map(item => enrichInboxSource(item, records));
+    const inboxItems = expireInboxItems(enriched, now());
+    if (JSON.stringify(inboxItems) === JSON.stringify(snapshot.data.inboxItems)) return c.json(snapshot);
+    const saved = store.save(snapshot.revision, { ...snapshot.data, inboxItems });
+    return c.json(saved ?? store.read());
+  });
   app.get('/api/v1/push/public-key', (c) => options.pushPublicKey
     ? c.json({ publicKey: options.pushPublicKey })
     : c.json({ error: 'Push notifications are unavailable' }, 503));
@@ -198,13 +207,22 @@ export function createApp(
       !isRecord(body) || typeof body.idempotencyKey !== 'string' || body.idempotencyKey.length < 8 || body.idempotencyKey.length > 200 ||
       typeof body.title !== 'string' || body.title.trim().length === 0 || body.title.length > 500 ||
       typeof body.summary !== 'string' || body.summary.trim().length === 0 || body.summary.length > 2_000 ||
-      (body.area !== undefined && !isOneOf(body.area, areas))
+      (body.area !== undefined && !isOneOf(body.area, areas)) ||
+      (body.lane !== undefined && body.lane !== "review" && body.lane !== "automation") ||
+      (body.recommendation !== undefined && !isReviewRecommendation(body.recommendation)) ||
+      (body.sourceContext !== undefined && !isInboxSourceContext(body.sourceContext)) ||
+      (body.existingHermesTaskId !== undefined && (typeof body.existingHermesTaskId !== 'string' || body.existingHermesTaskId.length === 0 || body.existingHermesTaskId.length > 200))
     ) return c.json({ error: 'Invalid task proposal' }, 400);
     const timestamp = now().toISOString();
+    const sourceContext = isInboxSourceContext(body.sourceContext) ? normalizeInboxSourceContext(body.sourceContext) : undefined;
     const normalizedProposal = {
       title: body.title.trim(),
       summary: body.summary.trim(),
       area: body.area ?? 'Personal',
+      ...(body.lane ? { lane: body.lane } : {}),
+      ...(body.recommendation ? { recommendation: body.recommendation } : {}),
+      ...(sourceContext ? { sourceContext } : {}),
+      ...(body.existingHermesTaskId ? { existingHermesTaskId: body.existingHermesTaskId } : {}),
     };
     const requestHash = createHash('sha256').update(JSON.stringify(normalizedProposal)).digest('base64url');
     const result = store.addAgentProposal(body.idempotencyKey, requestHash, {
@@ -215,6 +233,10 @@ export function createApp(
       actor: 'Hermes',
       status: 'new',
       accent: normalizedProposal.area,
+      ...(body.lane === 'review' || body.lane === 'automation' ? { lane: body.lane } : {}),
+      ...(isReviewRecommendation(body.recommendation) ? { recommendation: body.recommendation } : {}),
+      ...(sourceContext ? { sourceContext } : {}),
+      ...(typeof body.existingHermesTaskId === 'string' ? { existingHermesTaskId: body.existingHermesTaskId } : {}),
     }, timestamp);
     if (result.conflict) return c.json({ error: 'That idempotency key was used for a different proposal' }, 409);
     return c.json({ outcome: result.created ? 'created' : 'already_received', inboxItemId: result.inboxItemId }, result.created ? 201 : 200);
