@@ -48,7 +48,7 @@ export type Rows = WorkRowsSnapshot & {
 
 export const emptyRows: Rows = {
   inbox: [], drafts: [], jobs: [], jobUpdates: [], actions: [], reminders: [], briefings: [],
-  capabilities: { emailSendEnabled: false },
+  capabilities: { emailSendEnabled: false, assistants: [] },
   tasks: [], taskPlans: [], destinations: [], listNames: {}, failedScopes: [],
 };
 

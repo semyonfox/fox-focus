@@ -1,19 +1,53 @@
 import type { EmailSendUiState } from "./inbox-client.ts";
-import type { ActionRow, InboxItemRow, Job } from "./row-model.ts";
+import type { ActionRow, AssistantId, InboxItemRow, Job } from "./row-model.ts";
 
 // shared by the web Inbox and the Android app so both group and label work the same way
 export type WorkThreadGroup = "needs_you" | "working" | "settled" | "noise";
+
+// T3-style sidebar placement: active threads, then the collapsed shelves
+export type WorkThreadShelf = "active" | "snoozed" | "settled" | "noise";
+export type WorkThreadTone = "working" | "input" | "approval" | "done" | "failed" | "quiet";
 
 export type WorkThread = {
   key: string;
   kind: "inbox" | "job";
   title: string;
   source: string;
+  createdAt: string;
   updatedAt: string;
   group: WorkThreadGroup;
+  shelf: WorkThreadShelf;
+  assistant: AssistantId;
+  status: string;
+  tone: WorkThreadTone;
+  // counts toward the Inbox badge: the thread is waiting on the owner
+  attention: boolean;
   item: InboxItemRow | null;
   job: Job | null;
 };
+
+// Hermes mirrors its cron jobs into the Inbox; they are routines, not decisions
+export function isRoutineMirror(item: Pick<InboxItemRow, "source">): boolean {
+  return item.source.kind === "hermes" && item.source.reference.startsWith("cron:");
+}
+
+type JobPresentation = Pick<WorkThread, "shelf" | "status" | "tone" | "attention">;
+
+// snooze is only an overlay: newer agent output after the snooze wakes the thread early
+export function jobPresentation(job: Job, now = Date.now()): JobPresentation {
+  if (job.state === "settled") return { shelf: "settled", status: job.outcome === "dropped" ? "Dropped" : "Settled", tone: "quiet", attention: false };
+  const base: JobPresentation = job.state === "needs_you"
+    ? { shelf: "active", status: "Awaiting input", tone: "input", attention: true }
+    : job.state === "review"
+      ? job.resultKind === "failed"
+        ? { shelf: "active", status: "Failed", tone: "failed", attention: true }
+        : { shelf: "active", status: "Completed", tone: "done", attention: false }
+      : { shelf: "active", status: job.state === "queued" ? "Queued" : "Working", tone: "working", attention: false };
+  if (!job.snoozedUntil) return base;
+  const raisedHand = job.snoozedAt !== null && job.attentionAt !== null && Date.parse(job.attentionAt) > Date.parse(job.snoozedAt);
+  if (Date.parse(job.snoozedUntil) > now && !raisedHand) return { ...base, shelf: "snoozed", attention: false };
+  return { shelf: "active", status: "Woke", tone: base.tone === "working" ? "working" : "input", attention: base.tone !== "working" };
+}
 
 export function inboxSourceLabel(item: InboxItemRow): string {
   if (item.source.kind === "email") return `Email · ${item.source.accountId}`;
@@ -73,11 +107,12 @@ export function latestSendActions(actions: readonly ActionRow[]): Map<string, Ac
 }
 
 export function buildWorkThreads(
-  inbox: readonly InboxItemRow[],
+  allInbox: readonly InboxItemRow[],
   jobs: readonly Job[],
   sendActions: ReadonlyMap<string, ActionRow>,
   now = Date.now(),
 ): WorkThread[] {
+  const inbox = allInbox.filter(item => !isRoutineMirror(item));
   const inboxById = new Map(inbox.map((item) => [item.id, item]));
   const activeJobByInboxId = new Map<string, Job>();
   for (const job of jobs) {
@@ -94,11 +129,29 @@ export function buildWorkThreads(
     const sendProblem = sendAction?.state === "failed" || sendAction?.state === "conflict" || sendAction?.state === "unknown";
     const activeJob = activeJobByInboxId.get(item.id) ?? null;
     const latestItemUpdate = sendAction && sendAction.updatedAt > item.updatedAt ? sendAction.updatedAt : item.updatedAt;
+    const presentation: JobPresentation = sending
+      ? { shelf: "active", status: "Sending", tone: "working", attention: false }
+      : sendProblem
+        ? { shelf: "active", status: sendAction?.state === "unknown" ? "Needs reconciliation" : "Send failed", tone: "failed", attention: true }
+        : activeJob
+          ? jobPresentation(activeJob, now)
+          : item.likelyNoise
+            ? { shelf: "noise", status: "Likely noise", tone: "quiet", attention: false }
+            : item.state === "resolved"
+              ? { shelf: "settled", status: "Settled", tone: "quiet", attention: false }
+              : stillSnoozed
+                ? { shelf: "snoozed", status: "Snoozed", tone: "quiet", attention: false }
+                : item.state === "waiting"
+                  ? { shelf: "active", status: "Woke", tone: "input", attention: true }
+                  : item.currentDraftId
+                    ? { shelf: "active", status: "Draft ready", tone: "approval", attention: true }
+                    : { shelf: "active", status: "New", tone: "input", attention: true };
     return {
       key: `inbox:${item.id}`,
       kind: activeJob ? "job" : "inbox",
       title: activeJob?.title ?? item.title,
-      source: activeJob ? `${inboxSourceLabel(item)} · Hermes` : inboxSourceLabel(item),
+      source: activeJob ? `${inboxSourceLabel(item)} · ${assistantName(activeJob.assistant)}` : inboxSourceLabel(item),
+      createdAt: item.createdAt,
       updatedAt: activeJob && activeJob.updatedAt > latestItemUpdate ? activeJob.updatedAt : latestItemUpdate,
       group: sending
         ? "working"
@@ -113,6 +166,8 @@ export function buildWorkThreads(
                 : stillSnoozed
                   ? "working"
                   : "needs_you",
+      assistant: activeJob?.assistant ?? "hermes",
+      ...presentation,
       item,
       job: activeJob,
     };
@@ -124,17 +179,25 @@ export function buildWorkThreads(
       key: `job:${job.id}`,
       kind: "job",
       title: job.title,
-      source: item ? `${inboxSourceLabel(item)} · Hermes` : "Hermes",
+      source: item ? `${inboxSourceLabel(item)} · ${assistantName(job.assistant)}` : assistantName(job.assistant),
+      createdAt: job.createdAt,
       updatedAt: job.updatedAt,
       group: job.state === "settled"
         ? "settled"
         : job.state === "queued" || job.state === "working"
           ? "working"
           : "needs_you",
+      assistant: job.assistant,
+      ...jobPresentation(job, now),
       item,
       job,
     }];
   });
+  // newest first and stable, like T3: status changes recolour a row instead of moving it
   return [...inboxThreads, ...jobThreads]
-    .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt) || first.key.localeCompare(second.key));
+    .sort((first, second) => second.createdAt.localeCompare(first.createdAt) || first.key.localeCompare(second.key));
+}
+
+export function assistantName(assistant: AssistantId): string {
+  return assistant === "fox" ? "Fox" : "Hermes";
 }

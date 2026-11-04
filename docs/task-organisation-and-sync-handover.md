@@ -67,14 +67,20 @@ Reminders use separate versioned rows. Fox Focus does not copy plans or reminder
 
 ## Inbox
 
-Inbox is one T3 Code-style thread list:
+Inbox is one T3 Code-style thread sidebar:
 
-- Needs you contains new email, `needs_you` jobs, and work ready for review.
-- Working contains queued or active jobs and pending sends.
-- Settled is collapsed.
-- Likely noise is collapsed but never hidden.
+- An assistant filter, a new thread button and a board toggle sit at the top.
+- Active threads are listed newest first in a stable order. Each row shows the assistant, a status (Working, Awaiting input, Completed, Failed, Woke, New, Draft ready), the title, what it is attached to and its engine.
+- Hovering a row swaps its status for Settle and Snooze.
+- Snoozed, Settled and Likely noise are collapsed shelves below the active threads.
+- Hermes cron mirrors (`source.reference` starting `cron:`) are routines, not decisions. They never appear in the Inbox and show under the Hermes assistant's routines instead.
+- The Inbox badge counts threads waiting on the owner. Working and Completed threads do not count.
 
-The detail pane shows the summary, current email draft where relevant, update timeline, and bottom actions. Email actions are Send, Edit draft, Ask Hermes, Make task, Snooze, Done, Not interested, and Noise. Task detail also offers Hand to Hermes.
+Settle means done and dealt with. It is one action with no provider side effect. Snooze only hides a thread. A snoozed thread wakes at its time, or earlier when its assistant asks or finishes after the snooze.
+
+The detail pane shows the summary, current email draft where relevant, update timeline, and bottom actions. Email actions are Send, Edit draft, Ask Hermes, Make task, Snooze, Settle, Not interested, and Noise. Task detail also offers Hand to Hermes.
+
+The Assistants tab shows each assistant with an ongoing conversation, its threads, its routines and what it is allowed to do. Threads started there appear in the Inbox too.
 
 Email items use account plus message ID as their identity. Thread ID is context only. A later message in a resolved thread therefore appears as a new item.
 
@@ -90,7 +96,13 @@ A job has a one-line title, short instruction, optional linked task or Inbox ite
 4. Hermes either asks one question or submits a result.
 5. The owner answers, accepts, drops, or sends it back with one line.
 
-Hermes cannot settle a job. Accepting a result linked to an open task is the owner's completion click and uses the same normal Google action path. Sending work back returns it to `queued`; dropping it settles without changing a task.
+Hermes cannot settle a job. Settling never completes a linked Google task; completion stays on the task's own checkbox. Sending work back, or replying to a settled thread, returns it to `queued`.
+
+## Fox
+
+Fox is an in-process assistant that runs on the Claude API. Its threads are jobs with `assistant: "fox"`, and Fox Focus keeps their full transcript in `job_messages`. Fox can read open tasks, the next seven days of calendar and open Inbox items, ask the owner one multiple-choice question at a time, and settle a thread when the owner says it is done. It has no tool that writes to Google, Gmail, calendars or Hermes.
+
+A question suspends the thread with no process running. The owner's answer is stored as the tool result, and the worker continues from the stored transcript, including after a restart. Every worker write is fenced on its claim, so a run that lost its lease cannot overwrite a newer one. A spend cap over the last 24 hours, a per-run step limit and refusals all end the run as a Failed thread that a reply can retry.
 
 ## Email approval
 

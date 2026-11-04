@@ -82,7 +82,7 @@ Do not send raw MIME, credentials, or unrelated message bodies in this request.
 
 ## Jobs
 
-The owner creates a job, optionally linked to a task or Inbox item. Fox Focus allows one unsettled job per linked task or Inbox item. Its states are:
+The owner creates a job, optionally linked to a task or Inbox item. Fox Focus allows one unsettled job per linked task or Inbox item. Only jobs assigned to Hermes appear in `/context` and can be claimed. Jobs for the in-process Fox assistant are invisible to the bearer token and return `404` from the claim route. Its states are:
 
 ```text
 queued -> working -> needs_you -> working -> review
@@ -121,7 +121,7 @@ Post updates with the returned claim in `X-Claim-Id`:
 
 `kind` is `progress`, `question`, or `result`. Text is one plain-text line of at most 280 characters. URL is `null` or a safe HTTPS URL. A new progress update keeps the job working and renews the ten-minute lease. A question moves it to `needs_you` and releases the claim. A result moves it to `review` and releases the claim.
 
-The owner answers a question in one line, accepts, drops, or sends the job back with one line. Hermes cannot call those owner routes. Accepting a job linked to a task is also the owner's completion click; Fox Focus queues the normal ETag-guarded Google action.
+The owner answers a question in one line, settles, drops, or sends the job back with one line. Hermes cannot call those owner routes. Settling never completes a linked Google task. A retried owner answer with the same text replays instead of conflicting.
 
 Hermes may post several distinct progress bodies while the claim is active. Replaying the exact body under the same claim returns the same update without extending the lease.
 

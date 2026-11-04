@@ -1,6 +1,6 @@
 import { emailSendUiState, type EmailSendUiState } from "@shared/inbox-client";
 import type { ActionRow, DraftRevision, InboxItemRow, Job, JobUpdate, TaskPlanRow, TaskRow } from "@shared/row-model";
-import { buildWorkThreads, inboxStateLabel, jobStateLabel, latestSendActions, type WorkThread } from "@shared/work-threads";
+import { assistantName, buildWorkThreads, inboxStateLabel, jobPresentation, jobStateLabel, latestSendActions, type WorkThread } from "@shared/work-threads";
 import type { Rows } from "./api";
 import { addDays, dayLabel, dublinDateKey, whenLabel } from "./dates";
 
@@ -120,10 +120,12 @@ export function threads(rows: Rows, now = Date.now()): WorkThread[] {
 
 export const needsCount = (rows: Rows) => threads(rows).filter(thread => thread.group === "needs_you").length;
 
-export function jobThread(job: Job): WorkThread {
+export function jobThread(job: Job, now = Date.now()): WorkThread {
   return {
-    key: `job:${job.id}`, kind: "job", title: job.title, source: "Hermes", updatedAt: job.updatedAt,
+    key: `job:${job.id}`, kind: "job", title: job.title, source: assistantName(job.assistant),
+    createdAt: job.createdAt, updatedAt: job.updatedAt,
     group: job.state === "settled" ? "settled" : job.state === "queued" || job.state === "working" ? "working" : "needs_you",
+    assistant: job.assistant, ...jobPresentation(job, now),
     item: null, job,
   };
 }

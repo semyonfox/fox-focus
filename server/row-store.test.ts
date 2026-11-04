@@ -1019,7 +1019,7 @@ test('an expired job lease rejects the old claim and can be reclaimed', () => {
   } finally { store.close(); }
 });
 
-test('accepting a linked job atomically queues its normal Google completion action', () => {
+test('settling linked work is a single action that never queues a provider write', () => {
   const data = workspaceFixture();
   data.tasks[0].externalLinks = [{
     provider: 'google_tasks', connectionId: 'google-generation', containerId: 'uni-list', containerName: 'Study',
@@ -1055,107 +1055,15 @@ test('accepting a linked job atomically queues its normal Google completion acti
     }, '2026-09-14T10:00:03.000Z', 120_000);
     assert.equal(review.outcome, 'updated');
     if (review.outcome !== 'updated') return;
+    assert.equal(review.job.resultKind, 'complete');
+    assert.equal(review.job.attentionAt, '2026-09-14T10:00:03.000Z');
 
-    const missingVersion = store.settleJob(created.job.id, review.job.version, 'accepted', '2026-09-14T10:00:04.000Z');
-    assert.equal(missingVersion.outcome, 'task_version_required');
-    assert.equal(store.getJob(created.job.id)?.state, 'review');
+    const settled = store.settleJob(created.job.id, review.job.version, 'accepted', '2026-09-14T10:00:04.000Z');
+    assert.equal(settled.outcome, 'settled');
+    assert.equal(store.getJob(created.job.id)?.state, 'settled');
     assert.equal(store.listActions().length, 0);
-    const stale = store.settleJob(created.job.id, review.job.version, 'accepted', '2026-09-14T10:00:05.000Z', task.version - 1);
-    assert.equal(stale.outcome, 'task_conflict');
-    assert.equal(store.listActions().length, 0);
-
-    const accepted = store.settleJob(created.job.id, review.job.version, 'accepted', '2026-09-14T10:00:06.000Z', task.version);
-    assert.equal(accepted.outcome, 'settled');
-    if (accepted.outcome !== 'settled') return;
-    assert.equal(accepted.job.outcome, 'accepted');
-    assert.equal(accepted.action?.payload.kind, 'task-status');
-    assert.equal(accepted.action?.state, 'queued');
-    assert.equal(store.getTask(task.id)?.intentVersion, task.intentVersion + 1);
+    assert.equal(store.getTask(task.id)?.intentVersion, task.intentVersion);
   } finally { store.close(); }
-});
-
-test('accepting linked work replaces queued and failed reopens but waits for any running status action', () => {
-  const cases = [
-    { label: 'queued reopen', priorState: 'queued', sourceStatus: 'completed', desiredState: 'open' },
-    { label: 'failed reopen', priorState: 'failed', sourceStatus: 'completed', desiredState: 'open' },
-    { label: 'running reopen', priorState: 'running', sourceStatus: 'completed', desiredState: 'open' },
-    { label: 'running completion', priorState: 'running', sourceStatus: 'needsAction', desiredState: 'completed' },
-  ] as const;
-  for (const { label, priorState, sourceStatus, desiredState } of cases) {
-    const data = workspaceFixture();
-    data.tasks[0].externalLinks = [{
-      provider: 'google_tasks', connectionId: 'google-generation', containerId: 'uni-list', containerName: 'Study',
-      externalId: `google-task-${label}`, policy: 'completion_only', sourceStatus, sourceVersion: 'etag-old',
-      linkedAt: '2026-09-01T08:00:00.000Z',
-    }];
-    const store = openStore(':memory:', data);
-    try {
-      store.publishProviderScope({
-        provider: 'google', resourceKind: 'task-list', accountId: 'google-generation', connectionGeneration: 'google-generation',
-        containerId: 'uni-list', containerName: 'Study', coverageFrom: null, coverageTo: null,
-        fetchedAt: '2026-09-14T10:00:00.000Z',
-        records: [{
-          provider: 'google', kind: 'task', connectionId: 'google-generation', containerId: 'uni-list', containerName: 'Study',
-          externalId: `google-task-${label}`, title: 'Plan autumn term', status: sourceStatus, startsAt: null, endsAt: null,
-          startsOn: null, endsOn: null, allDay: false, dueOn: null,
-          completedAt: sourceStatus === 'completed' ? '2026-09-14T09:00:00.000Z' : null,
-          sourceUpdatedAt: '2026-09-14T09:00:00.000Z', sourceVersion: 'etag-current', completionWritable: true,
-          notes: null, parentId: null, position: null, sourceUrl: null, sourceTimeZone: null,
-        }],
-      });
-      const task = store.getTask('legacy-open');
-      assert.ok(task);
-      assert.equal(task.observed?.status, sourceStatus === 'completed' ? 'completed' : 'open');
-      const priorAction = store.queueTaskStatusAction(task.id, task.version, desiredState, '2026-09-14T10:00:01.000Z');
-      assert.equal(priorAction.outcome, 'queued');
-      if (priorAction.outcome !== 'queued') continue;
-
-      if (priorState !== 'queued') {
-        const claimed = store.claimNextTaskStatusAction('2026-09-14T10:00:02.000Z', 120_000);
-        assert.equal(claimed?.id, priorAction.action.id);
-        assert.ok(claimed?.claimId);
-        if (priorState === 'failed') {
-          const failed = store.settleTaskStatusAction(priorAction.action.id, claimed.claimId, {
-            outcome: 'failed', notice: 'Temporary provider failure.', retryable: true,
-          }, '2026-09-14T10:00:03.000Z');
-          assert.equal(failed?.state, 'failed');
-        }
-      }
-
-      const created = store.createJob({
-        title: 'Finish the plan', instruction: 'Prepare the final plan.', taskId: task.id, inboxId: null,
-      }, '2026-09-14T10:00:04.000Z');
-      assert.equal(created.outcome, 'created');
-      if (created.outcome !== 'created') continue;
-      const claim = store.claimJob(created.job.id, '2026-09-14T10:00:05.000Z', 120_000);
-      assert.equal(claim.outcome, 'claimed');
-      if (claim.outcome !== 'claimed') continue;
-      const review = store.postJobResult(created.job.id, claim.claimId, {
-        kind: 'result', text: 'The plan is ready.', url: null,
-      }, '2026-09-14T10:00:06.000Z', 120_000);
-      assert.equal(review.outcome, 'updated');
-      if (review.outcome !== 'updated') continue;
-
-      const currentTask = store.getTask(task.id);
-      assert.ok(currentTask);
-      const accepted = store.settleJob(
-        created.job.id, review.job.version, 'accepted', '2026-09-14T10:00:07.000Z', currentTask.version,
-      );
-      if (priorState === 'running') {
-        assert.equal(accepted.outcome, 'task_conflict');
-        assert.equal(store.getJob(created.job.id)?.state, 'review');
-        assert.equal(store.getAction(priorAction.action.id)?.state, 'running');
-        assert.equal(store.listActions().length, 1);
-        continue;
-      }
-      assert.equal(accepted.outcome, 'settled', label);
-      if (accepted.outcome !== 'settled') continue;
-      assert.equal(accepted.action?.payload.kind, 'task-status');
-      if (accepted.action?.payload.kind === 'task-status') assert.equal(accepted.action.payload.after, 'completed');
-      assert.equal(store.getAction(priorAction.action.id)?.state, 'superseded');
-      assert.equal(store.getTask(task.id)?.intentVersion, currentTask.intentVersion + 1);
-    } finally { store.close(); }
-  }
 });
 
 test('active work cannot be dropped, and accepting an already-completed task queues no action', () => {
@@ -1188,7 +1096,7 @@ test('active work cannot be dropped, and accepting an already-completed task que
     if (review.outcome !== 'updated') return;
     const accepted = store.settleJob(created.job.id, review.job.version, 'accepted', '2026-09-14T10:00:05.000Z');
     assert.equal(accepted.outcome, 'settled');
-    if (accepted.outcome === 'settled') assert.equal(accepted.action, null);
+    assert.equal(store.listActions().length, 0);
   } finally { store.close(); }
 });
 

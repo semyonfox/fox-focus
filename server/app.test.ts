@@ -590,6 +590,10 @@ test('email sending is default-off and Hermes settles only the owner-approved en
     assert.equal(disabledRows.status, 200);
     assert.deepEqual((await disabledRows.json() as { capabilities: unknown }).capabilities, {
       emailSendEnabled: false,
+      assistants: [
+        { id: 'fox', name: 'Fox', role: 'Quick helper', engine: 'claude', available: false },
+        { id: 'hermes', name: 'Hermes', role: 'Your Hermes agents', engine: 'hermes', available: true },
+      ],
     });
     const disabledApproval = await disabled.request('/api/v1/inbox-items/missing/send', {
       method: 'POST',
@@ -606,6 +610,10 @@ test('email sending is default-off and Hermes settles only the owner-approved en
     const rows = await app.request('/api/v1/rows', { headers: { authorization } });
     assert.deepEqual((await rows.json() as { capabilities: unknown }).capabilities, {
       emailSendEnabled: true,
+      assistants: [
+        { id: 'fox', name: 'Fox', role: 'Quick helper', engine: 'claude', available: false },
+        { id: 'hermes', name: 'Hermes', role: 'Your Hermes agents', engine: 'hermes', available: true },
+      ],
     });
     const proposal = {
       expectedVersion: null,
@@ -1442,4 +1450,53 @@ test('task migration preview is read-only, rejects stale approval, and replays o
   } finally {
     store.close();
   }
+});
+
+test('Fox threads are owner-only: unavailable without a worker, kicked on change, and hidden from the Hermes bearer', async () => {
+  const store = openStore(':memory:');
+  const token = 'fox-thread-route-token-at-least-24-characters';
+  const owner = { authorization, 'Content-Type': 'application/json' };
+  try {
+    const withoutWorker = createApp(store, password, undefined, undefined, { now: () => new Date('2026-11-04T10:00:00.000Z') });
+    const refused = await withoutWorker.request('/api/v1/jobs', {
+      method: 'POST', headers: owner,
+      body: JSON.stringify({ idempotencyKey: 'fox-1', title: 'Book NCT', instruction: 'Book my NCT', assistant: 'fox' }),
+    });
+    assert.equal(refused.status, 503);
+
+    let kicks = 0;
+    const app = createApp(store, password, undefined, undefined, {
+      taskStatusToken: token,
+      now: () => new Date('2026-11-04T10:00:00.000Z'),
+      agentWorker: { kick: () => { kicks += 1; } },
+    });
+    const created = await app.request('/api/v1/jobs', {
+      method: 'POST', headers: owner,
+      body: JSON.stringify({ idempotencyKey: 'fox-1', title: 'Book NCT', instruction: 'Book my NCT', assistant: 'fox' }),
+    });
+    assert.equal(created.status, 201);
+    const { job } = await created.json() as { job: { id: string; version: number; assistant: string } };
+    assert.equal(job.assistant, 'fox');
+    assert.equal(kicks, 1);
+
+    const thread = await app.request(`/api/v1/jobs/${job.id}/thread`, { headers: { authorization } });
+    assert.equal(thread.status, 200);
+    const body = await thread.json() as { entries: Array<{ role: string; kind: string; text: string }> };
+    assert.deepEqual(body.entries.map(entry => [entry.role, entry.kind, entry.text]), [['owner', 'message', 'Book my NCT']]);
+
+    const bearerThread = await app.request(`/api/v1/jobs/${job.id}/thread`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(bearerThread.status, 401);
+    const context = await app.request('/api/v1/context?from=2026-11-01&to=2026-11-30', { headers: { authorization: `Bearer ${token}` } });
+    assert.deepEqual((await context.json() as { jobs: unknown[] }).jobs, []);
+    const claim = await app.request(`/api/v1/requests/${job.id}/claim`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'X-Request-Kind': 'job' },
+    });
+    assert.equal(claim.status, 404);
+
+    const snoozed = await app.request(`/api/v1/jobs/${job.id}/snooze`, {
+      method: 'POST', headers: owner, body: JSON.stringify({ version: job.version, snoozedUntil: '2026-11-05T09:00:00.000Z' }),
+    });
+    assert.equal(snoozed.status, 200);
+    assert.equal((await snoozed.json() as { job: { snoozedUntil: string } }).job.snoozedUntil, '2026-11-05T09:00:00.000Z');
+  } finally { store.close(); }
 });

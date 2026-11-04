@@ -22,9 +22,9 @@ export default function JobScreen() {
   const task = job.taskId ? rows.tasks.find(candidate => candidate.id === job.taskId) ?? null : null;
   const item = job.inboxId ? rows.inbox.find(candidate => candidate.id === job.inboxId) ?? null : null;
 
-  // accepting a job linked to a task ticks that task, so the server wants the task version the owner saw
+  // settling is done and dealt with; it never ticks the linked task
   const settle = (outcome: JobOutcome) => {
-    void run(() => settleJob(job, outcome, task?.version), outcome === "accepted" ? "Accepted" : "Dropped")
+    void run(() => settleJob(job, outcome), outcome === "accepted" ? "Settled" : "Dropped")
       .then(ok => { if (ok) router.back(); });
   };
 
@@ -113,7 +113,7 @@ export default function JobScreen() {
           </Panel>
         ) : (
           <Actions>
-            <Button label={task ? "Accept and tick task" : "Accept"} tone="primary" onPress={() => settle("accepted")} />
+            <Button label="Settle" tone="primary" onPress={() => settle("accepted")} />
             <Button label="Send back" onPress={() => setSendingBack(true)} />
             <Button label="Drop" tone="quiet" onPress={() => settle("dropped")} />
           </Actions>
