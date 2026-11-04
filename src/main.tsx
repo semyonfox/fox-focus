@@ -3364,7 +3364,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     const threadJob = selectedWorkThread?.job && !selectedWorkThread.item ? selectedWorkThread.job : null;
 
     return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
-      <h1 id="review-heading" className="sr-only">Inbox</h1>
+      <header className="workspace-heading"><div><p className="eyebrow">Threads</p><h1 id="review-heading">Inbox</h1><p>{reviewCount ? `${reviewCount} need${reviewCount === 1 ? "s" : ""} you` : "You're caught up"}</p></div><button className="page-primary-action" type="button" onClick={() => openJobComposer({ title: "" })}><Plus size={13} /> New thread</button></header>
       <article className="pane review-workspace work-inbox thread-inbox">
         {workRowsError ? <p className="task-sync-note task-sync-note--warning" role="alert"><RefreshCw size={13} /> {workRows ? "Inbox could not refresh. Showing the last loaded state." : "Inbox could not load."} <button type="button" className="mini-action" onClick={() => setRowsRetry(value => value + 1)}>Retry</button></p> : null}
         <div className={`review-workbench thread-workbench${workDetailOpen ? " review-workbench--detail" : ""}${inboxBoard ? " thread-workbench--board" : ""}`}>
@@ -3441,7 +3441,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   function renderAssistantsView() {
     if (!initial || !workRows) {
       return <section className="workspace-page assistants-page" aria-labelledby="assistants-heading">
-        <h1 id="assistants-heading">Assistants</h1>
+        <header className="workspace-heading"><div><p className="eyebrow">Your team</p><h1 id="assistants-heading">Assistants</h1></div></header>
         <p className="empty-line">{initial ? workRowsError ? "Assistants could not load." : "Loading assistants…" : "Assistants need the Fox Focus server."}</p>
       </section>;
     }

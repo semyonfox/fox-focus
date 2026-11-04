@@ -71,7 +71,8 @@ export function AssistantsPage(props: AssistantsPageProps) {
   }
 
   return <section className="workspace-page assistants-page" aria-labelledby="assistants-heading">
-    <h1 id="assistants-heading" className="sr-only">Assistants</h1>
+    <header className="workspace-heading"><div><p className="eyebrow">Your team</p><h1 id="assistants-heading">Assistants</h1>
+      <p>{props.assistants.filter(candidate => candidate.available).map(candidate => candidate.name).join(" and ") || "None configured"} ready</p></div></header>
     <div className="assistants-layout pane">
       <aside className="assistants-roster" aria-label="Assistants">
         {props.assistants.map(candidate => {
