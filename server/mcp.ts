@@ -119,8 +119,15 @@ export function createMcpHandler(store: McpStore, options: McpOptions) {
 
   function findThread(key: string): WorkThread {
     const thread = threads().find(candidate => candidate.key === key);
-    if (!thread) throw new ToolError(`No thread with key ${key}. Use list_threads.`);
-    return thread;
+    if (thread) return thread;
+    // a settled email-linked request is folded into its email thread in the list; keep its own key usable
+    const job = key.startsWith('job:') ? store.getJob(key.slice('job:'.length)) : null;
+    if (job) return buildWorkThreads([], [job], new Map(), options.now().getTime())[0] ?? missing(key);
+    return missing(key);
+  }
+
+  function missing(key: string): never {
+    throw new ToolError(`No thread with key ${key}. Use list_threads.`);
   }
 
   function tasks(filter: string) {
@@ -131,7 +138,8 @@ export function createMcpHandler(store: McpStore, options: McpOptions) {
       const open = entry.task.observed?.status !== 'completed' && entry.task.unavailableAt === null;
       if (filter === 'all') return true;
       if (!open) return false;
-      const dates = [entry.task.observed?.doOn, entry.plan.deadlineOn, entry.plan.plannedOn].filter((value): value is string => typeof value === 'string');
+      const plannedDay = entry.plan.plannedAt ? dublinDateKey(new Date(entry.plan.plannedAt)) : null;
+      const dates = [entry.task.observed?.doOn, entry.plan.deadlineOn, entry.plan.plannedOn, plannedDay].filter((value): value is string => typeof value === 'string');
       if (filter === 'today') return dates.some(date => date <= today);
       if (filter === 'overdue') return dates.some(date => date < today);
       return true;
@@ -147,8 +155,13 @@ export function createMcpHandler(store: McpStore, options: McpOptions) {
     }));
   }
 
-  function jobFor(thread: WorkThread): Job | null {
-    return thread.job ? store.getJob(thread.job.id) : null;
+  function jobFor(thread: WorkThread, includeSettled = false): Job | null {
+    if (thread.job) return store.getJob(thread.job.id);
+    const item = thread.item;
+    if (!item || !includeSettled) return null;
+    // the latest request about this email, even once settled, so it can be read and reopened
+    return store.listJobs().filter(job => job.inboxId === item.id && !job.taskId)
+      .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt))[0] ?? null;
   }
 
   function callTool(name: string, args: Record<string, unknown>): unknown {
@@ -173,7 +186,7 @@ export function createMcpHandler(store: McpStore, options: McpOptions) {
       }
       case 'read_thread': {
         const thread = findThread(argString(args, 'key', 300));
-        const job = jobFor(thread);
+        const job = jobFor(thread, true);
         const item = thread.item;
         const draft = item?.currentDraftId ? store.listDrafts().find(candidate => candidate.id === item.currentDraftId) ?? null : null;
         return {
@@ -200,7 +213,7 @@ export function createMcpHandler(store: McpStore, options: McpOptions) {
       case 'reply': {
         const thread = findThread(argString(args, 'key', 300));
         const text = argString(args, 'text');
-        const job = jobFor(thread);
+        const job = jobFor(thread, true);
         if (!job) throw new ToolError('Email items have no conversation. Use settle, dismiss or snooze.');
         const result = job.state === 'needs_you'
           ? store.answerJob(job.id, job.version, text, at)

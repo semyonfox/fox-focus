@@ -1,16 +1,18 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { createApp } from './app.ts';
 import { canonicalHash } from './row-store.ts';
 import { openStore } from './store.ts';
+import type { PrototypeData } from '../src/model.ts';
 
 const password = 'test-only-password-at-least-24-characters';
 const token = 'mcp-test-token-at-least-24-characters-long';
 const hermesToken = 'hermes-test-token-at-least-24-characters';
 const at = '2026-11-04T10:00:00.000Z';
 
-function setup(options: { fox?: boolean } = {}) {
-  const store = openStore(':memory:');
+function setup(options: { fox?: boolean; data?: PrototypeData } = {}) {
+  const store = options.data ? openStore(':memory:', options.data) : openStore(':memory:');
   let kicks = 0;
   const app = createApp(store, password, undefined, undefined, {
     now: () => new Date(at),
@@ -140,5 +142,53 @@ test('start_thread falls back to Hermes when Fox is not configured', async () =>
     const started = await call('start_thread', { request: 'Check the gala entries' });
     assert.equal(started.structuredContent?.assistant, 'hermes');
     assert.equal((await call('start_thread', { request: 'Hi', assistant: 'fox' })).isError, true);
+  } finally { store.close(); }
+});
+
+test('a settled email-linked request stays readable and can be reopened through MCP', async () => {
+  const { call, store } = setup();
+  try {
+    const email = {
+      expectedVersion: null,
+      source: { kind: 'email' as const, accountId: 'personal', messageId: 'msg-2', threadId: 'thread-2' },
+      title: 'Sponsorship reply', summary: 'Aoife asked about Silver.', likelyNoise: false,
+    };
+    const upsert = store.upsertHermesInbox('email:personal:msg-2', canonicalHash(email), email, at);
+    assert.ok(upsert.item);
+    const created = store.createJob({ title: 'Draft the reply', instruction: 'Draft a yes.', taskId: null, inboxId: upsert.item.id }, at);
+    assert.equal(created.outcome, 'created');
+    if (created.outcome !== 'created') return;
+    const claim = store.claimJob(created.job.id, at, 60_000);
+    assert.equal(claim.outcome, 'claimed');
+    if (claim.outcome !== 'claimed') return;
+    const done = store.postJobResult(created.job.id, claim.claimId, { kind: 'result', text: 'Draft ready.', url: null }, at, 60_000);
+    assert.equal(done.outcome, 'updated');
+    if (done.outcome !== 'updated') return;
+    store.settleJob(created.job.id, done.job.version, 'accepted', at);
+
+    const emailKey = `inbox:${upsert.item.id}`;
+    const read = await call('read_thread', { key: emailKey });
+    assert.deepEqual((read.structuredContent?.messages as Array<{ text: string }>).map(message => message.text), ['Draft a yes.', 'Draft ready.']);
+    assert.equal((await call('read_thread', { key: `job:${created.job.id}` })).isError, undefined);
+    const reopened = await call('reply', { key: emailKey, text: 'Make it shorter' });
+    assert.equal(reopened.structuredContent?.state, 'queued');
+  } finally { store.close(); }
+});
+
+test('tasks planned at a time count as today and overdue', async () => {
+  const data = JSON.parse(readFileSync(new URL('./fixtures/workspace-v7.json', import.meta.url), 'utf8')) as PrototypeData;
+  const { call, store } = setup({ data });
+  try {
+    const task = store.listTasks().find(candidate => candidate.observed?.status === 'open');
+    assert.ok(task);
+    const plan = store.getTaskPlan(task.id);
+    assert.ok(plan);
+    const timed = store.updateTaskPlan(task.id, plan.version, {
+      priority: plan.priority, waiting: false, deadlineOn: null, plannedOn: null,
+      plannedAt: '2026-11-04T15:00:00.000Z', estimateMinutes: null,
+    }, at);
+    assert.ok(timed);
+    const today = await call('list_tasks', { filter: 'today' });
+    assert.ok((today.structuredContent?.tasks as Array<{ planned_at: string | null }>).some(entry => entry.planned_at === '2026-11-04T15:00:00.000Z'));
   } finally { store.close(); }
 });
