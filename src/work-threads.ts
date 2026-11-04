@@ -1,5 +1,5 @@
 import type { EmailSendUiState } from "./inbox-client.ts";
-import type { ActionRow, AssistantId, InboxItemRow, Job } from "./row-model.ts";
+import type { ActionRow, AssistantId, InboxItemRow, Job, JobUpdate, ThreadEntry } from "./row-model.ts";
 
 // shared by the web Inbox and the Android app so both group and label work the same way
 export type WorkThreadGroup = "needs_you" | "working" | "settled" | "noise";
@@ -200,4 +200,22 @@ export function buildWorkThreads(
 
 export function assistantName(assistant: AssistantId): string {
   return assistant === "fox" ? "Fox" : "Hermes";
+}
+
+// Hermes threads keep their one-line update timeline; show it in the same conversation shape
+export function hermesThreadEntries(job: Job, updates: JobUpdate[]): ThreadEntry[] {
+  const entries: ThreadEntry[] = [{ seq: 0, role: "owner", kind: "message", text: job.instruction, options: [], url: null, at: job.createdAt }];
+  for (const update of updates) {
+    if (update.kind === "settled") continue;
+    entries.push({
+      seq: update.seq,
+      role: update.author === "owner" ? "owner" : "assistant",
+      kind: update.kind === "progress" ? "activity" : update.kind === "question" ? "question" : update.kind === "answer" ? "answer" : "message",
+      text: update.text,
+      options: [],
+      url: update.url,
+      at: update.at,
+    });
+  }
+  return entries;
 }

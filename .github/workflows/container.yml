@@ -39,6 +39,7 @@ jobs:
               "hermes.ts",
               "index.ts",
               "integrations.ts",
+              "mcp.ts",
               "oauth.ts",
               "providers.ts",
               "push.ts",

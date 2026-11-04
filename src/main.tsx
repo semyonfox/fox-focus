@@ -92,11 +92,12 @@ import {
 } from "./row-client.ts";
 import type { ActionRow, AssistantId, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow, ThreadEntry } from "./row-model.ts";
 import { ThreadBoard, ThreadSidebar, type AssistantFilter } from "./thread-sidebar.tsx";
-import { ThreadView, hermesThreadEntries } from "./thread-view.tsx";
+import { ThreadView } from "./thread-view.tsx";
 import { AssistantsPage } from "./assistants-page.tsx";
 import {
   buildWorkThreads,
   inboxSourceLabel,
+  hermesThreadEntries,
   inboxStateLabel,
   isRoutineMirror,
   jobStateLabel,

@@ -23,6 +23,8 @@ services:
       ANTHROPIC_API_KEY_FILE: ${ANTHROPIC_API_KEY_FILE_HOST:+/run/secrets/fox-focus/anthropic-api-key}
       FOX_AGENT_DAILY_BUDGET_USD: ${FOX_AGENT_DAILY_BUDGET_USD:-5}
       FOX_AGENT_CONCURRENCY: ${FOX_AGENT_CONCURRENCY:-3}
+      # Setting the host file turns on the /mcp endpoint for Claude Code and other MCP clients.
+      MCP_TOKEN_FILE: ${MCP_TOKEN_FILE_HOST:+/run/secrets/fox-focus/mcp-token}
       # OAuth configuration is read from individual read-only files. Keep the
       # host files outside this repository and never mount a whole credential
       # directory such as Hermes's provider state.
@@ -43,6 +45,7 @@ services:
       - ${HERMES_ACTION_TOKEN_FILE_HOST:-./empty-oauth/token-key.placeholder}:/run/secrets/fox-focus/hermes-action-token:ro
       - ${HERMES_STATUS_TOKEN_FILE_HOST:-./empty-oauth/hermes-status-token.placeholder}:/run/secrets/fox-focus/hermes-status-token:ro
       - ${ANTHROPIC_API_KEY_FILE_HOST:-./empty-oauth/hermes-status-token.placeholder}:/run/secrets/fox-focus/anthropic-api-key:ro
+      - ${MCP_TOKEN_FILE_HOST:-./empty-oauth/hermes-status-token.placeholder}:/run/secrets/fox-focus/mcp-token:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

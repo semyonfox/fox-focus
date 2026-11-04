@@ -48,7 +48,7 @@ Keep the Hermes credential separate from the browser password. Set `HERMES_STATU
 
 The owner can use Basic authentication on every private route. The compatibility routes `/api/v1/task-status` and `/api/v1/task-proposals` are Basic-only. Supply the bearer token to Hermes through its own secret configuration; this repository configures only the Fox Focus side.
 
-For the supplied Compose file, set `HERMES_STATUS_TOKEN_FILE_HOST` to the absolute host path. Compose mounts it read-only and sets the internal `HERMES_STATUS_TOKEN_FILE` path. For a direct container deployment, mount that one file read-only and set `HERMES_STATUS_TOKEN_FILE` to its container path. Do not pass the token value in the environment. Fox Focus publishes no API catalog, OpenAPI document, MCP endpoint, or `llms.txt`.
+For the supplied Compose file, set `HERMES_STATUS_TOKEN_FILE_HOST` to the absolute host path. Compose mounts it read-only and sets the internal `HERMES_STATUS_TOKEN_FILE` path. For a direct container deployment, mount that one file read-only and set `HERMES_STATUS_TOKEN_FILE` to its container path. Do not pass the token value in the environment. Fox Focus publishes no API catalog, OpenAPI document or `llms.txt`. The optional `/mcp` endpoint below is owner-only and off by default.
 
 `EMAIL_SEND_ENABLED` defaults to `false` in Compose and the server. Set it to `true` only after verifying the Hermes hash, MIME, receipt, and reconciliation contract. Startup fails closed if sending is enabled without `HERMES_STATUS_TOKEN_FILE`. A timed-out send becomes `unknown`; disabling new sends does not disable reconciliation claims. See [Hermes integration contract](hermes-task-sync-request.md).
 
@@ -63,6 +63,22 @@ FOX_AGENT_CONCURRENCY=3
 ```
 
 Compose mounts the file read-only at `/run/secrets/fox-focus/anthropic-api-key` and sets `ANTHROPIC_API_KEY_FILE`. Do not pass the key value in the environment. The budget caps estimated spend over the last 24 hours. Requests already running when the cap is reached still finish, so it can go over by up to one request per running thread. Concurrency is how many threads run at once. Fox can read tasks, calendar and Inbox context and ask questions. It cannot write to any provider.
+
+## MCP endpoint
+
+`/mcp` lets Claude Code, T3 or Codex work with Fox Focus directly. It is a stateless Streamable HTTP MCP server with JSON responses and no SSE stream. It stays off until you mount a token file:
+
+```dotenv
+MCP_TOKEN_FILE_HOST=/absolute/private/mcp-token
+```
+
+The token needs at least 24 characters and must differ from the Hermes token. Clients send it as `Authorization: Bearer <token>`. It works only on `/mcp`, never on `/api/*`, and requests from another site's page are refused. The tools read today, tasks and Inbox threads, and can start, answer, settle, snooze or dismiss threads. None of them writes to Google, Gmail or calendars.
+
+To add it to Claude Code:
+
+```bash
+claude mcp add --transport http fox-focus https://focus.example/mcp --header "Authorization: Bearer $(cat /absolute/private/mcp-token)"
+```
 
 ## Hermes migration boundary
 

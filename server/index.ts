@@ -98,12 +98,20 @@ if (anthropicKeyPath) {
     maxConcurrent: concurrency,
   });
 }
+// the /mcp endpoint for Claude Code and other MCP clients; off unless a token file is mounted
+const mcpTokenPath = process.env.MCP_TOKEN_FILE;
+let mcpToken: string | undefined;
+if (mcpTokenPath) {
+  mcpToken = readFileSync(mcpTokenPath, 'utf8').trim();
+  if (!mcpToken) throw new Error('MCP token file is empty');
+}
 const app = createApp(store, password, hermes, integrations, {
   pushPublicKey: vapid.publicKey,
   taskStatusToken,
   emailSendEnabled,
   actionWorker,
   agentWorker,
+  mcpToken,
 });
 actionWorker.start();
 agentWorker?.start();

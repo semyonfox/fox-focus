@@ -35,6 +35,7 @@ import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
 import { canonicalHash } from './row-store.ts';
 import { threadEntries } from './agent-worker.ts';
+import { createMcpHandler } from './mcp.ts';
 import {
   buildTaskMigrationPreview,
   migrationIdForIdempotencyKey,
@@ -78,6 +79,8 @@ export type AppOptions = {
   actionWorker?: { kick: () => void };
   // the in-process Claude worker for Fox threads; absent when no API key is configured
   agentWorker?: { kick: () => void };
+  // owner-scoped bearer token for the /mcp endpoint; the endpoint is off without it
+  mcpToken?: string;
 };
 
 function tokenMatches(value: string, expected: string): boolean {
@@ -113,6 +116,12 @@ export function createApp(
   if (options.taskStatusToken !== undefined && options.taskStatusToken.length < 24) {
     throw new Error('Hermes API token must have at least 24 characters');
   }
+  if (options.mcpToken !== undefined && options.mcpToken.length < 24) {
+    throw new Error('MCP token must have at least 24 characters');
+  }
+  if (options.mcpToken !== undefined && options.mcpToken === options.taskStatusToken) {
+    throw new Error('The MCP token must differ from the Hermes API token');
+  }
   const now = options.now ?? (() => new Date());
   const emailSendEnabled = options.emailSendEnabled === true;
   const app = new Hono();
@@ -123,6 +132,37 @@ export function createApp(
   app.use('/app/*', auth);
   app.use('/sw.js', auth);
   app.use('/manifest.webmanifest', auth);
+  const mcpToken = options.mcpToken;
+  if (mcpToken) {
+    const mcp = createMcpHandler(store, {
+      now,
+      foxAvailable: options.agentWorker !== undefined,
+      kickFox: () => options.agentWorker?.kick(),
+    });
+    app.use('/mcp', bodyLimit({ maxSize: 256 * 1024 }));
+    app.all('/mcp', async (c) => {
+      const authorization = c.req.header('Authorization') ?? '';
+      const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
+      if (!tokenMatches(bearer, mcpToken)) return c.json({ error: 'Unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
+      // MCP clients send no Origin; a browser page on another site must not reach this endpoint
+      const origin = c.req.header('Origin');
+      if (origin) {
+        try {
+          if (new URL(origin).host !== c.req.header('Host')) return c.json({ error: 'Cross-origin requests are not allowed' }, 403);
+        } catch { return c.json({ error: 'Invalid origin' }, 403); }
+      }
+      if (c.req.method !== 'POST') return c.body(null, 405, { Allow: 'POST' });
+      if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+      let body: unknown;
+      try { body = await c.req.json(); } catch {
+        return c.json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, 400);
+      }
+      const replies = (Array.isArray(body) ? body : [body]).map(message => mcp.handle(message)).filter(reply => reply !== null);
+      if (!replies.length) return c.body(null, 202);
+      c.header('Cache-Control', 'no-store');
+      return c.json(Array.isArray(body) ? replies : replies[0]);
+    });
+  }
   app.use('/api/*', async (c, next) => {
     const authorization = c.req.header('Authorization') ?? '';
     const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';

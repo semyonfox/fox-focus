@@ -1,26 +1,8 @@
 import { useState, type FormEvent } from "react";
 import { AlarmClock, Check, CircleDashed, CornerDownLeft } from "lucide-react";
-import type { Job, JobUpdate, ThreadEntry } from "./row-model.ts";
+import type { Job, ThreadEntry } from "./row-model.ts";
 import { assistantName, relativeTime } from "./work-threads.ts";
 import { assistantInitial, snoozePresets } from "./thread-sidebar.tsx";
-
-// Hermes threads keep their one-line update timeline; show it in the same conversation shape
-export function hermesThreadEntries(job: Job, updates: JobUpdate[]): ThreadEntry[] {
-  const entries: ThreadEntry[] = [{ seq: 0, role: "owner", kind: "message", text: job.instruction, options: [], url: null, at: job.createdAt }];
-  for (const update of updates) {
-    if (update.kind === "settled") continue;
-    entries.push({
-      seq: update.seq,
-      role: update.author === "owner" ? "owner" : "assistant",
-      kind: update.kind === "progress" ? "activity" : update.kind === "question" ? "question" : update.kind === "answer" ? "answer" : "message",
-      text: update.text,
-      options: [],
-      url: update.url,
-      at: update.at,
-    });
-  }
-  return entries;
-}
 
 export type ThreadViewProps = {
   job: Job;
