@@ -20,7 +20,9 @@ import {
   isJobResultInput,
   isJobSendBackInput,
   isJobSettleInput,
+  isJobSnoozeInput,
   isReplyEnvelope,
+  type AssistantInfo,
   isTaskMigrationApprovalInput,
   isTaskPlanInput,
   isTaskCreateInput,
@@ -32,6 +34,7 @@ import type { Store } from './store.ts';
 import { HermesServiceError, type HermesMirrorService } from './hermes.ts';
 import type { IntegrationOverview, IntegrationService } from './integrations.ts';
 import { canonicalHash } from './row-store.ts';
+import { threadEntries } from './agent-worker.ts';
 import {
   buildTaskMigrationPreview,
   migrationIdForIdempotencyKey,
@@ -73,6 +76,8 @@ export type AppOptions = {
   emailSendEnabled?: boolean;
   now?: () => Date;
   actionWorker?: { kick: () => void };
+  // the in-process Claude worker for Fox threads; absent when no API key is configured
+  agentWorker?: { kick: () => void };
 };
 
 function tokenMatches(value: string, expected: string): boolean {
@@ -152,8 +157,15 @@ export function createApp(
     const saved = store.save(snapshot.revision, { ...snapshot.data, inboxItems });
     return c.json(saved ?? store.read());
   });
+  const assistants: AssistantInfo[] = [
+    { id: 'fox', name: 'Fox', role: 'Quick helper', engine: 'claude', available: options.agentWorker !== undefined },
+    { id: 'hermes', name: 'Hermes', role: 'Your Hermes agents', engine: 'hermes', available: options.taskStatusToken !== undefined },
+  ];
+  function kickFor(assistant: 'fox' | 'hermes'): void {
+    if (assistant === 'fox') options.agentWorker?.kick();
+  }
   app.get('/api/v1/rows', (c) => c.json({
-    capabilities: { emailSendEnabled },
+    capabilities: { emailSendEnabled, assistants },
     tasks: store.listTasks(),
     taskPlans: store.listTaskPlans(),
     inbox: store.listInboxItems(),
@@ -477,11 +489,14 @@ export function createApp(
     let body: unknown;
     try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
     if (!isJobInstruction(body)) return c.json({ error: 'Invalid job' }, 400);
+    const assistant = body.assistant ?? 'hermes';
+    if (assistant === 'fox' && !options.agentWorker) return c.json({ error: 'Fox is not configured on this server' }, 503);
     const result = store.createJob({
       title: body.title.trim(),
       instruction: body.instruction.trim(),
       taskId: body.taskId ?? null,
       inboxId: body.inboxId ?? null,
+      ...(assistant === 'hermes' ? {} : { assistant }),
     }, now().toISOString(), body.idempotencyKey);
     if (result.outcome === 'missing_task') return c.json({ error: 'Linked task not found' }, 404);
     if (result.outcome === 'missing_inbox') return c.json({ error: 'Linked Inbox item not found' }, 404);
@@ -489,9 +504,15 @@ export function createApp(
       return c.json({ error: 'This job key was already used for a different instruction', current: result.job }, 409);
     }
     if (result.outcome === 'active_job') {
-      return c.json({ error: 'Hermes already has an active request for this item', current: result.job }, 409);
+      return c.json({ error: 'There is already an active request for this item', current: result.job }, 409);
     }
+    if (result.outcome === 'created') kickFor(result.job.assistant);
     return c.json({ job: result.job }, result.outcome === 'created' ? 201 : 200);
+  });
+  app.get('/api/v1/jobs/:id/thread', (c) => {
+    const job = store.getJob(c.req.param('id'));
+    if (!job) return c.json({ error: 'Job not found' }, 404);
+    return c.json({ job, entries: threadEntries(store.listJobMessages(job.id)) });
   });
   app.post('/api/v1/jobs/:id/answer', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
@@ -501,8 +522,12 @@ export function createApp(
     const result = store.answerJob(c.req.param('id'), body.version, body.text, now().toISOString());
     if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
     if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
+    if (result.outcome === 'idempotency_conflict') return c.json({ error: 'A different answer was already sent', current: result.job }, 409);
     if (result.outcome === 'invalid_state') return c.json({ error: 'Job does not need an answer', current: result.job }, 409);
-    if (!('update' in result)) return c.json({ error: 'Answer failed' }, 409);
+    if (result.outcome === 'invalid_input') return c.json({ error: 'Hermes answers must be one line of up to 280 characters', current: result.job }, 400);
+    if (result.outcome === 'replayed') return c.json({ job: result.job, update: null });
+    if (result.outcome !== 'updated') return c.json({ error: 'The change could not be saved', current: result.job }, 409);
+    kickFor(result.job.assistant);
     return c.json({ job: result.job, update: result.update });
   });
   app.post('/api/v1/jobs/:id/send-back', async (c) => {
@@ -513,8 +538,12 @@ export function createApp(
     const result = store.sendBackJob(c.req.param('id'), body.version, body.text, now().toISOString());
     if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
     if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
-    if (result.outcome === 'invalid_state') return c.json({ error: 'Job is not ready for review', current: result.job }, 409);
-    if (!('update' in result)) return c.json({ error: 'Send back failed' }, 409);
+    if (result.outcome === 'idempotency_conflict') return c.json({ error: 'A different reply was already sent', current: result.job }, 409);
+    if (result.outcome === 'invalid_state') return c.json({ error: 'This thread cannot take a reply right now', current: result.job }, 409);
+    if (result.outcome === 'invalid_input') return c.json({ error: 'Hermes replies must be one line of up to 280 characters', current: result.job }, 400);
+    if (result.outcome === 'replayed') return c.json({ job: result.job, update: null });
+    if (result.outcome !== 'updated') return c.json({ error: 'The change could not be saved', current: result.job }, 409);
+    kickFor(result.job.assistant);
     return c.json({ job: result.job, update: result.update });
   });
   app.post('/api/v1/jobs/:id/settle', async (c) => {
@@ -522,19 +551,22 @@ export function createApp(
     let body: unknown;
     try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
     if (!isJobSettleInput(body)) return c.json({ error: 'Invalid settlement' }, 400);
-    const result = store.settleJob(c.req.param('id'), body.version, body.outcome, now().toISOString(), body.taskVersion);
+    const result = store.settleJob(c.req.param('id'), body.version, body.outcome, now().toISOString());
     if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
     if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
-    if (result.outcome === 'invalid_state') return c.json({ error: 'Job cannot be settled from its current state', current: result.job }, 409);
-    if (result.outcome === 'task_not_found') return c.json({ error: 'Linked task not found', current: result.job }, 409);
-    if (result.outcome === 'task_version_required') {
-      return c.json({ error: 'The displayed linked task version is required', current: result.task }, 409);
-    }
-    if (result.outcome === 'task_conflict') return c.json({ error: 'Linked task changed', current: result.task }, 409);
-    if (result.outcome === 'task_read_only') return c.json({ error: 'Linked task cannot be completed', current: result.task }, 422);
-    if (!('action' in result)) return c.json({ error: 'Settlement failed' }, 409);
-    if (result.action) options.actionWorker?.kick();
-    return c.json({ job: result.job, update: result.update, action: result.action });
+    if (result.outcome !== 'settled') return c.json({ error: 'Job cannot be settled from its current state', current: result.job }, 409);
+    return c.json({ job: result.job, update: result.update });
+  });
+  app.post('/api/v1/jobs/:id/snooze', async (c) => {
+    if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
+    if (!isJobSnoozeInput(body)) return c.json({ error: 'Invalid snooze' }, 400);
+    const result = store.snoozeJob(c.req.param('id'), body.version, body.snoozedUntil, now().toISOString());
+    if (result.outcome === 'not_found') return c.json({ error: 'Job not found' }, 404);
+    if (result.outcome === 'conflict') return c.json({ error: 'Job changed', current: result.job }, 409);
+    if (result.outcome !== 'updated') return c.json({ error: 'This thread cannot be snoozed', current: result.job }, 409);
+    return c.json({ job: result.job });
   });
   app.put('/api/v1/inbox-items/:inboxId', async (c) => {
     if (!c.req.header('Content-Type')?.startsWith('application/json')) return c.json({ error: 'Expected application/json' }, 415);

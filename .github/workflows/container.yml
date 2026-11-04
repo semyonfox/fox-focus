@@ -34,6 +34,7 @@ jobs:
             assert.deepEqual(readdirSync("/data"), []);
             assert.deepEqual(readdirSync("/app/server").sort(), [
               "action-worker.ts",
+              "agent-worker.ts",
               "app.ts",
               "hermes.ts",
               "index.ts",

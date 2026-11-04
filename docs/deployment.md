@@ -52,6 +52,18 @@ For the supplied Compose file, set `HERMES_STATUS_TOKEN_FILE_HOST` to the absolu
 
 `EMAIL_SEND_ENABLED` defaults to `false` in Compose and the server. Set it to `true` only after verifying the Hermes hash, MIME, receipt, and reconciliation contract. Startup fails closed if sending is enabled without `HERMES_STATUS_TOKEN_FILE`. A timed-out send becomes `unknown`; disabling new sends does not disable reconciliation claims. See [Hermes integration contract](hermes-task-sync-request.md).
 
+## Fox assistant
+
+Fox runs inside the Fox Focus process and calls the Claude API. It stays off, makes no API calls and shows as not configured until you mount an API key file:
+
+```dotenv
+ANTHROPIC_API_KEY_FILE_HOST=/absolute/private/anthropic-api-key
+FOX_AGENT_DAILY_BUDGET_USD=5
+FOX_AGENT_CONCURRENCY=3
+```
+
+Compose mounts the file read-only at `/run/secrets/fox-focus/anthropic-api-key` and sets `ANTHROPIC_API_KEY_FILE`. Do not pass the key value in the environment. The budget caps estimated spend over the last 24 hours. Requests already running when the cap is reached still finish, so it can go over by up to one request per running thread. Concurrency is how many threads run at once. Fox can read tasks, calendar and Inbox context and ask questions. It cannot write to any provider.
+
 ## Hermes migration boundary
 
 The optional Hermes SQLite mount is a transitional read-only source. Mount the selected board directory read-only and point `HERMES_KANBAN_DB` at its database. The adapter must never open that database for writing or return task bodies, filesystem paths, sessions, provider tokens, or result text.

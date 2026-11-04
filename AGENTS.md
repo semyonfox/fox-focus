@@ -1,5 +1,7 @@
 # Fox Focus
 
+attribution: on
+
 Fox Focus is a private, self-hosted life cockpit. Keep the product small: Google-backed tasks, local planning and reminders, a terse work Inbox, and read-only calendar context.
 
 ## Data and safety
@@ -7,6 +9,8 @@ Fox Focus is a private, self-hosted life cockpit. Keep the product small: Google
 Google Tasks owns task content and completion, including new tasks created through Fox Focus. Fox Focus owns local planning, deadlines, reminders, Inbox decisions, and execution records. Pending Google creations are commands awaiting confirmation, not local-only tasks. Google Calendar, Gmail, and Canvas remain authoritative for their records.
 
 Never commit credentials, tokens, private email bodies, Canvas data, or database dumps.
+
+Fox, the in-process Claude assistant, may read Fox Focus context, ask the owner questions and settle its own thread on the owner's word. Do not give it tools that write to a provider or approve an action.
 
 External writes require a durable human-readable approval record identifying the owner, target account and record, exact before-and-after values, and approval time. For an owner-initiated Google task completion or reopen, the displayed task and explicit status control are the preview; activating that control is approval and needs no second dialog. Task creation requires the destination list and exact outgoing fields to be visible before submission. Agent-proposed writes, bulk migrations, and conflicts with changed remote records require a separate exact preview and approval. Persist approval and the immutable command before dispatch. Keep pending and confirmed state separate. Email sending requires approval of the complete reply envelope and content and execution of the exact stored payload. Unknown create or send outcomes require reconciliation before any further attempt. Do not add unapproved send, delete, calendar-edit, or Canvas-submit paths.
 

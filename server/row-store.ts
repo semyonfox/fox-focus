@@ -16,8 +16,11 @@ import {
   type Task,
 } from '../src/model.ts';
 import {
+  isAssistantId,
   isBriefingRow,
   isEmailSendReceiptInput,
+  isJobPrompt,
+  isOneLineJobText,
   isReplyEnvelope,
   isUtcInstant,
   taskCreateNotes,
@@ -32,8 +35,11 @@ import {
   type InboxItemRow,
   type InboxOutcome,
   type InboxState,
+  type AssistantId,
   type Job,
   type JobOutcome,
+  type JobPrompt,
+  type JobResultKind,
   type JobUpdate,
   type ReminderRow,
   type ReplyEnvelope,
@@ -49,7 +55,7 @@ import {
 import { filterCalendarContextByDateRange } from '../src/integration-model.ts';
 import type { ImportedRecord, Provider } from './store.ts';
 
-export const ROW_SCHEMA_VERSION = 11;
+export const ROW_SCHEMA_VERSION = 12;
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -101,6 +107,10 @@ function jsonStringList(value: unknown): string[] | null {
   } catch {
     return null;
   }
+}
+
+function jsonRecordValue(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
 function stringOrNull(value: unknown): string | null {
@@ -524,6 +534,13 @@ function jobFromSql(row: Record<string, unknown>): Job | null {
       ? row.outcome
       : undefined;
   if (outcome === undefined) return null;
+  const assistant: AssistantId = row.assistant === undefined || row.assistant === null ? 'hermes'
+    : isAssistantId(row.assistant) ? row.assistant : 'hermes';
+  const promptValue = jsonRecord(row.prompt_json);
+  const prompt: JobPrompt | null = promptValue && isJobPrompt(promptValue) ? promptValue : null;
+  const resultKind: JobResultKind | null = row.result_kind === 'complete' || row.result_kind === 'failed'
+    ? row.result_kind
+    : null;
   return {
     id: row.id,
     version: row.version,
@@ -531,14 +548,55 @@ function jobFromSql(row: Record<string, unknown>): Job | null {
     instruction: row.instruction,
     taskId: stringOrNull(row.task_id),
     inboxId: stringOrNull(row.inbox_id),
+    assistant,
     state: row.state as Job['state'],
     outcome,
     question: stringOrNull(row.question),
+    prompt,
+    resultKind,
+    resultNote: stringOrNull(row.result_note),
     claimId: stringOrNull(row.claim_id),
     leaseUntil: stringOrNull(row.lease_until),
+    snoozedUntil: stringOrNull(row.snoozed_until),
+    snoozedAt: stringOrNull(row.snoozed_at),
+    attentionAt: stringOrNull(row.attention_at),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+export type JobMessageRow = {
+  seq: number;
+  jobId: string;
+  role: 'user' | 'assistant';
+  content: unknown[];
+  usage: Record<string, unknown> | null;
+  model: string | null;
+  at: string;
+};
+
+function jobMessageFromSql(row: Record<string, unknown>): JobMessageRow | null {
+  if (typeof row.seq !== 'number' || typeof row.job_id !== 'string' ||
+    (row.role !== 'user' && row.role !== 'assistant') || typeof row.content_json !== 'string' ||
+    typeof row.at !== 'string') return null;
+  let content: unknown;
+  try { content = JSON.parse(row.content_json); } catch { return null; }
+  if (!Array.isArray(content)) return null;
+  return {
+    seq: row.seq,
+    jobId: row.job_id,
+    role: row.role,
+    content,
+    usage: jsonRecord(row.usage_json),
+    model: stringOrNull(row.model),
+    at: row.at,
+  };
+}
+
+// one line for the 280 character question column; the full prompt lives in prompt_json
+function questionSummary(text: string): string {
+  const line = text.replace(/\s+/g, ' ').trim();
+  return line.length <= 280 ? line : `${line.slice(0, 279)}…`;
 }
 
 function jobUpdateFromSql(row: Record<string, unknown>): JobUpdate | null {
@@ -647,6 +705,25 @@ function insertChange(
     input.at,
   );
   return Number(result.lastInsertRowid);
+}
+
+// added in schema 12 for in-process agent requests; nullable or defaulted so old rows stay valid
+const JOB_EXTRA_COLUMNS = [
+  { name: 'assistant', definition: "TEXT NOT NULL DEFAULT 'hermes' CHECK(assistant IN ('hermes', 'fox'))" },
+  { name: 'prompt_json', definition: 'TEXT CHECK(prompt_json IS NULL OR json_valid(prompt_json))' },
+  { name: 'result_kind', definition: "TEXT CHECK(result_kind IS NULL OR result_kind IN ('complete', 'failed'))" },
+  { name: 'result_note', definition: 'TEXT CHECK(result_note IS NULL OR length(result_note) BETWEEN 1 AND 500)' },
+  { name: 'snoozed_until', definition: 'TEXT' },
+  { name: 'snoozed_at', definition: 'TEXT' },
+  { name: 'attention_at', definition: 'TEXT' },
+] as const;
+
+function addMissingJobColumns(db: DatabaseSync): void {
+  const existing = new Set((db.prepare('PRAGMA table_info(jobs)').all() as Record<string, unknown>[])
+    .map(column => column.name));
+  for (const column of JOB_EXTRA_COLUMNS) {
+    if (!existing.has(column.name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${column.name} ${column.definition}`);
+  }
 }
 
 function ensureSchema(db: DatabaseSync): void {
@@ -780,6 +857,7 @@ function ensureSchema(db: DatabaseSync): void {
       question TEXT CHECK(question IS NULL OR length(question) BETWEEN 1 AND 280),
       claim_id TEXT,
       lease_until TEXT,
+      ${JOB_EXTRA_COLUMNS.map(column => `${column.name} ${column.definition},`).join('\n      ')}
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       CHECK((state='settled' AND outcome IS NOT NULL) OR (state<>'settled' AND outcome IS NULL)),
@@ -797,6 +875,17 @@ function ensureSchema(db: DatabaseSync): void {
       at TEXT NOT NULL
     ) STRICT;
     CREATE INDEX IF NOT EXISTS job_updates_job ON job_updates(job_id, seq);
+
+    CREATE TABLE IF NOT EXISTS job_messages (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+      content_json TEXT NOT NULL CHECK(json_valid(content_json) AND json_type(content_json)='array'),
+      usage_json TEXT CHECK(usage_json IS NULL OR json_valid(usage_json)),
+      model TEXT,
+      at TEXT NOT NULL
+    ) STRICT;
+    CREATE INDEX IF NOT EXISTS job_messages_job ON job_messages(job_id, seq);
 
     CREATE TABLE IF NOT EXISTS reminders (
       id TEXT PRIMARY KEY,
@@ -866,6 +955,8 @@ function ensureSchema(db: DatabaseSync): void {
     BEGIN SELECT RAISE(ABORT, 'job updates are immutable'); END;
     CREATE TRIGGER IF NOT EXISTS job_updates_immutable_delete BEFORE DELETE ON job_updates
     BEGIN SELECT RAISE(ABORT, 'job updates are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS job_messages_immutable_update BEFORE UPDATE ON job_messages
+    BEGIN SELECT RAISE(ABORT, 'job messages are immutable'); END;
     CREATE TRIGGER IF NOT EXISTS action_payload_immutable BEFORE UPDATE OF kind, task_id, inbox_id, operation_key, request_hash, payload_json, approval_json ON actions
     WHEN OLD.kind<>NEW.kind OR OLD.task_id IS NOT NEW.task_id OR OLD.inbox_id IS NOT NEW.inbox_id OR
       OLD.operation_key<>NEW.operation_key OR OLD.request_hash<>NEW.request_hash OR
@@ -877,6 +968,7 @@ function ensureSchema(db: DatabaseSync): void {
     CREATE TRIGGER IF NOT EXISTS briefings_history_retained BEFORE DELETE ON briefings
     BEGIN SELECT RAISE(ABORT, 'briefing history is retained'); END;
   `);
+  addMissingJobColumns(db);
 }
 
 function legacyTaskRow(task: Task, now: string): TaskRow {
@@ -2507,7 +2599,8 @@ export function createRowStore(db: DatabaseSync) {
         source: { kind: 'local', id: event.id, taskId: event.taskId ?? null },
       }));
       const calendar = filterCalendarContextByDateRange([...providerCalendar, ...localCalendar], from, to) as Array<Record<string, unknown>>;
-      const jobs = listJobs(false);
+      // the bearer-token context feeds the Hermes bridge, so it only sees Hermes requests
+      const jobs = listJobs(false).filter(job => job.assistant === 'hermes');
       const jobIds = new Set(jobs.map(job => job.id));
       const jobUpdates = listJobUpdates().filter(update => jobIds.has(update.jobId));
       const cursorRow = db.prepare('SELECT COALESCE(MAX(seq), 0) AS cursor FROM changes').get() as Record<string, unknown>;
@@ -3503,7 +3596,7 @@ export function createRowStore(db: DatabaseSync) {
   }
 
   function createJob(
-    input: { title: string; instruction: string; taskId: string | null; inboxId: string | null },
+    input: { title: string; instruction: string; taskId: string | null; inboxId: string | null; assistant?: AssistantId },
     now: string,
     idempotencyKey: string = randomUUID(),
   ):
@@ -3512,7 +3605,11 @@ export function createRowStore(db: DatabaseSync) {
     | { outcome: 'idempotency_conflict'; job: Job }
     | { outcome: 'active_job'; job: Job }
     | { outcome: 'missing_task' | 'missing_inbox'; job: null } {
-    const requestHash = canonicalHash(input);
+    const assistant = input.assistant ?? 'hermes';
+    // Hermes requests keep their original hash so pre-upgrade retries still replay
+    const requestHash = canonicalHash(assistant === 'hermes'
+      ? { title: input.title, instruction: input.instruction, taskId: input.taskId, inboxId: input.inboxId }
+      : { ...input, assistant });
     const mutationKey = `owner:job-create:${createHash('sha256').update(idempotencyKey).digest('base64url')}`;
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -3553,21 +3650,29 @@ export function createRowStore(db: DatabaseSync) {
         instruction: input.instruction,
         taskId: input.taskId,
         inboxId: input.inboxId,
+        assistant,
         state: 'queued',
         outcome: null,
         question: null,
+        prompt: null,
+        resultKind: null,
+        resultNote: null,
         claimId: null,
         leaseUntil: null,
+        snoozedUntil: null,
+        snoozedAt: null,
+        attentionAt: null,
         createdAt: now,
         updatedAt: now,
       };
       db.prepare(`INSERT INTO jobs (
-        id, version, title, instruction, task_id, inbox_id, state, outcome, question,
+        id, version, title, instruction, task_id, inbox_id, assistant, state, outcome, question,
         claim_id, lease_until, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)`).run(
-        job.id, job.version, job.title, job.instruction, job.taskId, job.inboxId, job.state,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)`).run(
+        job.id, job.version, job.title, job.instruction, job.taskId, job.inboxId, job.assistant, job.state,
         job.createdAt, job.updatedAt,
       );
+      if (assistant !== 'hermes') insertJobMessage(job.id, 'user', [{ type: 'text', text: input.instruction }], null, null, now);
       insertChange(db, {
         actor: 'owner', mutationKey, mutationHash: requestHash, entityKind: 'job', entityId: job.id,
         entityVersion: 1, operation: 'upsert', snapshot: jobSnapshot(job),
@@ -3581,6 +3686,7 @@ export function createRowStore(db: DatabaseSync) {
     }
   }
 
+  // the Hermes claim route; in-process assistants are claimed by claimNextAgentJob instead
   function claimJob(id: string, now: string, leaseMilliseconds: number, claimRequestKey?: string):
     | { outcome: 'claimed'; job: Job; claimId: string }
     | { outcome: 'not_found'; job: null }
@@ -3588,7 +3694,7 @@ export function createRowStore(db: DatabaseSync) {
     db.exec('BEGIN IMMEDIATE');
     try {
       const current = getJob(id);
-      if (!current) {
+      if (!current || current.assistant !== 'hermes') {
         db.exec('COMMIT');
         return { outcome: 'not_found', job: null };
       }
@@ -3669,7 +3775,7 @@ export function createRowStore(db: DatabaseSync) {
         return { outcome: 'replayed', job, update };
       }
       const current = getJob(id);
-      if (!current) {
+      if (!current || current.assistant !== 'hermes') {
         db.exec('COMMIT');
         return { outcome: 'not_found', job: null };
       }
@@ -3687,8 +3793,12 @@ export function createRowStore(db: DatabaseSync) {
       const releasesClaim = input.kind === 'question' || input.kind === 'result';
       const leaseUntil = releasesClaim ? null : new Date(Date.parse(now) + leaseMilliseconds).toISOString();
       const nextClaimId = releasesClaim ? null : claimId;
-      db.prepare(`UPDATE jobs SET version=?, state=?, question=?, claim_id=?, lease_until=?, updated_at=?
-        WHERE id=? AND version=?`).run(version, state, question, nextClaimId, leaseUntil, now, id, current.version);
+      const attentionAt = releasesClaim ? now : current.attentionAt;
+      const resultKind = input.kind === 'result' ? 'complete' : current.resultKind;
+      db.prepare(`UPDATE jobs SET version=?, state=?, question=?, claim_id=?, lease_until=?, attention_at=?,
+        result_kind=?, updated_at=? WHERE id=? AND version=?`).run(
+        version, state, question, nextClaimId, leaseUntil, attentionAt, resultKind, now, id, current.version,
+      );
       const job = getJob(id);
       if (!job) throw new Error('Updated job disappeared');
       const update = addJobUpdate(id, 'hermes', input.kind, input.text, input.url, now);
@@ -3705,12 +3815,56 @@ export function createRowStore(db: DatabaseSync) {
     }
   }
 
+  function insertJobMessage(
+    jobId: string,
+    role: JobMessageRow['role'],
+    content: unknown[],
+    usage: Record<string, unknown> | null,
+    model: string | null,
+    at: string,
+  ): JobMessageRow {
+    const result = db.prepare(`INSERT INTO job_messages (job_id, role, content_json, usage_json, model, at)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(jobId, role, JSON.stringify(content), usage ? JSON.stringify(usage) : null, model, at);
+    return { seq: Number(result.lastInsertRowid), jobId, role, content, usage, model, at };
+  }
+
+  function listJobMessages(jobId: string): JobMessageRow[] {
+    return (db.prepare('SELECT * FROM job_messages WHERE job_id=? ORDER BY seq').all(jobId) as Record<string, unknown>[])
+      .flatMap(row => {
+        const message = jobMessageFromSql(row);
+        return message ? [message] : [];
+      });
+  }
+
+  // a lost response retried with the same text must not look like a conflict
+  function ownerReplay(mutationKey: string, requestHash: string, id: string):
+    | { outcome: 'replayed'; job: Job }
+    | { outcome: 'idempotency_conflict'; job: Job }
+    | null {
+    const replay = db.prepare('SELECT mutation_hash FROM changes WHERE mutation_key=?')
+      .get(mutationKey) as Record<string, unknown> | undefined;
+    if (!replay) return null;
+    const job = getJob(id);
+    if (!job) throw new Error('Job replay points to a missing job');
+    return replay.mutation_hash === requestHash
+      ? { outcome: 'replayed', job }
+      : { outcome: 'idempotency_conflict', job };
+  }
+
   function answerJob(id: string, expectedVersion: number, text: string, now: string):
-    | { outcome: 'updated'; job: Job; update: JobUpdate }
+    | { outcome: 'updated'; job: Job; update: JobUpdate | null }
+    | { outcome: 'replayed'; job: Job }
     | { outcome: 'not_found'; job: null }
-    | { outcome: 'conflict' | 'invalid_state'; job: Job } {
+    | { outcome: 'conflict' | 'invalid_state' | 'invalid_input' | 'idempotency_conflict'; job: Job } {
+    const mutationKey = `owner:job-answer:${id}:${expectedVersion + 1}`;
+    const requestHash = canonicalHash({ text });
     db.exec('BEGIN IMMEDIATE');
     try {
+      const replay = ownerReplay(mutationKey, requestHash, id);
+      if (replay) {
+        db.exec('COMMIT');
+        return replay;
+      }
       const current = getJob(id);
       if (!current) {
         db.exec('COMMIT');
@@ -3724,16 +3878,27 @@ export function createRowStore(db: DatabaseSync) {
         db.exec('COMMIT');
         return { outcome: 'invalid_state', job: current };
       }
+      if (current.assistant === 'hermes' ? !isOneLineJobText(text) : current.prompt === null) {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_input', job: current };
+      }
       const version = current.version + 1;
-      db.prepare(`UPDATE jobs SET version=?, state='working', question=NULL, claim_id=NULL,
-        lease_until=NULL, updated_at=? WHERE id=? AND version=?`).run(version, now, id, current.version);
+      // Hermes reclaims an answered job from working; the in-process worker picks up queued jobs
+      const nextState = current.assistant === 'hermes' ? 'working' : 'queued';
+      db.prepare(`UPDATE jobs SET version=?, state=?, question=NULL, prompt_json=NULL, claim_id=NULL,
+        lease_until=NULL, updated_at=? WHERE id=? AND version=?`).run(version, nextState, now, id, current.version);
       const job = getJob(id);
       if (!job) throw new Error('Answered job disappeared');
-      const update = addJobUpdate(id, 'owner', 'answer', text, null, now);
+      let update: JobUpdate | null = null;
+      if (current.assistant === 'hermes') {
+        update = addJobUpdate(id, 'owner', 'answer', text, null, now);
+      } else if (current.prompt) {
+        insertJobMessage(id, 'user', [{ type: 'tool_result', tool_use_id: current.prompt.toolUseId, content: text }], null, null, now);
+      }
       insertChange(db, {
-        actor: 'owner', mutationKey: `owner:job-answer:${id}:${version}`, entityKind: 'job', entityId: id,
+        actor: 'owner', mutationKey, mutationHash: requestHash, entityKind: 'job', entityId: id,
         entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
-        details: { before: 'needs_you', after: 'working', update }, at: now,
+        details: { before: 'needs_you', after: nextState, update }, at: now,
       });
       db.exec('COMMIT');
       return { outcome: 'updated', job, update };
@@ -3743,8 +3908,86 @@ export function createRowStore(db: DatabaseSync) {
     }
   }
 
+  // replying to a completed, failed or settled thread sends it back to work
   function sendBackJob(id: string, expectedVersion: number, text: string, now: string):
-    | { outcome: 'updated'; job: Job; update: JobUpdate }
+    | { outcome: 'updated'; job: Job; update: JobUpdate | null }
+    | { outcome: 'replayed'; job: Job }
+    | { outcome: 'not_found'; job: null }
+    | { outcome: 'conflict' | 'invalid_state' | 'invalid_input' | 'idempotency_conflict'; job: Job } {
+    const mutationKey = `owner:job-send-back:${id}:${expectedVersion + 1}`;
+    const requestHash = canonicalHash({ text });
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const replay = ownerReplay(mutationKey, requestHash, id);
+      if (replay) {
+        db.exec('COMMIT');
+        return replay;
+      }
+      const current = getJob(id);
+      if (!current) {
+        db.exec('COMMIT');
+        return { outcome: 'not_found', job: null };
+      }
+      if (current.version !== expectedVersion) {
+        db.exec('COMMIT');
+        return { outcome: 'conflict', job: current };
+      }
+      if (current.state !== 'review' && current.state !== 'settled') {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_state', job: current };
+      }
+      if (current.assistant === 'hermes' && !isOneLineJobText(text)) {
+        db.exec('COMMIT');
+        return { outcome: 'invalid_input', job: current };
+      }
+      if (current.state === 'settled' && (current.taskId || current.inboxId)) {
+        const activeRow = db.prepare(`SELECT 1 FROM jobs WHERE id<>? AND state<>'settled' AND
+          ((? IS NOT NULL AND task_id=?) OR (? IS NOT NULL AND inbox_id=?)) LIMIT 1`).get(
+          id, current.taskId, current.taskId, current.inboxId, current.inboxId,
+        );
+        if (activeRow) {
+          db.exec('COMMIT');
+          return { outcome: 'invalid_state', job: current };
+        }
+      }
+      const version = current.version + 1;
+      db.prepare(`UPDATE jobs SET version=?, state='queued', outcome=NULL, question=NULL, prompt_json=NULL,
+        result_kind=NULL, result_note=NULL, claim_id=NULL, lease_until=NULL, snoozed_until=NULL, snoozed_at=NULL,
+        updated_at=? WHERE id=? AND version=?`).run(version, now, id, current.version);
+      const job = getJob(id);
+      if (!job) throw new Error('Returned job disappeared');
+      let update: JobUpdate | null = null;
+      if (current.assistant === 'hermes') {
+        update = addJobUpdate(id, 'owner', 'sent_back', text, null, now);
+      } else {
+        // a run that stopped mid-tool-call left tool_use blocks with no result; the API needs them answered first
+        const last = listJobMessages(id).at(-1);
+        const unanswered = last?.role === 'assistant'
+          ? last.content.flatMap(block => {
+            const record = jsonRecordValue(block);
+            return record?.type === 'tool_use' && typeof record.id === 'string'
+              ? [{ type: 'tool_result', tool_use_id: record.id, is_error: true, content: 'Not run.' }]
+              : [];
+          })
+          : [];
+        insertJobMessage(id, 'user', [...unanswered, { type: 'text', text }], null, null, now);
+      }
+      insertChange(db, {
+        actor: 'owner', mutationKey, mutationHash: requestHash, entityKind: 'job', entityId: id,
+        entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
+        details: { before: current.state, after: 'queued', update }, at: now,
+      });
+      db.exec('COMMIT');
+      return { outcome: 'updated', job, update };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  // settle means done and dealt with; it never writes to a provider
+  function settleJob(id: string, expectedVersion: number, outcome: JobOutcome, now: string):
+    | { outcome: 'settled'; job: Job; update: JobUpdate }
     | { outcome: 'not_found'; job: null }
     | { outcome: 'conflict' | 'invalid_state'; job: Job } {
     db.exec('BEGIN IMMEDIATE');
@@ -3763,38 +4006,30 @@ export function createRowStore(db: DatabaseSync) {
         return { outcome: 'invalid_state', job: current };
       }
       const version = current.version + 1;
-      db.prepare(`UPDATE jobs SET version=?, state='queued', outcome=NULL, question=NULL,
-        claim_id=NULL, lease_until=NULL, updated_at=? WHERE id=? AND version=?`).run(
-        version, now, id, current.version,
-      );
+      db.prepare(`UPDATE jobs SET version=?, state='settled', outcome=?, question=NULL, prompt_json=NULL,
+        claim_id=NULL, lease_until=NULL, snoozed_until=NULL, snoozed_at=NULL, updated_at=?
+        WHERE id=? AND version=?`).run(version, outcome, now, id, current.version);
       const job = getJob(id);
-      if (!job) throw new Error('Returned job disappeared');
-      const update = addJobUpdate(id, 'owner', 'sent_back', text, null, now);
+      if (!job) throw new Error('Settled job disappeared');
+      const update = addJobUpdate(id, 'owner', 'settled', outcome === 'accepted' ? 'Settled' : 'Dropped', null, now);
       insertChange(db, {
-        actor: 'owner', mutationKey: `owner:job-send-back:${id}:${version}`, entityKind: 'job', entityId: id,
+        actor: 'owner', mutationKey: `owner:job-settle:${id}:${version}`, entityKind: 'job', entityId: id,
         entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
-        details: { before: 'review', after: 'queued', update }, at: now,
+        details: { before: current.state, after: 'settled', outcome, update }, at: now,
       });
       db.exec('COMMIT');
-      return { outcome: 'updated', job, update };
+      return { outcome: 'settled', job, update };
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
       throw error;
     }
   }
 
-  function settleJob(
-    id: string,
-    expectedVersion: number,
-    outcome: JobOutcome,
-    now: string,
-    taskVersion?: number,
-  ):
-    | { outcome: 'settled'; job: Job; update: JobUpdate; action: ActionRow | null }
+  // snooze only hides a thread; it never pauses the agent working on it
+  function snoozeJob(id: string, expectedVersion: number, snoozedUntil: string | null, now: string):
+    | { outcome: 'updated'; job: Job }
     | { outcome: 'not_found'; job: null }
-    | { outcome: 'conflict' | 'invalid_state'; job: Job }
-    | { outcome: 'task_not_found'; job: Job }
-    | { outcome: 'task_conflict' | 'task_read_only' | 'task_version_required'; job: Job; task: TaskRow } {
+    | { outcome: 'conflict' | 'invalid_state'; job: Job } {
     db.exec('BEGIN IMMEDIATE');
     try {
       const current = getJob(id);
@@ -3806,66 +4041,145 @@ export function createRowStore(db: DatabaseSync) {
         db.exec('COMMIT');
         return { outcome: 'conflict', job: current };
       }
-      if (current.state !== 'review') {
+      if (current.state === 'settled' || (snoozedUntil !== null && Date.parse(snoozedUntil) <= Date.parse(now))) {
         db.exec('COMMIT');
         return { outcome: 'invalid_state', job: current };
       }
-
-      let action: ActionRow | null = null;
-      if (outcome === 'accepted' && current.taskId) {
-        const task = getTask(current.taskId);
-        if (!task) {
-          db.exec('COMMIT');
-          return { outcome: 'task_not_found', job: current };
-        }
-        const runningTaskAction = db.prepare(`SELECT 1 FROM actions
-          WHERE task_id=? AND kind='task-status' AND state='running' LIMIT 1`).get(task.id);
-        if (runningTaskAction) {
-          db.exec('COMMIT');
-          return { outcome: 'task_conflict', job: current, task };
-        }
-        const contradictoryIntent = (db.prepare(`SELECT * FROM actions
-          WHERE task_id=? AND kind='task-status' AND state IN ('queued', 'failed')`).all(task.id) as Record<string, unknown>[])
-          .some(row => {
-            const pending = actionFromSql(row);
-            return pending?.payload.kind === 'task-status' && pending.payload.after !== 'completed';
-          });
-        if (task.observed?.status !== 'completed' || contradictoryIntent) {
-          if (taskVersion === undefined) {
-            db.exec('COMMIT');
-            return { outcome: 'task_version_required', job: current, task };
-          }
-          const queued = queueTaskStatusActionInTransaction(current.taskId, taskVersion, 'completed', now);
-          if (queued.outcome !== 'queued') {
-            db.exec('ROLLBACK');
-            return queued.outcome === 'not_found'
-              ? { outcome: 'task_not_found', job: current }
-              : { outcome: queued.outcome === 'conflict' ? 'task_conflict' : 'task_read_only', job: current, task: queued.task };
-          }
-          action = queued.action;
-        }
-      }
-
       const version = current.version + 1;
-      db.prepare(`UPDATE jobs SET version=?, state='settled', outcome=?, question=NULL,
-        claim_id=NULL, lease_until=NULL, updated_at=? WHERE id=? AND version=?`).run(
-        version, outcome, now, id, current.version,
-      );
+      db.prepare(`UPDATE jobs SET version=?, snoozed_until=?, snoozed_at=?, updated_at=? WHERE id=? AND version=?`)
+        .run(version, snoozedUntil, snoozedUntil === null ? null : now, now, id, current.version);
       const job = getJob(id);
-      if (!job) throw new Error('Settled job disappeared');
-      const text = outcome === 'accepted' ? 'Accepted' : 'Dropped';
-      const update = addJobUpdate(id, 'owner', 'settled', text, null, now);
+      if (!job) throw new Error('Snoozed job disappeared');
       insertChange(db, {
-        actor: 'owner', mutationKey: `owner:job-settle:${id}:${version}`, entityKind: 'job', entityId: id,
+        actor: 'owner', mutationKey: `owner:job-snooze:${id}:${version}`, entityKind: 'job', entityId: id,
         entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
-        details: { before: current.state, after: 'settled', outcome, actionId: action?.id ?? null, update }, at: now,
+        details: { snoozedUntil }, at: now,
       });
       db.exec('COMMIT');
-      return { outcome: 'settled', job, update, action };
+      return { outcome: 'updated', job };
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
       throw error;
     }
+  }
+
+  // claims the oldest runnable request for the in-process worker, including one whose worker crashed
+  function claimNextAgentJob(assistant: AssistantId, now: string, leaseMilliseconds: number): { job: Job; claimId: string } | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = db.prepare(`SELECT * FROM jobs WHERE assistant=? AND (state='queued' OR
+        (state='working' AND (claim_id IS NULL OR lease_until IS NULL OR lease_until<=?)))
+        ORDER BY updated_at, id LIMIT 1`).get(assistant, now) as Record<string, unknown> | undefined;
+      const current = row ? jobFromSql(row) : null;
+      if (!current) {
+        db.exec('COMMIT');
+        return null;
+      }
+      const claimId = randomUUID();
+      const leaseUntil = new Date(Date.parse(now) + leaseMilliseconds).toISOString();
+      const version = current.version + 1;
+      db.prepare(`UPDATE jobs SET version=?, state='working', claim_id=?, lease_until=?, updated_at=?
+        WHERE id=? AND version=?`).run(version, claimId, leaseUntil, now, current.id, current.version);
+      const job = getJob(current.id);
+      if (!job) throw new Error('Claimed agent job disappeared');
+      insertChange(db, {
+        actor: 'system', mutationKey: `agent:job-claim:${current.id}:${claimId}`, entityKind: 'job', entityId: current.id,
+        entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
+        details: { agent: assistant, before: current.state, after: 'working', claimId }, at: now,
+      });
+      db.exec('COMMIT');
+      return { job, claimId };
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function holdsAgentClaim(id: string, claimId: string, now: string): Job | null {
+    const current = getJob(id);
+    return current && current.state === 'working' && current.claimId === claimId &&
+      current.leaseUntil !== null && current.leaseUntil > now ? current : null;
+  }
+
+  // every write by the worker is fenced on its claim so a stale run cannot overwrite a newer one
+  function appendAgentMessage(
+    id: string,
+    claimId: string,
+    message: { role: JobMessageRow['role']; content: unknown[]; usage: Record<string, unknown> | null; model: string | null },
+    now: string,
+    leaseMilliseconds: number,
+  ): JobMessageRow | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!holdsAgentClaim(id, claimId, now)) {
+        db.exec('COMMIT');
+        return null;
+      }
+      const leaseUntil = new Date(Date.parse(now) + leaseMilliseconds).toISOString();
+      db.prepare('UPDATE jobs SET lease_until=? WHERE id=? AND claim_id=?').run(leaseUntil, id, claimId);
+      const inserted = insertJobMessage(id, message.role, message.content, message.usage, message.model, now);
+      db.exec('COMMIT');
+      return inserted;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  type AgentRunEnd =
+    | { kind: 'ask'; prompt: JobPrompt }
+    | { kind: 'complete' }
+    | { kind: 'failed'; note: string }
+    | { kind: 'settle' };
+
+  function finishAgentRun(id: string, claimId: string, end: AgentRunEnd, now: string): Job | null {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = holdsAgentClaim(id, claimId, now);
+      if (!current) {
+        db.exec('COMMIT');
+        return null;
+      }
+      const version = current.version + 1;
+      if (end.kind === 'ask') {
+        db.prepare(`UPDATE jobs SET version=?, state='needs_you', question=?, prompt_json=?, claim_id=NULL,
+          lease_until=NULL, attention_at=?, updated_at=? WHERE id=? AND version=?`).run(
+          version, questionSummary(end.prompt.question), JSON.stringify(end.prompt), now, now, id, current.version,
+        );
+      } else if (end.kind === 'settle') {
+        db.prepare(`UPDATE jobs SET version=?, state='settled', outcome='accepted', result_kind='complete',
+          claim_id=NULL, lease_until=NULL, snoozed_until=NULL, snoozed_at=NULL, updated_at=?
+          WHERE id=? AND version=?`).run(version, now, id, current.version);
+      } else {
+        const note = end.kind === 'failed' ? end.note.slice(0, 500) : null;
+        db.prepare(`UPDATE jobs SET version=?, state='review', result_kind=?, result_note=?, claim_id=NULL,
+          lease_until=NULL, attention_at=?, updated_at=? WHERE id=? AND version=?`).run(
+          version, end.kind, note, now, now, id, current.version,
+        );
+      }
+      const job = getJob(id);
+      if (!job) throw new Error('Finished agent job disappeared');
+      insertChange(db, {
+        actor: 'system', mutationKey: `agent:job-finish:${id}:${version}`, entityKind: 'job', entityId: id,
+        entityVersion: version, operation: 'transition', snapshot: jobSnapshot(job),
+        details: { agent: current.assistant, before: 'working', after: job.state, end: end.kind }, at: now,
+      });
+      db.exec('COMMIT');
+      return job;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+      throw error;
+    }
+  }
+
+  function listAgentUsageSince(since: string): Array<{ model: string | null; usage: Record<string, unknown> }> {
+    return (db.prepare(`SELECT job_messages.model AS model, job_messages.usage_json AS usage_json FROM job_messages
+      JOIN jobs ON jobs.id=job_messages.job_id
+      WHERE job_messages.role='assistant' AND jobs.assistant<>'hermes' AND job_messages.at>=?`).all(since) as Record<string, unknown>[])
+      .flatMap(row => {
+        const usage = jsonRecord(row.usage_json);
+        return usage ? [{ model: stringOrNull(row.model), usage }] : [];
+      });
   }
 
   function queueTaskStatusActionInTransaction(
@@ -4396,6 +4710,12 @@ export function createRowStore(db: DatabaseSync) {
     answerJob,
     sendBackJob,
     settleJob,
+    snoozeJob,
+    listJobMessages,
+    claimNextAgentJob,
+    appendAgentMessage,
+    finishAgentRun,
+    listAgentUsageSince,
     queueTaskStatusAction,
     claimNextTaskCreateAction,
     settleTaskCreateAction,

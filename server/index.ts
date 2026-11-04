@@ -18,6 +18,8 @@ import {
 } from './push.ts';
 import { adoptedTaskIdForHermes } from './task-management.ts';
 import { createTaskStatusActionWorker } from './action-worker.ts';
+import Anthropic from '@anthropic-ai/sdk';
+import { createAgentWorker, type AgentWorker } from './agent-worker.ts';
 
 const PUSH_REQUEST_TIMEOUT_MS = 10_000;
 
@@ -79,13 +81,32 @@ const actionWorker = createTaskStatusActionWorker(store, integrations ?? {
     notice: 'Google Tasks is not configured. Reconnect the original account to reconcile this create.',
   }),
 });
+// Fox threads run in-process on the Claude API. Without a key file the worker stays off and Fox
+// shows as unavailable, so a plain deploy changes nothing.
+const anthropicKeyPath = process.env.ANTHROPIC_API_KEY_FILE;
+let agentWorker: AgentWorker | undefined;
+if (anthropicKeyPath) {
+  const apiKey = readFileSync(anthropicKeyPath, 'utf8').trim();
+  if (!apiKey) throw new Error('Anthropic API key file is empty');
+  const anthropic = new Anthropic({ apiKey });
+  const dailyBudget = Number(process.env.FOX_AGENT_DAILY_BUDGET_USD ?? 5);
+  const concurrency = Number(process.env.FOX_AGENT_CONCURRENCY ?? 3);
+  if (!Number.isFinite(dailyBudget) || dailyBudget <= 0) throw new Error('Invalid FOX_AGENT_DAILY_BUDGET_USD');
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 10) throw new Error('Invalid FOX_AGENT_CONCURRENCY');
+  agentWorker = createAgentWorker(store, { create: (params) => anthropic.beta.messages.create(params) }, {
+    dailyBudgetUsd: dailyBudget,
+    maxConcurrent: concurrency,
+  });
+}
 const app = createApp(store, password, hermes, integrations, {
   pushPublicKey: vapid.publicKey,
   taskStatusToken,
   emailSendEnabled,
   actionWorker,
+  agentWorker,
 });
 actionWorker.start();
+agentWorker?.start();
 // Establish a current or explicitly stale mirror before the first reminder
 // tick, so persisted rows from a previous run can never fire unchecked.
 if (hermes) await hermes.poll();
@@ -190,6 +211,7 @@ if (integrations) {
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
   clearInterval(pushTimer);
   actionWorker.stop();
+  agentWorker?.stop();
   if (hermesTimer) clearInterval(hermesTimer);
   server.close(() => { store.close(); process.exit(0); });
 });

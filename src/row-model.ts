@@ -298,6 +298,26 @@ export type ActionRow = {
 
 export type JobState = "queued" | "working" | "needs_you" | "review" | "settled";
 export type JobOutcome = "accepted" | "dropped";
+export type JobResultKind = "complete" | "failed";
+
+// hermes jobs run on the external Hermes bridge, fox jobs on the in-process Claude worker
+export const assistantIds = ["hermes", "fox"] as const;
+export type AssistantId = (typeof assistantIds)[number];
+
+export type AssistantInfo = {
+  id: AssistantId;
+  name: string;
+  role: string;
+  engine: "claude" | "hermes";
+  available: boolean;
+};
+
+export type JobPrompt = {
+  kind: "choice";
+  toolUseId: string;
+  question: string;
+  options: string[];
+};
 
 export type Job = {
   id: string;
@@ -306,13 +326,31 @@ export type Job = {
   instruction: string;
   taskId: string | null;
   inboxId: string | null;
+  assistant: AssistantId;
   state: JobState;
   outcome: JobOutcome | null;
   question: string | null;
+  prompt: JobPrompt | null;
+  resultKind: JobResultKind | null;
+  resultNote: string | null;
   claimId: string | null;
   leaseUntil: Instant | null;
+  snoozedUntil: Instant | null;
+  snoozedAt: Instant | null;
+  attentionAt: Instant | null;
   createdAt: Instant;
   updatedAt: Instant;
+};
+
+// a display projection of an agent conversation; the raw API transcript stays on the server
+export type ThreadEntry = {
+  seq: number;
+  role: "owner" | "assistant";
+  kind: "message" | "question" | "answer" | "activity";
+  text: string;
+  options: string[];
+  url: string | null;
+  at: Instant;
 };
 
 export type JobUpdate = {
@@ -613,17 +651,40 @@ export function isHermesInboxUpsertInput(value: unknown): value is HermesInboxUp
     (value.draft === undefined || isReplyEnvelope(value.draft)) && isInboxProposalContext(value);
 }
 
+export function isAssistantId(value: unknown): value is AssistantId {
+  return isOneOf(value, assistantIds);
+}
+
 export function isJobInstruction(value: unknown): value is {
   idempotencyKey: string;
   title: string;
   instruction: string;
   taskId?: string | null;
   inboxId?: string | null;
+  assistant?: AssistantId;
 } {
   return isRecord(value) && isShortText(value.idempotencyKey, 200) && !/[\r\n]/.test(value.idempotencyKey) &&
     isOneLineText(value.title, 200) && isShortText(value.instruction, 2_000) &&
     (value.taskId === undefined || value.taskId === null || isShortText(value.taskId, 200)) &&
-    (value.inboxId === undefined || value.inboxId === null || isShortText(value.inboxId, 200));
+    (value.inboxId === undefined || value.inboxId === null || isShortText(value.inboxId, 200)) &&
+    (value.assistant === undefined || isAssistantId(value.assistant));
+}
+
+export function isJobPrompt(value: unknown): value is JobPrompt {
+  return isRecord(value) && value.kind === "choice" && isShortText(value.toolUseId, 200) &&
+    isShortText(value.question, 1_000) && Array.isArray(value.options) && value.options.length >= 2 &&
+    value.options.length <= 4 && value.options.every(option => isOneLineText(option, 120));
+}
+
+// Hermes answers stay one line of 280 characters; the store enforces that per assistant
+export const JOB_MESSAGE_LIMIT = 4_000;
+
+export function isJobMessageText(value: unknown): value is string {
+  return isShortText(value, JOB_MESSAGE_LIMIT);
+}
+
+export function isOneLineJobText(value: unknown): value is string {
+  return isOneLineText(value, 280);
 }
 
 export function isJobResultInput(value: unknown): value is {
@@ -638,23 +699,25 @@ export function isJobResultInput(value: unknown): value is {
     })()));
 }
 
+function isJobVersion(value: unknown): value is number {
+  return Number.isSafeInteger(value) && typeof value === "number" && value >= 1;
+}
+
 export function isJobAnswerInput(value: unknown): value is { version: number; text: string } {
-  return isRecord(value) && Number.isSafeInteger(value.version) && typeof value.version === "number" &&
-    value.version >= 1 && isOneLineText(value.text, 280);
+  return isRecord(value) && isJobVersion(value.version) && isJobMessageText(value.text);
 }
 
 export function isJobSendBackInput(value: unknown): value is { version: number; text: string } {
   return isJobAnswerInput(value);
 }
 
-export function isJobSettleInput(value: unknown): value is {
-  version: number;
-  outcome: JobOutcome;
-  taskVersion?: number;
-} {
-  return isRecord(value) && Number.isSafeInteger(value.version) && typeof value.version === "number" && value.version >= 1 &&
-    (value.outcome === "accepted" || value.outcome === "dropped") &&
-    (value.taskVersion === undefined || (
-      Number.isSafeInteger(value.taskVersion) && typeof value.taskVersion === "number" && value.taskVersion >= 1
-    ));
+// settling is a single owner action with no provider side effect
+export function isJobSettleInput(value: unknown): value is { version: number; outcome: JobOutcome } {
+  return isRecord(value) && isJobVersion(value.version) &&
+    (value.outcome === "accepted" || value.outcome === "dropped");
+}
+
+export function isJobSnoozeInput(value: unknown): value is { version: number; snoozedUntil: Instant | null } {
+  return isRecord(value) && isJobVersion(value.version) &&
+    (value.snoozedUntil === null || isIsoInstant(value.snoozedUntil));
 }

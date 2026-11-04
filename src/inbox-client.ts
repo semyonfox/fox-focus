@@ -2,10 +2,14 @@ import { apiFetch } from "./api-transport.ts";
 import { dublinDateKey, dublinDateTimeToInstant, dublinTimeValue, isDateKey } from "./calendar-time.ts";
 import { areas, isOneOf, isRecord, priorities, type Area } from "./model.ts";
 import {
+  isAssistantId,
   isBriefingRow,
+  isJobPrompt,
   isReplyEnvelope,
   isUtcInstant,
   type ActionRow,
+  type AssistantId,
+  type AssistantInfo,
   type BriefingEntry,
   type BriefingRow,
   type DraftRevision,
@@ -18,6 +22,7 @@ import {
   type ReminderRow,
   type TaskCreateInput,
   type TaskCreatePayload,
+  type ThreadEntry,
 } from "./row-model.ts";
 
 export type TaskCreateActionRow = ActionRow & { payload: TaskCreatePayload };
@@ -48,7 +53,7 @@ export type WorkRowsSnapshot = {
   actions: ActionRow[];
   reminders: ReminderRow[];
   briefings: BriefingRow[];
-  capabilities: { emailSendEnabled: boolean };
+  capabilities: { emailSendEnabled: boolean; assistants: AssistantInfo[] };
 };
 
 export type EmailSendUiState = "disabled" | "ready" | "sending" | "reconciling" | "unknown" | "failed" | "sent";
@@ -107,10 +112,18 @@ function isDraftRevision(value: unknown): value is DraftRevision {
     isReplyEnvelope(value.reply) && isUtcInstant(value.createdAt);
 }
 
+function isNullableInstant(value: unknown): boolean {
+  return value === null || isUtcInstant(value);
+}
+
 function isJob(value: unknown): value is Job {
   return isRecord(value) && typeof value.id === "string" && isPositiveVersion(value.version) &&
     isOneLine(value.title, 200) && typeof value.instruction === "string" && value.instruction.length <= 2_000 &&
-    isNullableString(value.taskId) && isNullableString(value.inboxId) &&
+    isNullableString(value.taskId) && isNullableString(value.inboxId) && isAssistantId(value.assistant) &&
+    (value.prompt === null || isJobPrompt(value.prompt)) &&
+    (value.resultKind === null || value.resultKind === "complete" || value.resultKind === "failed") &&
+    isNullableString(value.resultNote) && isNullableInstant(value.snoozedUntil) &&
+    isNullableInstant(value.snoozedAt) && isNullableInstant(value.attentionAt) &&
     ["queued", "working", "needs_you", "review", "settled"].includes(String(value.state)) &&
     (value.outcome === null || value.outcome === "accepted" || value.outcome === "dropped") &&
     (value.question === null || isOneLine(value.question, 280)) && isNullableString(value.claimId) &&
@@ -308,7 +321,8 @@ export function parseWorkRows(value: unknown): WorkRowsSnapshot {
     !Array.isArray(value.jobUpdates) || !value.jobUpdates.every(isJobUpdate) ||
     !Array.isArray(value.reminders) || !value.reminders.every(isReminderRow) ||
     !Array.isArray(value.briefings) || !value.briefings.every(isBriefingRow) || !isRecord(value.capabilities) ||
-    typeof value.capabilities.emailSendEnabled !== "boolean") {
+    typeof value.capabilities.emailSendEnabled !== "boolean" || !Array.isArray(value.capabilities.assistants) ||
+    !value.capabilities.assistants.every(isAssistantInfo)) {
     throw new Error("Could not load Inbox rows");
   }
   return {
@@ -319,8 +333,29 @@ export function parseWorkRows(value: unknown): WorkRowsSnapshot {
     actions: value.actions,
     reminders: value.reminders,
     briefings: value.briefings,
-    capabilities: { emailSendEnabled: value.capabilities.emailSendEnabled },
+    capabilities: { emailSendEnabled: value.capabilities.emailSendEnabled, assistants: value.capabilities.assistants },
   };
+}
+
+function isAssistantInfo(value: unknown): value is AssistantInfo {
+  return isRecord(value) && isAssistantId(value.id) && typeof value.name === "string" && typeof value.role === "string" &&
+    (value.engine === "claude" || value.engine === "hermes") && typeof value.available === "boolean";
+}
+
+function isThreadEntry(value: unknown): value is ThreadEntry {
+  return isRecord(value) && typeof value.seq === "number" && (value.role === "owner" || value.role === "assistant") &&
+    (value.kind === "message" || value.kind === "question" || value.kind === "answer" || value.kind === "activity") &&
+    typeof value.text === "string" && Array.isArray(value.options) && value.options.every(option => typeof option === "string") &&
+    (value.url === null || isSafeResultUrl(value.url)) && isUtcInstant(value.at);
+}
+
+export async function loadJobThread(jobId: string, signal?: AbortSignal): Promise<ThreadEntry[]> {
+  const response = await apiFetch(`/api/v1/jobs/${encodeURIComponent(jobId)}/thread`, { cache: "no-store", signal });
+  const value: unknown = await response.json();
+  if (!response.ok || !isRecord(value) || !Array.isArray(value.entries) || !value.entries.every(isThreadEntry)) {
+    throw new Error("Could not load the thread");
+  }
+  return value.entries;
 }
 
 async function request(path: string, method: "POST" | "PUT", body: unknown): Promise<unknown> {
@@ -394,6 +429,7 @@ export async function createJob(input: {
   instruction: string;
   taskId?: string;
   inboxId?: string;
+  assistant?: AssistantId;
 }): Promise<Job> {
   const value = await request("/api/v1/jobs", "POST", {
     idempotencyKey: input.idempotencyKey,
@@ -401,6 +437,7 @@ export async function createJob(input: {
     instruction: input.instruction,
     taskId: input.taskId ?? null,
     inboxId: input.inboxId ?? null,
+    ...(input.assistant ? { assistant: input.assistant } : {}),
   });
   if (!isRecord(value) || !isJob(value.job)) throw new Error("The queued job response was invalid");
   return value.job;
@@ -414,10 +451,10 @@ export async function sendBackJob(job: Job, text: string): Promise<unknown> {
   return request(`/api/v1/jobs/${encodeURIComponent(job.id)}/send-back`, "POST", { version: job.version, text });
 }
 
-export async function settleJob(job: Job, outcome: JobOutcome, taskVersion?: number): Promise<unknown> {
-  return request(`/api/v1/jobs/${encodeURIComponent(job.id)}/settle`, "POST", {
-    version: job.version,
-    outcome,
-    ...(taskVersion === undefined ? {} : { taskVersion }),
-  });
+export async function settleJob(job: Job, outcome: JobOutcome): Promise<unknown> {
+  return request(`/api/v1/jobs/${encodeURIComponent(job.id)}/settle`, "POST", { version: job.version, outcome });
+}
+
+export async function snoozeJob(job: Job, snoozedUntil: string | null): Promise<unknown> {
+  return request(`/api/v1/jobs/${encodeURIComponent(job.id)}/snooze`, "POST", { version: job.version, snoozedUntil });
 }

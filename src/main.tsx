@@ -64,6 +64,7 @@ import {
   dublinInstantLocalValue,
   dublinLocalReminderInstant,
   isTaskCreateActionRow,
+  loadJobThread,
   loadTaskDestinations,
   loadWorkRows,
   mergeWorkRows,
@@ -71,6 +72,7 @@ import {
   saveOwnerDraft,
   sendBackJob,
   settleJob,
+  snoozeJob,
   taskCreateConflictCandidates,
   type TaskCreateActionRow,
   type TaskDestination,
@@ -88,11 +90,15 @@ import {
   type TaskRowsSnapshot,
   type TaskStatusActionRow,
 } from "./row-client.ts";
-import type { ActionRow, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow } from "./row-model.ts";
+import type { ActionRow, AssistantId, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow, ThreadEntry } from "./row-model.ts";
+import { ThreadBoard, ThreadSidebar, type AssistantFilter } from "./thread-sidebar.tsx";
+import { ThreadView, hermesThreadEntries } from "./thread-view.tsx";
+import { AssistantsPage } from "./assistants-page.tsx";
 import {
   buildWorkThreads,
   inboxSourceLabel,
   inboxStateLabel,
+  isRoutineMirror,
   jobStateLabel,
   latestSendActions,
   relativeTime,
@@ -125,6 +131,12 @@ function loadTheme(): ResolvedTheme {
     // use the system preference when storage is restricted
   }
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "black" : "light";
+}
+
+// a thread title is the first line of the request, kept to one short line
+function threadTitleFrom(text: string): string {
+  const line = text.trim().split(/\r?\n/)[0]?.replace(/\s+/g, " ") ?? "";
+  return line.length <= 80 ? line || "New thread" : `${line.slice(0, 79)}…`;
 }
 
 function makeId(prefix: string): string {
@@ -263,7 +275,7 @@ type WorkspaceView = Exclude<SectionAnchor, "signals">;
 function workspaceViewFromLocation(): WorkspaceView {
   if (typeof window === "undefined") return "today";
   const value = window.location.hash.slice(1);
-  return value === "agenda" || value === "tasks" || value === "review" ? value : "today";
+  return value === "agenda" || value === "tasks" || value === "review" || value === "assistants" ? value : "today";
 }
 
 function taskSortLabel(sort: TaskSort): string {
@@ -756,7 +768,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [settledOpen, setSettledOpen] = useState(false);
   const [noiseOpen, setNoiseOpen] = useState(false);
   const [workBusyKey, setWorkBusyKey] = useState<string | null>(null);
-  const [jobComposer, setJobComposer] = useState<{ idempotencyKey: string; title: string; taskId?: string; inboxId?: string; context?: string } | null>(null);
+  const [jobComposer, setJobComposer] = useState<{ idempotencyKey: string; title: string; taskId?: string; inboxId?: string; context?: string; assistant: AssistantId } | null>(null);
+  const [assistantFilter, setAssistantFilter] = useState<AssistantFilter>("all");
+  const [inboxBoard, setInboxBoard] = useState(false);
+  const [snoozedOpen, setSnoozedOpen] = useState(false);
+  const [threadSearch, setThreadSearch] = useState("");
+  const [threadEntries, setThreadEntries] = useState<Record<string, { stamp: string; entries: ThreadEntry[] }>>({});
+  const [selectedAssistant, setSelectedAssistant] = useState<AssistantId>("fox");
   const [jobInstruction, setJobInstruction] = useState("");
   const [jobReply, setJobReply] = useState("");
   const [editingReply, setEditingReply] = useState<{ inboxId: string; inboxVersion: number; reply: ReplyEnvelope } | null>(null);
@@ -1009,7 +1027,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   useEffect(() => {
     const wasOpen = workDetailWasOpen.current;
     workDetailWasOpen.current = workDetailOpen;
-    if (activeSection !== "review" || !workControlsOpen || !narrowInbox) return;
+    if (activeSection !== "review" || !initial || !narrowInbox) return;
     const frame = window.requestAnimationFrame(() => {
       if (workDetailOpen) {
         workDetailHeadingRef.current?.focus({ preventScroll: true });
@@ -1022,7 +1040,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeSection, selectedWorkKey, workDetailOpen, workControlsOpen, narrowInbox]);
+  }, [activeSection, selectedWorkKey, workDetailOpen, initial, narrowInbox]);
 
   // Match the dialog paint order so reminders and drawer transitions keep focus.
   const activeOverlay = showIntegrations ? "integrations"
@@ -1422,22 +1440,41 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     () => buildWorkThreads(workRows?.inbox ?? [], workRows?.jobs ?? [], latestSendActionByInbox),
     [latestSendActionByInbox, workRows?.inbox, workRows?.jobs],
   );
-  const needsYouThreads = workThreads.filter((thread) => thread.group === "needs_you");
-  const workingThreads = workThreads.filter((thread) => thread.group === "working");
-  const settledThreads = workThreads.filter((thread) => thread.group === "settled");
-  const noiseThreads = workThreads.filter((thread) => thread.group === "noise");
-  const selectedWorkThread = workThreads.find((thread) => thread.key === selectedWorkKey) ??
-    needsYouThreads[0] ?? workingThreads[0] ?? (noiseOpen ? noiseThreads[0] : null) ??
-    (settledOpen ? settledThreads[0] : null) ?? null;
+  const routineMirrors = useMemo(() => (workRows?.inbox ?? []).filter(isRoutineMirror), [workRows?.inbox]);
+  const filteredThreads = workThreads.filter((thread) => assistantFilter === "all" || thread.assistant === assistantFilter);
+  const activeThreads = filteredThreads.filter((thread) => thread.shelf === "active");
+  const needsYouThreads = activeThreads.filter((thread) => thread.attention);
+  const workingThreads = activeThreads.filter((thread) => !thread.attention);
+  const snoozedThreads = filteredThreads.filter((thread) => thread.shelf === "snoozed");
+  const settledThreads = filteredThreads.filter((thread) => thread.shelf === "settled")
+    .sort((first, second) => second.updatedAt.localeCompare(first.updatedAt));
+  const noiseThreads = filteredThreads.filter((thread) => thread.shelf === "noise");
+  const selectedWorkThread = workThreads.find((thread) => thread.key === selectedWorkKey) ?? activeThreads[0] ?? null;
+  // keyboard order matches the sidebar: active threads, then any open shelves
   const visibleWorkThreads = [
-    ...needsYouThreads,
-    ...workingThreads,
-    ...(noiseOpen ? noiseThreads : []),
+    ...activeThreads,
+    ...(snoozedOpen ? snoozedThreads : []),
     ...(settledOpen ? settledThreads : []),
+    ...(noiseOpen ? noiseThreads : []),
   ];
   const selectedWorkIndex = selectedWorkThread
     ? visibleWorkThreads.findIndex((thread) => thread.key === selectedWorkThread.key)
     : -1;
+  // Fox transcripts load on demand; a new job version means the agent or owner moved the thread on
+  const foxThreadStamps = useMemo(() => (workRows?.jobs ?? [])
+    .filter(job => job.assistant === "fox" && (job.state !== "settled" || job.id === selectedWorkThread?.job?.id))
+    .map(job => ({ id: job.id, stamp: `${job.version}:${job.updatedAt}` })), [selectedWorkThread?.job?.id, workRows?.jobs]);
+  const threadLoads = useRef(new Set<string>());
+  useEffect(() => {
+    for (const { id, stamp } of foxThreadStamps) {
+      const key = `${id}:${stamp}`;
+      if (threadEntries[id]?.stamp === stamp || threadLoads.current.has(key)) continue;
+      threadLoads.current.add(key);
+      loadJobThread(id).then(entries => {
+        setThreadEntries(current => ({ ...current, [id]: { stamp, entries } }));
+      }).catch(() => { /* the next rows refresh retries */ }).finally(() => threadLoads.current.delete(key));
+    }
+  }, [foxThreadStamps, threadEntries]);
   const selectedWorkItem = selectedWorkThread?.item ?? null;
   const selectedWorkJob = selectedWorkThread?.job ?? null;
   const selectedWorkDraft = selectedWorkItem ? draftByInboxId.get(selectedWorkItem.id) ?? null : null;
@@ -1576,7 +1613,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       : []).filter(task => matchesTitle(task.title) && (!taskDueDay || task.dueOn === taskDueDay));
 
   const reminderCount = activeReminders.length;
-  const reviewCount = inboxItems.filter(item => item.status !== "handled" && inboxLane(item) === "review").length;
+  const reviewCount = initial && workRows
+    ? workThreads.filter(thread => thread.attention).length
+    : inboxItems.filter(item => item.status !== "handled" && inboxLane(item) === "review").length;
   const automationCount = inboxItems.filter(item => item.status !== "handled" && inboxLane(item) === "automation").length;
   const plannedTaskCount = activeTasks.filter((task) => Boolean(task.scheduledTime || task.scheduledDate ||
     (task.linkedEventId && eventById.has(task.linkedEventId)))).length +
@@ -2569,7 +2608,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function openJobComposer(
-    input: { title: string; taskId?: string; inboxId?: string; context?: string },
+    input: { title: string; taskId?: string; inboxId?: string; context?: string; assistant?: AssistantId },
     initialInstruction = "",
   ) {
     const existing = (workRows?.jobs ?? []).find((job) => job.state !== "settled" && (
@@ -2586,7 +2625,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       return;
     }
     setEditingHermesTaskId(null);
-    setJobComposer({ ...input, idempotencyKey: makeId("job-request") });
+    // linked email and task requests stay with Hermes, which holds the mail and task context
+    const foxAvailable = workRows?.capabilities.assistants.some(assistant => assistant.id === "fox" && assistant.available) === true;
+    const assistant = input.assistant ?? (input.inboxId || input.taskId || !foxAvailable ? "hermes" : "fox");
+    setJobComposer({ ...input, assistant, idempotencyKey: makeId("job-request") });
     setJobInstruction(initialInstruction);
     setModalError("");
     setModal(null);
@@ -2614,8 +2656,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   async function submitJob(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!jobComposer || !jobComposer.title.trim() || !jobInstruction.trim()) {
-      setModalError("Add a one-line title and short instruction for Hermes.");
+    if (!jobComposer || !jobInstruction.trim()) {
+      setModalError("Write the request first.");
       return;
     }
     const context = jobComposer.context?.trim();
@@ -2629,10 +2671,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     try {
       const job = await createJob({
         idempotencyKey: jobComposer.idempotencyKey,
-        title: jobComposer.title.trim(),
+        title: jobComposer.title.trim() || threadTitleFrom(jobInstruction),
         instruction,
         taskId: jobComposer.taskId,
         inboxId: jobComposer.inboxId,
+        assistant: jobComposer.assistant,
       });
       setWorkRows((current) => mergeWorkRows(current, {
         inbox: [],
@@ -2642,10 +2685,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         actions: [],
         reminders: [],
         briefings: [],
-        capabilities: current?.capabilities ?? { emailSendEnabled: false },
+        capabilities: current?.capabilities ?? { emailSendEnabled: false, assistants: [] },
       }));
       setJobComposer(null);
-      setStatusMessage("Queued for Hermes. It will show as Working when claimed.");
+      setSelectedWorkKey(job.inboxId && !job.taskId ? `inbox:${job.inboxId}` : `job:${job.id}`);
+      setStatusMessage(job.assistant === "fox" ? "Sent to Fox." : "Queued for Hermes. It will show as Working when claimed.");
       try { await refreshRowSnapshots(); } catch { setWorkRowsError(true); }
     } catch (error) {
       setModalError(error instanceof Error ? error.message : "The job could not be queued.");
@@ -2674,34 +2718,95 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setJobReply("");
   }
 
-  function settleSelectedJob(job: Job, outcome: "accepted" | "dropped") {
-    const task = job.taskId ? taskRowById.get(job.taskId) : undefined;
-    if (outcome === "accepted" && !canAcceptJob(job)) {
-      setStatusMessage("The linked Google task is not ready for completion.");
-      return;
-    }
-    const threadKey = selectedWorkThread?.job?.id === job.id
+  function threadKeyForJob(job: Job): string {
+    return selectedWorkThread?.job?.id === job.id
       ? selectedWorkThread.key
       : job.inboxId && !job.taskId && inboxRowById.has(job.inboxId)
         ? `inbox:${job.inboxId}`
         : `job:${job.id}`;
-    void runWorkMutation(threadKey, () => settleJob(job, outcome, outcome === "accepted" ? task?.version : undefined),
-      outcome === "accepted" ? "Accepted the result." : "Dropped the job.").then((settled) => {
+  }
+
+  // settle is a single "done and dealt with" action; it never completes the linked Google task
+  function settleSelectedJob(job: Job, outcome: "accepted" | "dropped") {
+    const threadKey = threadKeyForJob(job);
+    void runWorkMutation(threadKey, () => settleJob(job, outcome), outcome === "accepted" ? "Settled." : "Dropped.").then((settled) => {
       if (settled) chooseNextWorkThread(threadKey);
     });
   }
 
-  function canAcceptJob(job: Job): boolean {
-    if (!job.taskId) return true;
-    const task = taskRowById.get(job.taskId);
-    if (!task?.observed) return false;
-    const runningStatusAction = (taskRows?.actions ?? []).some((action) => action.state === "running" &&
-      action.payload.kind === "task-status" && action.payload.taskId === task.id);
-    if (runningStatusAction) return false;
-    const queuedReopen = (taskRows?.actions ?? []).some((action) => action.payload.taskId === task.id &&
-      action.payload.after === "open" && (action.state === "queued" || action.state === "failed"));
-    if (task.observed.status === "completed" && !queuedReopen) return true;
-    return task.binding.kind === "google" && task.observed.completionWritable && task.unavailableAt === null;
+  function settleThread(thread: WorkThread) {
+    if (thread.job) {
+      if (thread.job.state === "review") settleSelectedJob(thread.job, "accepted");
+      return;
+    }
+    const item = thread.item;
+    if (!item || !canMutateInboxItem(item)) return;
+    chooseNextWorkThread(thread.key);
+    void runWorkMutation(thread.key, () => decideInboxItem(item, { state: "resolved", outcome: "read", snoozedUntil: null }), "Settled.");
+  }
+
+  function snoozeThread(thread: WorkThread, until: string | null) {
+    const job = thread.job;
+    if (job) {
+      void runWorkMutation(thread.key, () => snoozeJob(job, until), until ? "Snoozed." : "Woken.");
+      return;
+    }
+    const item = thread.item;
+    if (!item || !canMutateInboxItem(item)) return;
+    void runWorkMutation(thread.key, () => decideInboxItem(item, until
+      ? { state: "waiting", outcome: null, snoozedUntil: until }
+      : { state: "open", outcome: null, snoozedUntil: null }), until ? "Snoozed." : "Woken.");
+  }
+
+  function canSettleThread(thread: WorkThread): boolean {
+    if (thread.job) return thread.job.state === "review";
+    return thread.item ? thread.shelf !== "settled" && canMutateInboxItem(thread.item) : false;
+  }
+
+  function canSnoozeThread(thread: WorkThread): boolean {
+    if (thread.job) return thread.job.state !== "settled";
+    return thread.item ? thread.shelf !== "settled" && canMutateInboxItem(thread.item) : false;
+  }
+
+  function answerThreadJob(job: Job, text: string) {
+    void runWorkMutation(`job:${job.id}`, () => answerJob(job, text), job.assistant === "fox" ? "Answer sent to Fox." : "Answer sent to Hermes.");
+  }
+
+  function replyThreadJob(job: Job, text: string) {
+    void runWorkMutation(`job:${job.id}`, () => sendBackJob(job, text), job.assistant === "fox" ? "Sent to Fox." : "Sent back to Hermes.");
+  }
+
+  async function startAssistantThread(assistant: AssistantId, text: string): Promise<boolean> {
+    if (workBusyKey) return false;
+    setWorkBusyKey("job:create");
+    setStatusMessage("");
+    try {
+      const job = await createJob({ idempotencyKey: makeId("job-request"), title: threadTitleFrom(text), instruction: text, assistant });
+      setWorkRows((current) => mergeWorkRows(current, {
+        inbox: [], drafts: [], jobs: [job], jobUpdates: [], actions: [], reminders: [], briefings: [],
+        capabilities: current?.capabilities ?? { emailSendEnabled: false, assistants: [] },
+      }));
+      setStatusMessage(assistant === "fox" ? "Sent to Fox." : "Queued for Hermes.");
+      try { await refreshRowSnapshots(); } catch { setWorkRowsError(true); }
+      return true;
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "The thread could not be started.");
+      return false;
+    } finally {
+      setWorkBusyKey(null);
+    }
+  }
+
+  function threadContextLabel(thread: WorkThread): string {
+    if (thread.item) return thread.item.source.kind === "email" ? `Email · ${thread.item.title}` : thread.source;
+    const job = thread.job;
+    if (job?.taskId) return `Task · ${taskById.get(job.taskId)?.title ?? "linked task"}`;
+    return job?.assistant === "fox" ? "Chat" : "Request";
+  }
+
+  function entriesForJob(job: Job): ThreadEntry[] | null {
+    if (job.assistant === "hermes") return hermesThreadEntries(job, (workRows?.jobUpdates ?? []).filter(update => update.jobId === job.id));
+    return threadEntries[job.id]?.entries ?? null;
   }
 
   function selectInbox(item: InboxItem) {
@@ -2802,11 +2907,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   useEffect(() => {
     const onInboxKeyDown = (event: KeyboardEvent) => {
-      if (activeSection !== "review" || !workControlsOpen || isOverlayOpen || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (activeSection !== "review" || !initial || isOverlayOpen || event.metaKey || event.ctrlKey || event.altKey) return;
       if (!(event.target instanceof HTMLElement) || !event.target.closest(".work-inbox") || event.target.isContentEditable ||
         event.target.closest("input, textarea, select, [contenteditable='true']")) return;
-      if (!event.target.closest(".work-thread")) return;
-      const focusedKey = event.target.closest<HTMLElement>(".work-thread")?.dataset.threadKey;
+      if (!event.target.closest(".thread-row-main")) return;
+      const focusedKey = event.target.closest<HTMLElement>(".thread-row-main")?.dataset.threadKey;
       const thread = selectedWorkThread;
       if (event.key === "j" || event.key === "k") {
         event.preventDefault();
@@ -2824,9 +2929,9 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       } else if (event.key === "x" && canAct && item) {
         event.preventDefault();
         dismissWorkItem(item);
-      } else if (event.key === "a" && job?.state === "review" && workBusyKey === null) {
+      } else if (event.key === "e" && canSettleThread(thread) && workBusyKey === null) {
         event.preventDefault();
-        settleSelectedJob(job, "accepted");
+        settleThread(thread);
       } else if (event.key === "b" && job?.state === "review" && workBusyKey === null) {
         event.preventDefault();
         document.getElementById("job-reply")?.focus();
@@ -3206,51 +3311,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   }
 
   function renderWorkInboxView() {
-    function renderThread(thread: WorkThread) {
-      const sendState = thread.item
-        ? emailSendUiState(
-            thread.item,
-            draftByInboxId.get(thread.item.id),
-            latestSendActionByInbox.get(thread.item.id),
-            workRows?.capabilities.emailSendEnabled ?? false,
-          )
-        : "disabled";
-      const state = thread.job ? jobStateLabel(thread.job) : thread.item ? inboxStateLabel(thread.item, sendState) : "";
-      return <button
-        className={`work-thread${selectedWorkThread?.key === thread.key ? " work-thread--selected" : ""}`}
-        data-thread-key={thread.key}
-        ref={(element) => {
-          if (element) workThreadRefs.current.set(thread.key, element);
-          else workThreadRefs.current.delete(thread.key);
-        }}
-        type="button"
-        aria-pressed={selectedWorkThread?.key === thread.key}
-        key={thread.key}
-        onClick={() => selectWorkThread(thread)}
-      >
-        <i className={`inbox-thread-dot inbox-thread-dot--${thread.group}`} />
-        <span className="work-thread-copy"><strong>{thread.title}</strong><small>{thread.source}</small></span>
-        <span className="work-thread-tail"><small>{relativeTime(thread.updatedAt)}</small><em>{state}</em></span>
-      </button>;
-    }
-
-    function renderAlwaysOpenGroup(label: string, threads: WorkThread[]) {
-      return <section className="work-thread-group" aria-label={label}>
-        <header><strong>{label}</strong><span>{threads.length}</span></header>
-        {threads.map(renderThread)}
-      </section>;
-    }
-
-    function renderCollapsibleGroup(label: string, threads: WorkThread[], open: boolean, setOpen: (open: boolean) => void) {
-      if (!threads.length) return null;
-      return <section className="work-thread-group work-thread-group--collapsed" aria-label={label}>
-        <button className="work-thread-group-toggle" type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
-          <ChevronDown size={12} /><strong>{label}</strong><span>{threads.length}</span>
-        </button>
-        {open ? threads.map(renderThread) : null}
-      </section>;
-    }
-
     const actionItem = selectedWorkThread?.kind === "inbox" ? selectedWorkItem : null;
     const problemSend = selectedWorkItem ? problemSendInboxIds.has(selectedWorkItem.id) : false;
     const sendState = selectedWorkItem
@@ -3279,23 +3339,45 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           : sendState === "failed"
             ? "Send failed"
             : "Send";
-    const linkedJobTaskUnavailable = selectedWorkJob ? !canAcceptJob(selectedWorkJob) : false;
+
+    const sidebar = <ThreadSidebar
+      threads={workThreads}
+      assistants={workRows?.capabilities.assistants ?? []}
+      filter={assistantFilter}
+      onFilter={setAssistantFilter}
+      selectedKey={inboxBoard ? null : selectedWorkThread?.key ?? null}
+      view={inboxBoard ? "board" : "threads"}
+      onView={view => setInboxBoard(view === "board")}
+      onSelect={thread => { setInboxBoard(false); selectWorkThread(thread); }}
+      onSettle={settleThread}
+      onSnooze={snoozeThread}
+      canSettle={canSettleThread}
+      canSnooze={canSnoozeThread}
+      contextLabel={threadContextLabel}
+      onNewThread={() => openJobComposer({ title: "" })}
+      shelves={{ snoozed: snoozedOpen, settled: settledOpen, noise: noiseOpen }}
+      onShelf={shelf => shelf === "snoozed" ? setSnoozedOpen(open => !open) : shelf === "settled" ? setSettledOpen(open => !open) : setNoiseOpen(open => !open)}
+      search={threadSearch}
+      onSearch={setThreadSearch}
+      rowRef={(key, element) => { if (element) workThreadRefs.current.set(key, element); else workThreadRefs.current.delete(key); }}
+    />;
+    const threadJob = selectedWorkThread?.job && !selectedWorkThread.item ? selectedWorkThread.job : null;
 
     return <section className="workspace-page workspace-page--review" aria-labelledby="review-heading">
-      <header className="workspace-heading"><div><p className="eyebrow">Forward and back</p><h1 id="review-heading">Inbox</h1></div><span className="review-page-count">{reviewCount ? `${reviewCount} ${reviewCount === 1 ? "needs" : "need"} you` : "Clear"}</span></header>
-      <article className="pane review-workspace work-inbox">
-        {renderInboxLanes()}
-        {workRowsError ? <p className="task-sync-note task-sync-note--warning" role="alert"><RefreshCw size={13} /> {workRows ? "Inbox could not refresh. Showing the last loaded state." : "Inbox could not load."} <button type="button" className="mini-action" onClick={() => setRowsRetry(value => value + 1)}>Retry Inbox reads</button></p> : null}
-        <div className={`review-workbench${workDetailOpen ? " review-workbench--detail" : ""}`}>
-          <aside className="work-thread-list" aria-label="Inbox threads" ref={workThreadListRef} tabIndex={-1}>
-            {renderAlwaysOpenGroup("Needs you", needsYouThreads)}
-            {renderAlwaysOpenGroup("Working", workingThreads)}
-            {renderCollapsibleGroup("Likely noise", noiseThreads, noiseOpen, setNoiseOpen)}
-            {renderCollapsibleGroup("Settled", settledThreads, settledOpen, setSettledOpen)}
-            {!workThreads.length && workRows ? <p className="empty-line">Inbox is clear.</p> : null}
-            {!workRows && !workRowsError ? <p className="empty-line" role="status">Loading Inbox…</p> : null}
-          </aside>
-          {selectedWorkThread ? <section className="work-thread-detail" aria-label={selectedWorkThread.title}>
+      <h1 id="review-heading" className="sr-only">Inbox</h1>
+      <article className="pane review-workspace work-inbox thread-inbox">
+        {workRowsError ? <p className="task-sync-note task-sync-note--warning" role="alert"><RefreshCw size={13} /> {workRows ? "Inbox could not refresh. Showing the last loaded state." : "Inbox could not load."} <button type="button" className="mini-action" onClick={() => setRowsRetry(value => value + 1)}>Retry</button></p> : null}
+        <div className={`review-workbench thread-workbench${workDetailOpen ? " review-workbench--detail" : ""}${inboxBoard ? " thread-workbench--board" : ""}`}>
+          {sidebar}
+          {inboxBoard ? <ThreadBoard threads={workThreads} filter={assistantFilter} contextLabel={threadContextLabel}
+            onOpen={thread => { setInboxBoard(false); selectWorkThread(thread); }} />
+          : threadJob ? <div className="work-thread-detail thread-detail">
+            <button className="work-inbox-back" type="button" onClick={() => setWorkDetailOpen(false)}><ChevronLeft size={16} /> Inbox</button>
+            <ThreadView key={threadJob.id} job={threadJob} entries={entriesForJob(threadJob)} busy={workBusyKey !== null}
+              onAnswer={text => answerThreadJob(threadJob, text)} onReply={text => replyThreadJob(threadJob, text)}
+              onSettle={() => settleSelectedJob(threadJob, "accepted")} onSnooze={until => selectedWorkThread && snoozeThread(selectedWorkThread, until)} />
+          </div>
+          : selectedWorkThread ? <section className="work-thread-detail" aria-label={selectedWorkThread.title}>
             <div className="review-queue-nav">
               <button className="work-inbox-back" type="button" onClick={() => setWorkDetailOpen(false)}><ChevronLeft size={16} /> Inbox</button>
               <span>{selectedWorkIndex >= 0 ? `${selectedWorkIndex + 1} of ${visibleWorkThreads.length}` : detailState}</span>
@@ -3340,12 +3422,13 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               {actionItem && !selectedWorkJob && actionItem.state !== "resolved" ? <>
                 {itemShowsSendAction ? <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} onClick={() => sendWorkItem(actionItem)}><Send size={12} /> {sendButtonLabel}</button> : null}
                 <button className={itemShowsSendAction ? "secondary-action" : "page-primary-action"} type="button" disabled={!itemCanAskHermes} onClick={() => openJobComposer({ title: actionItem.title, inboxId: actionItem.id })}><MessageSquare size={13} /> Ask Hermes <kbd>h</kbd></button>
+                <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => selectedWorkThread && settleThread(selectedWorkThread)}><Check size={13} /> Settle <kbd>e</kbd></button>
                 <button className="secondary-action" type="button" disabled={!itemCanAct} onClick={() => dismissWorkItem(actionItem)}><X size={13} /> Dismiss <kbd>x</kbd></button>
               </> : null}
               {selectedWorkJob?.state === "review" ? <>
                 {selectedWorkItem?.source.kind === "email" && selectedWorkDraft && sendState !== "disabled" ? <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} onClick={() => sendWorkItem(selectedWorkItem)}><Send size={12} /> {sendButtonLabel}</button> : null}
                 {selectedWorkItem && !selectedWorkItem.taskId ? <button className="secondary-action" type="button" disabled={jobBusy} onClick={() => openTaskComposer(undefined, undefined, selectedWorkItem)}><ListTodo size={12} /> Review task</button> : null}
-                <button className={selectedWorkJob.taskId ? "page-primary-action" : "secondary-action"} type="button" disabled={jobBusy || linkedJobTaskUnavailable} title={linkedJobTaskUnavailable ? "The linked Google task is not ready" : undefined} onClick={() => settleSelectedJob(selectedWorkJob, "accepted")}><Check size={12} /> {selectedWorkJob.taskId ? "Accept & complete" : "Accept result"} <kbd>a</kbd></button>
+                <button className="secondary-action" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "accepted")}><Check size={12} /> Settle <kbd>e</kbd></button>
                 <button className="danger-button" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "dropped")}><Trash2 size={12} /> Drop</button>
               </> : null}
             </footer>
@@ -3355,10 +3438,35 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     </section>;
   }
 
+  function renderAssistantsView() {
+    if (!initial || !workRows) {
+      return <section className="workspace-page assistants-page" aria-labelledby="assistants-heading">
+        <h1 id="assistants-heading">Assistants</h1>
+        <p className="empty-line">{initial ? workRowsError ? "Assistants could not load." : "Loading assistants…" : "Assistants need the Fox Focus server."}</p>
+      </section>;
+    }
+    return <AssistantsPage
+      assistants={workRows.capabilities.assistants}
+      threads={workThreads}
+      routines={routineMirrors}
+      selected={selectedAssistant}
+      onSelect={setSelectedAssistant}
+      entriesFor={entriesForJob}
+      busyKey={workBusyKey}
+      onStart={startAssistantThread}
+      onAnswer={answerThreadJob}
+      onReply={replyThreadJob}
+      onSettle={job => settleSelectedJob(job, "accepted")}
+      onSnooze={(job, until) => { void runWorkMutation(`job:${job.id}`, () => snoozeJob(job, until), until ? "Snoozed." : "Woken."); }}
+      onOpenThread={thread => { selectWorkThread(thread); openWorkspaceView("review"); }}
+    />;
+  }
+
   function renderWorkspaceView() {
     if (activeSection === "agenda") return renderCalendarView();
     if (activeSection === "tasks") return renderTasksView();
-    if (activeSection === "review") return initial && workControlsOpen ? renderWorkInboxView() : renderLegacyReviewView();
+    if (activeSection === "review") return initial ? renderWorkInboxView() : renderLegacyReviewView();
+    if (activeSection === "assistants") return renderAssistantsView();
     return renderTodayView();
   }
 
@@ -3428,6 +3536,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           <button className={activeSection === "agenda" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "agenda" ? "page" : undefined} onClick={() => openWorkspaceView("agenda")}><CalendarDays size={14} /><span>Calendar</span></button>
           <button className={activeSection === "tasks" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "tasks" ? "page" : undefined} onClick={() => openWorkspaceView("tasks")}><ListTodo size={14} /><span>Tasks</span></button>
           <button className={activeSection === "review" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "review" ? "page" : undefined} onClick={() => { setInboxView("review"); setWorkControlsOpen(false); setWorkDetailOpen(false); openWorkspaceView("review"); }}><Inbox size={14} /><span>Inbox</span>{reviewCount ? <b>{reviewCount}</b> : null}</button>
+          <button className={activeSection === "assistants" ? "workspace-nav-item workspace-nav-item--active" : "workspace-nav-item"} type="button" aria-current={activeSection === "assistants" ? "page" : undefined} onClick={() => openWorkspaceView("assistants")}><Bot size={14} /><span>Assistants</span></button>
         </nav>
         <div className="command-actions">
           <button className="quiet-action notification-action" type="button" onClick={() => setShowReminderTray(true)} aria-label={`Open ${reminderCount} reminders`}><Bell size={15} />{reminderCount ? <b>{reminderCount}</b> : null}<span>Reminders</span></button>
@@ -3533,21 +3642,26 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       ) : null}
 
       {jobComposer ? (
-        <DialogFrame title="Ask Hermes" onClose={() => setJobComposer(null)} className="editor-dialog--job">
+        <DialogFrame title={jobComposer.assistant === "fox" ? "Ask Fox" : "Ask Hermes"} onClose={() => setJobComposer(null)} className="editor-dialog--job">
           <form onSubmit={submitJob}>
             <div className="editor-heading">
               <div className="composer-icon"><MessageSquare size={17} /></div>
-              <div><p className="eyebrow">Hermes request</p><h2>What should Hermes do?</h2></div>
+              <div><p className="eyebrow">New thread</p><h2>What should {jobComposer.assistant === "fox" ? "Fox" : "Hermes"} do?</h2></div>
               <button className="close-composer" type="button" onClick={() => setJobComposer(null)} aria-label="Close job editor"><X size={17} /></button>
             </div>
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
             <div className="editor-grid">
-              <label className="field field--full"><span>Title</span><input required value={jobComposer.title} maxLength={200} onChange={(event) => setJobComposer((current) => current ? { ...current, title: event.target.value } : current)} /></label>
+              {!jobComposer.inboxId && !jobComposer.taskId ? <div className="field field--full job-assistant-choice" role="radiogroup" aria-label="Assistant">
+                {(workRows?.capabilities.assistants ?? []).map(assistant => <button key={assistant.id} type="button" role="radio" aria-checked={jobComposer.assistant === assistant.id}
+                  className={jobComposer.assistant === assistant.id ? "secondary-action secondary-action--selected" : "secondary-action"} disabled={!assistant.available}
+                  onClick={() => setJobComposer((current) => current ? { ...current, assistant: assistant.id } : current)}>{assistant.name}</button>)}
+              </div> : null}
+              <label className="field field--full"><span>Title</span><input value={jobComposer.title} maxLength={200} placeholder="Optional. The first line is used." onChange={(event) => setJobComposer((current) => current ? { ...current, title: event.target.value } : current)} /></label>
               {jobComposer.context ? <p className="job-composer-context">{jobComposer.context}</p> : null}
               <div className="job-prompt-presets" role="group" aria-label="Suggested requests">{jobPromptPresets.map(([label, instruction]) => <button className="secondary-action" type="button" key={label} onClick={() => setJobInstruction(instruction)}>{label}</button>)}</div>
               <label className="field field--full"><span>Request</span><textarea data-autofocus required maxLength={2000} value={jobInstruction} onChange={(event) => setJobInstruction(event.target.value)} placeholder="Ask for a draft, a task, a plan, or a check…" /></label>
             </div>
-            <div className="editor-footer"><span>{jobComposer.taskId ? "Hermes receives this task's context." : jobComposer.inboxId ? "Hermes receives this Inbox item's context." : "Hermes receives the context shown above."}</span><div><button className="secondary-action" type="button" onClick={() => setJobComposer(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === "job:create"}><CornerUpLeft size={14} /> Send to Hermes</button></div></div>
+            <div className="editor-footer"><span>{jobComposer.assistant === "fox" ? "Fox can read your tasks, calendar and Inbox. It cannot change anything." : jobComposer.taskId ? "Hermes receives this task's context." : jobComposer.inboxId ? "Hermes receives this Inbox item's context." : "Hermes receives the context shown above."}</span><div><button className="secondary-action" type="button" onClick={() => setJobComposer(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === "job:create"}><CornerUpLeft size={14} /> Send to {jobComposer.assistant === "fox" ? "Fox" : "Hermes"}</button></div></div>
           </form>
         </DialogFrame>
       ) : null}
