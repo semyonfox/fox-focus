@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   DUBLIN_TIME_ZONE,
   addCalendarDays,
+  addCalendarMonths,
   calendarDateWindow,
   currentEventProgress,
   dublinDateKey,
@@ -31,6 +32,24 @@ test("adds calendar days across month, leap-year, and year boundaries", () => {
   assert.equal(addCalendarDays("2026-01-31", 1), "2026-02-01");
   assert.equal(addCalendarDays("2024-03-01", -1), "2024-02-29");
   assert.equal(addCalendarDays("2026-12-31", 1), "2027-01-01");
+});
+
+test("month and year navigation clamps to the destination month's last day", () => {
+  assert.equal(addCalendarMonths("2026-01-31", 1), "2026-02-28");
+  assert.equal(addCalendarMonths("2024-01-31", 1), "2024-02-29");
+  assert.equal(addCalendarMonths("2026-03-31", -1), "2026-02-28");
+  assert.equal(addCalendarMonths("2024-02-29", 12), "2025-02-28");
+  assert.equal(addCalendarMonths("2024-02-29", -12), "2023-02-28");
+  assert.equal(addCalendarMonths("2026-12-31", 1), "2027-01-31");
+  assert.equal(addCalendarMonths("2026-01-31", -1), "2025-12-31");
+  assert.equal(addCalendarMonths("2026-09-25", 1), "2026-10-25");
+});
+
+test("month navigation rejects invalid input and dates outside the supported range", () => {
+  assert.throws(() => addCalendarMonths("2026-02-30", 1), RangeError);
+  assert.throws(() => addCalendarMonths("2026-01-01", 1.5), RangeError);
+  assert.throws(() => addCalendarMonths("0001-01-01", -1), RangeError);
+  assert.throws(() => addCalendarMonths("9999-12-31", 1), RangeError);
 });
 
 test("builds a seven-day window centred on the selected date", () => {
