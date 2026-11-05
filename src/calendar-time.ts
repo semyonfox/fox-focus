@@ -142,6 +142,24 @@ export function calendarDateWindow(dateKey: string, daysBefore: number, daysAfte
   return dates;
 }
 
+// keep the day where possible, or use the last day of a shorter month
+export function addCalendarMonths(dateKey: string, delta: number): string {
+  const parts = assertDateKey(dateKey);
+  if (!Number.isSafeInteger(delta)) throw new RangeError("delta must be an integer");
+
+  const date = new Date(utcTimestamp({ ...parts, day: 1, hour: 0, minute: 0 }));
+  date.setUTCMonth(date.getUTCMonth() + delta);
+  const monthEnd = new Date(date);
+  monthEnd.setUTCMonth(monthEnd.getUTCMonth() + 1, 0);
+  const result = formatDateParts({
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: Math.min(parts.day, monthEnd.getUTCDate()),
+  });
+  if (!Number.isFinite(date.getTime()) || !isDateKey(result)) throw new RangeError("Result is outside the supported date range");
+  return result;
+}
+
 /**
  * Resolves a Dublin wall time to an exact UTC instant. DST gaps and ambiguous
  * fall-back times return null instead of silently moving or choosing a side.
