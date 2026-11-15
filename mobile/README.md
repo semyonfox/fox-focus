@@ -1,6 +1,6 @@
 # Fox Focus mobile
 
-Android app for Fox Focus, built with Expo SDK 57 and expo-router. It is a second client for the same server as the web app: it imports the row model, API clients and Inbox grouping from `../src`, so both apps validate, group and label work the same way.
+Android app for Fox Focus, built with Expo SDK 58 and expo-router 58. It is a second client for the same server as the web app: it imports the row model, API clients and Inbox grouping from `../src`, so both apps validate, group and label work the same way.
 
 Settings takes the server URL and the owner login (`fox` and the workspace password), kept in the Android keystore.
 

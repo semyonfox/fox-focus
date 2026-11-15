@@ -1,5 +1,5 @@
 import { createContext, createRef, useCallback, useContext, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
-import { AccessibilityInfo, type NativeScrollEvent, type NativeSyntheticEvent, type View } from "react-native";
+import { AccessibilityInfo, type NativeScrollEvent, type NativeSyntheticEvent, type ViewInstance } from "react-native";
 
 type DockTab = "index" | "tasks" | "inbox";
 
@@ -9,7 +9,7 @@ type DockState = {
   screenReader: boolean;
   expand: () => void;
   onScroll: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
-  blurTargets: Record<DockTab, RefObject<View | null>>;
+  blurTargets: Record<DockTab, RefObject<ViewInstance | null>>;
 };
 
 const DockContext = createContext<DockState | null>(null);
@@ -21,9 +21,9 @@ export function DockProvider({ children }: { children: ReactNode }) {
   const previousOffset = useRef(0);
   const travel = useRef(0);
   const blurTargets = useRef({
-    index: createRef<View>(),
-    tasks: createRef<View>(),
-    inbox: createRef<View>(),
+    index: createRef<ViewInstance>(),
+    tasks: createRef<ViewInstance>(),
+    inbox: createRef<ViewInstance>(),
   }).current;
 
   useEffect(() => {
