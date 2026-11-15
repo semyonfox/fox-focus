@@ -22,7 +22,7 @@ export function DockScene({ tab, children }: { tab: "index" | "tasks" | "inbox";
   return <BlurTargetView ref={blurTargets[tab]} style={styles.scene}>{children}</BlurTargetView>;
 }
 
-export function Dock({ state, descriptors, navigation }: TabBarProps) {
+export function Dock({ state, descriptors, emitter, navigateToTab }: TabBarProps) {
   const { expanded, expand, reduceMotion, screenReader, blurTargets } = useDock();
   const { rows } = useStore();
   const needs = needsCount(rows);
@@ -70,11 +70,11 @@ export function Dock({ state, descriptors, navigation }: TabBarProps) {
             accessibilityState={{ selected }}
             onFocus={expand}
             onPress={() => {
-              const event = navigation.emit({ type: "tabPress", target: route.key, canPreventDefault: true });
-              if (!selected && !event.defaultPrevented) navigation.navigate(route.name);
+              const event = emitter.emit({ type: "tabPress", target: route.key, canPreventDefault: true });
+              if (!selected && !event.defaultPrevented) navigateToTab(route.key);
               else expand();
             }}
-            onLongPress={() => navigation.emit({ type: "tabLongPress", target: route.key })}
+            onLongPress={() => emitter.emit({ type: "tabLongPress", target: route.key })}
             style={({ pressed }) => [styles.item, selected && styles.selected, pressed && styles.pressed]}
           >
             <View>
