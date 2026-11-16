@@ -3,14 +3,15 @@ import { requestTaskPlan } from "@shared/row-client";
 import type { Priority } from "@shared/model";
 import type { TaskPlanRow } from "@shared/row-model";
 import { taskCommandStatus } from "@shared/task-command-status";
-import { useLocalSearchParams } from "expo-router";
+import { router, useLocalSearchParams } from "expo-router";
 import { useState } from "react";
 import { Linking, StyleSheet, View } from "react-native";
+import { PlanEditor, type PlanFields } from "@/components/plan-editor";
 import { tickTask, ThreadItem } from "@/components/rows";
 import { Actions, Button, Chip, Composer, Fact, Missing, Panel, Screen, Section, T } from "@/components/ui";
 import { expectOk, oneLine, randomKey } from "@/lib/api";
 import { dayLabel, whenLabel } from "@/lib/dates";
-import { canTick, isDone, isPending, isStuck, jobsFor, jobThread, latestTaskAction, listName, planFor, taskTitle } from "@/lib/derive";
+import { activeJobFor, assistantAvailable, canTick, isDone, isPending, isStuck, jobsFor, jobThread, latestTaskAction, listName, planFor, taskTitle } from "@/lib/derive";
 import { useStore } from "@/lib/store";
 import { space } from "@/lib/theme";
 
@@ -42,17 +43,18 @@ export default function TaskScreen() {
     plan?.estimateMinutes ? { label: "Estimate", value: `${plan.estimateMinutes} min` } : null,
   ].filter((fact): fact is { label: string; value: string } => fact !== null);
 
-  const savePlan = (current: TaskPlanRow, change: Partial<Pick<TaskPlanRow, "priority" | "waiting">>) => {
-    void run(async () => expectOk(await requestTaskPlan(task.id, {
+  // the plan is Fox Focus planning only; nothing here writes to Google
+  const savePlan = (current: TaskPlanRow, change: Partial<Pick<TaskPlanRow, "priority" | "waiting"> & PlanFields>, done?: string) =>
+    run(async () => expectOk(await requestTaskPlan(task.id, {
       version: current.version,
       priority: change.priority ?? current.priority,
       waiting: change.waiting ?? current.waiting,
-      deadlineOn: current.deadlineOn,
-      plannedOn: current.plannedOn,
-      plannedAt: current.plannedAt,
-      estimateMinutes: current.estimateMinutes,
-    }), "Could not save the plan"));
-  };
+      deadlineOn: change.deadlineOn !== undefined ? change.deadlineOn : current.deadlineOn,
+      plannedOn: change.plannedOn !== undefined ? change.plannedOn : current.plannedOn,
+      plannedAt: change.plannedAt !== undefined ? change.plannedAt : current.plannedAt,
+      estimateMinutes: change.estimateMinutes !== undefined ? change.estimateMinutes : current.estimateMinutes,
+    }), "Could not save the plan"), done);
+  const active = activeJobFor(rows, { taskId: task.id });
 
   const handOver = async (text: string) => {
     const ok = await run(() => createJob({ idempotencyKey: randomKey(), title: oneLine(title, 200), instruction: text, taskId: task.id }), "Handed to Hermes");
@@ -70,11 +72,12 @@ export default function TaskScreen() {
       {plan ? (
         <View style={styles.chips}>
           {priorities.map(option => (
-            <Chip key={option.value} label={option.label} on={plan.priority === option.value} onPress={() => savePlan(plan, { priority: option.value })} />
+            <Chip key={option.value} label={option.label} on={plan.priority === option.value} onPress={() => { void savePlan(plan, { priority: option.value }); }} />
           ))}
-          <Chip label="Waiting" on={plan.waiting} onPress={() => savePlan(plan, { waiting: !plan.waiting })} />
+          <Chip label="Waiting" on={plan.waiting} onPress={() => { void savePlan(plan, { waiting: !plan.waiting }); }} />
         </View>
       ) : null}
+      {plan && !done ? <PlanEditor key={plan.version} plan={plan} onSave={next => savePlan(plan, next, "Plan saved")} /> : null}
 
       <Actions>
         <Button
@@ -83,7 +86,9 @@ export default function TaskScreen() {
           disabled={pending || isStuck(action) || !canTick(task)}
           onPress={() => { void run(tickTask(task, done)); }}
         />
-        {!asking ? <Button label="Hand to Hermes" onPress={() => setAsking(true)} /> : null}
+        {active
+          ? <Button label="Open Hermes thread" onPress={() => router.push({ pathname: "/job/[id]", params: { id: active.id } })} />
+          : !asking ? <Button label="Hand to Hermes" disabled={task.binding.kind === "pending" || !assistantAvailable(rows, "hermes")} onPress={() => setAsking(true)} /> : null}
         {sourceUrl ? <Button label="Open in Google" tone="quiet" onPress={() => { void Linking.openURL(sourceUrl); }} /> : null}
       </Actions>
       {asking ? <Composer placeholder="What should Hermes do?" submitLabel="Hand over" onSubmit={handOver} onCancel={() => setAsking(false)} /> : null}

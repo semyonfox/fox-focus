@@ -2,7 +2,7 @@
   "expo": {
     "name": "Fox Focus",
     "slug": "fox-focus",
-    "version": "0.1.5",
+    "version": "0.1.6",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "foxfocus",
@@ -18,7 +18,7 @@
     },
     "android": {
       "package": "ie.semyon.foxfocus",
-      "versionCode": 6,
+      "versionCode": 7,
       "adaptiveIcon": {
         "backgroundColor": "#171717",
         "foregroundImage": "./assets/images/android-icon-foreground.png",

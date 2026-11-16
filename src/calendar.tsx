@@ -1,17 +1,11 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { ChevronLeft, ChevronRight, Link2, Plus, X } from 'lucide-react';
 import { addCalendarDays, addCalendarMonths, calendarDateWindow, dublinDateKey, dublinTimeValue, formatDublinDateKey } from './calendar-time.ts';
-import { daySegment, layoutDay, minuteOfDay } from './calendar-layout.ts';
-import type { Area, TimelineEvent } from './model.ts';
-import type { ImportedRecord, OverviewState } from './integrations.tsx';
-import { importedTaskArea } from './workspace-rules.ts';
+import { calendarEntries, daySegment, layoutDay, minuteOfDay, type CalendarEntry } from './calendar-layout.ts';
+import type { TimelineEvent } from './model.ts';
+import type { OverviewState } from './integrations.tsx';
 import './calendar.css';
 
-export type CalendarEntry = {
-  id: string; title: string; date: string; time: string; duration: number;
-  startsAt?: string; allDay: boolean; endDate?: string; area: Area; source: string;
-  local?: TimelineEvent;
-};
 type Entry = CalendarEntry;
 type Mode = 'day' | 'week' | 'month';
 
@@ -172,28 +166,6 @@ function CalendarDayStrip({ date, today, onDate }: { date: string; today: string
       <strong className={`calendar-day-number${day === today ? ' calendar-day-number--today' : ''}`}>{Number(day.slice(8))}</strong>
     </button>)}
   </div>;
-}
-
-export function calendarEntries(events: TimelineEvent[], records: ImportedRecord[], today: string): Entry[] {
-  return [
-    ...events.map(event => ({
-      id: event.id, title: event.title,
-      date: event.startsAt ? dublinDateKey(new Date(event.startsAt)) : event.date ?? today,
-      time: typeof event.startsAt === "string" ? dublinTimeValue(event.startsAt) : event.start,
-      duration: event.duration, startsAt: event.startsAt, allDay: false,
-      area: event.area, source: event.source ?? (event.editable ? 'Local block' : 'Imported calendar'), local: event,
-    })),
-    ...records.filter(record => record.kind === 'calendar_event' && record.status !== 'cancelled' && (record.startsOn || record.startsAt)).map(record => ({
-      id: `import:${record.provider}:${record.id}`, title: record.title,
-      date: record.startsOn ?? dublinDateKey(new Date(record.startsAt!)),
-      time: record.startsAt ? dublinTimeValue(record.startsAt) : '00:00',
-      // sources without an end are shown as a short marker, not an invented hour
-      duration: record.startsAt && record.endsAt ? Math.max(1, (Date.parse(record.endsAt) - Date.parse(record.startsAt)) / 60_000) : 15,
-      startsAt: record.startsAt ?? undefined, allDay: record.allDay || Boolean(record.startsOn),
-      endDate: record.endsOn ?? undefined,
-      area: importedTaskArea(undefined, record), source: `${record.containerName} · Imported`,
-    })),
-  ];
 }
 
 export function Calendar({ events, overview, date, onDate, selectedId, onEdit, onAdd, onSources, onAsk }: {

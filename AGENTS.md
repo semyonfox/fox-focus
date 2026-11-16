@@ -22,3 +22,5 @@ The existing `personal-tasks` board remains canonical until a migration is expli
 - Preserve provenance and stable external identifiers for imported data.
 - Never write to the Hermes SQLite database. Keep Microsoft writes, provider deletes, task moves, completed-list clears, calendar writes, and direct Gmail access out of Fox Focus.
 - Prefer a small, well-tested local app over a dashboard of unfinished integrations.
+
+attribution: on

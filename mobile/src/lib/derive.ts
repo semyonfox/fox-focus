@@ -1,7 +1,10 @@
+import { calendarEntries, daySegment, type CalendarEntry } from "@shared/calendar-layout";
 import { emailSendUiState, type EmailSendUiState } from "@shared/inbox-client";
-import type { ActionRow, DraftRevision, InboxItemRow, Job, JobUpdate, TaskPlanRow, TaskRow } from "@shared/row-model";
+import type { TimelineEvent } from "@shared/model";
+import { importedTaskArea } from "@shared/workspace-rules";
+import type { ActionRow, AssistantId, DraftRevision, InboxItemRow, Job, JobUpdate, TaskPlanRow, TaskRow } from "@shared/row-model";
 import { assistantName, buildWorkThreads, inboxStateLabel, jobPresentation, jobStateLabel, latestSendActions, type WorkThread } from "@shared/work-threads";
-import type { Rows } from "./api";
+import type { CalendarSource, Rows } from "./api";
 import { addDays, dayLabel, dublinDateKey, whenLabel } from "./dates";
 
 export const isDone = (task: TaskRow) => task.observed?.status === "completed";
@@ -14,10 +17,14 @@ export function taskTitle(rows: Rows, task: TaskRow): string {
   return "Untitled";
 }
 
-export function listName(rows: Rows, task: TaskRow): string {
-  const listId = task.binding.kind === "google"
+function listIdFor(task: TaskRow): string | null {
+  return task.binding.kind === "google"
     ? task.binding.ref.listId
     : task.binding.kind === "pending" ? task.binding.destination.listId : null;
+}
+
+export function listName(rows: Rows, task: TaskRow): string {
+  const listId = listIdFor(task);
   if (!listId) return "Fox Focus";
   return rows.listNames[listId] ?? rows.destinations.find(destination => destination.listId === listId)?.listName ?? "Google Tasks";
 }
@@ -118,7 +125,8 @@ export function threads(rows: Rows, now = Date.now()): WorkThread[] {
   return buildWorkThreads(rows.inbox, rows.jobs, latestSendActions(rows.actions), now);
 }
 
-export const needsCount = (rows: Rows) => threads(rows).filter(thread => thread.group === "needs_you").length;
+// same rule as the web Inbox badge
+export const needsCount = (rows: Rows) => threads(rows).filter(thread => thread.attention).length;
 
 export function jobThread(job: Job, now = Date.now()): WorkThread {
   return {
@@ -132,12 +140,10 @@ export function jobThread(job: Job, now = Date.now()): WorkThread {
 
 export type DotTone = "amber" | "blue" | "light" | "faint";
 
+const toneDots = { input: "amber", failed: "amber", working: "blue", approval: "light", done: "light", quiet: "faint" } as const;
+
 export function threadTone(thread: WorkThread): DotTone {
-  if (thread.job) {
-    const { state } = thread.job;
-    return state === "needs_you" ? "amber" : state === "review" ? "light" : state === "settled" ? "faint" : "blue";
-  }
-  return thread.group === "needs_you" ? "amber" : thread.group === "working" ? "blue" : "faint";
+  return toneDots[thread.tone];
 }
 
 export function threadStatus(rows: Rows, thread: WorkThread): string {
@@ -152,6 +158,62 @@ export function threadStatus(rows: Rows, thread: WorkThread): string {
   return jobStateLabel(job);
 }
 
-export const updateKindLabel: Record<JobUpdate["kind"], string> = {
-  progress: "update", question: "question", answer: "answer", result: "result", sent_back: "sent back", settled: "settled",
-};
+
+// same merge as the web calendar: local blocks, timed task plans, then imported calendars
+export function calendarFor(rows: Rows, calendar: CalendarSource, today = dublinDateKey()): CalendarEntry[] {
+  const rowIds = new Set(rows.tasks.map(task => task.id));
+  const replaced = new Set(calendar.legacyTasks.flatMap(task => rowIds.has(task.id) && task.linkedEventId ? [task.linkedEventId] : []));
+  const local = calendar.events.filter(event => !replaced.has(event.id) && (!event.taskId || !rowIds.has(event.taskId)));
+  const planned = rows.taskPlans.flatMap<TimelineEvent>(plan => {
+    const task = rows.tasks.find(candidate => candidate.id === plan.taskId);
+    // finished work drops off the calendar
+    if (!plan.plannedAt || !task || task.unavailableAt || isDone(task)) return [];
+    const title = taskTitle(rows, task);
+    const area = importedTaskArea(calendar.listAreas, {
+      provider: "google", containerId: listIdFor(task) ?? "", containerName: listName(rows, task), title,
+      notes: task.observed?.notes, sourceUrl: task.observed?.sourceUrl,
+    });
+    return [{
+      id: `row-plan:${task.id}`, title, subtitle: `Fox Focus plan · ${area}`, area, startsAt: plan.plannedAt,
+      duration: plan.estimateMinutes ?? 30, editable: true, origin: "task", taskId: task.id, source: "Fox Focus task plan",
+    }];
+  });
+  return calendarEntries([...local, ...planned], calendar.records, today);
+}
+
+export const isAllDayOn = (entry: CalendarEntry, day: string) =>
+  entry.allDay && entry.date <= day && (entry.endDate ? day < entry.endDate : day === entry.date);
+
+export type DaySlot = { entry: CalendarEntry; start: number; end: number };
+
+// timed entries clipped to one Dublin day, in start order
+export function timedOn(entries: readonly CalendarEntry[], day: string): DaySlot[] {
+  return entries.flatMap(entry => {
+    if (entry.allDay) return [];
+    const segment = daySegment(entry, day);
+    return segment ? [{ entry, ...segment }] : [];
+  }).sort((a, b) => a.start - b.start || a.end - b.end || a.entry.title.localeCompare(b.entry.title));
+}
+
+export function entryTaskId(entry: CalendarEntry): string | null {
+  return entry.local?.origin === "task" && entry.local.taskId ? entry.local.taskId : null;
+}
+
+export function assistantAvailable(rows: Rows, assistant: AssistantId): boolean {
+  return rows.capabilities.assistants.some(candidate => candidate.id === assistant && candidate.available);
+}
+
+// as on the web: linked email and task requests stay with Hermes, loose questions go to Fox when it is there
+export function defaultAssistant(rows: Rows, linked: boolean): AssistantId {
+  return linked || !assistantAvailable(rows, "fox") ? "hermes" : "fox";
+}
+
+// one unsettled request per task or Inbox item, like the web composer
+export function activeJobFor(rows: Rows, link: { taskId?: string; inboxId?: string }): Job | null {
+  return jobsFor(rows, link).find(job => job.state !== "settled") ?? null;
+}
+
+export function threadTitleFrom(text: string): string {
+  const line = text.trim().split(/\r?\n/)[0]?.replace(/\s+/g, " ") ?? "";
+  return line.length <= 80 ? line || "New thread" : `${line.slice(0, 79)}…`;
+}

@@ -2,7 +2,8 @@ import { reviewItemFromRow } from './inbox-review.ts';
 import { enrichInboxSource, expireInboxItems } from './inbox-time.ts';
 import { InboxTiming } from './inbox-timing.tsx';
 import { ReviewDecision } from './review-decision.tsx';
-import { Calendar, type CalendarEntry } from './calendar.tsx';
+import { Calendar } from './calendar.tsx';
+import type { CalendarEntry } from './calendar-layout.ts';
 import { inboxLane, importedTaskArea, isUniversityWork, localTaskArea, type InboxLane } from './workspace-rules.ts';
 import "@fontsource-variable/instrument-sans";
 import {
@@ -50,8 +51,8 @@ import {
 } from "./calendar-time.ts";
 import { hermesLabels, useHermesFeed } from "./hermes-feed.tsx";
 import { deduplicatedProviderIdentity, type HermesTask, type HermesTaskAnnotationInput } from "./hermes-model.ts";
-import { IntegrationsDrawer, providerLabel, useOverview, type ImportedRecord, type OverviewState } from './integrations.tsx';
-import { areaForList } from './integration-model.ts';
+import { IntegrationsDrawer, providerLabel, useOverview, type OverviewState } from './integrations.tsx';
+import { areaForList, type ImportedRecord } from './integration-model.ts';
 import {
   answerJob,
   approveEmailSend,

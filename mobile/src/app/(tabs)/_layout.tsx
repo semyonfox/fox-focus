@@ -27,8 +27,10 @@ export default function TabsLayout() {
         }}
       >
         <Tabs.Screen name="index" options={{ title: "Today" }} />
+        <Tabs.Screen name="calendar" options={{ title: "Calendar" }} />
         <Tabs.Screen name="tasks" options={{ title: "Tasks" }} />
         <Tabs.Screen name="inbox" options={{ title: "Inbox" }} />
+        <Tabs.Screen name="assistants" options={{ title: "Assistants" }} />
       </Tabs>
     </DockProvider>
   );

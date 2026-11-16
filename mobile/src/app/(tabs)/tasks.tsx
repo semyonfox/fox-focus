@@ -1,10 +1,11 @@
 import type { TaskRow } from "@shared/row-model";
 import { useState } from "react";
 import { RefreshControl, SectionList, StyleSheet, View } from "react-native";
+import { NewTask } from "@/components/new-task";
 import { TaskItem } from "@/components/rows";
 import { DockScene } from "@/components/dock";
 import { ConnectPrompt } from "@/components/status-line";
-import { Chip, Field, Section, T } from "@/components/ui";
+import { Button, Chip, Field, Section, T } from "@/components/ui";
 import { doneTasks, groupByWhen, listName, openTasks, taskTitle } from "@/lib/derive";
 import { useDock } from "@/lib/dock";
 import { useStore } from "@/lib/store";
@@ -15,6 +16,7 @@ export default function Tasks() {
   const dock = useDock();
   const [view, setView] = useState<"open" | "done">("open");
   const [query, setQuery] = useState("");
+  const [adding, setAdding] = useState(false);
   const needle = query.trim().toLowerCase();
   const matches = (task: TaskRow) => !needle ||
     taskTitle(rows, task).toLowerCase().includes(needle) || listName(rows, task).toLowerCase().includes(needle);
@@ -38,9 +40,11 @@ export default function Tasks() {
           <View>
             {actionError ? <T tone="amber" accessibilityRole="alert" accessibilityLiveRegion="polite">{actionError}</T> : null}
             {error ? <T tone="amber" accessibilityRole="alert">{error}. Pull down to retry reading tasks.</T> : null}
+            {adding ? <NewTask onClose={() => setAdding(false)} /> : null}
             <View style={styles.chips}>
               <Chip label="Open" on={view === "open"} onPress={() => setView("open")} />
               <Chip label="Done" on={view === "done"} onPress={() => setView("done")} />
+              {!adding && connection ? <View style={styles.add}><Button label="Add task" tone="primary" onPress={() => setAdding(true)} /></View> : null}
             </View>
             <Field label="Search task titles" value={query} onChangeText={setQuery} placeholder="Search" autoCorrect={false} returnKeyType="search" />
           </View>
@@ -58,6 +62,7 @@ export default function Tasks() {
 const styles = StyleSheet.create({
   list: { flex: 1, backgroundColor: colors.page },
   content: { padding: space.lg, paddingBottom: 120 },
-  chips: { flexDirection: "row", gap: space.sm, marginBottom: space.md },
+  chips: { flexDirection: "row", gap: space.sm, marginBottom: space.md, marginTop: space.md },
+  add: { marginLeft: "auto" },
   empty: { marginTop: space.xl },
 });

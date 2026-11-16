@@ -4,7 +4,7 @@ Android app for Fox Focus, built with Expo SDK 58 and expo-router 58. It is a se
 
 Settings takes the server URL and the owner login (`fox` and the workspace password), kept in the Android keystore.
 
-Screens: Today (needs you, morning brief, next up), Tasks (open or done, grouped by when), Inbox (email items and Hermes jobs in one list), plus task, Inbox item and job detail.
+Screens: Today (needs you, now and next, morning brief, next up), Calendar (day grid and agenda of local blocks, task plans and read-only imported calendars), Tasks (open or done, grouped by when, and new Google tasks behind the same exact-fields preview as the web), Inbox (threads on the web's shelves, filtered by assistant), Assistants (Fox and Hermes threads, routines and permissions), plus task detail with planning, Inbox item and thread detail.
 
 ## Develop
 
