@@ -1,5 +1,7 @@
 import { apiFetch, setApiFetch } from "@shared/api-transport";
 import { loadTaskDestinations, parseWorkRows, preferredTaskDestination, type TaskDestination, type WorkRowsSnapshot } from "@shared/inbox-client";
+import { isOverview, type ImportedRecord } from "@shared/integration-model";
+import { isPrototypeData, isRecord, type PrototypeData } from "@shared/model";
 import { parseTaskRows, type RowResponse } from "@shared/row-client";
 import type { TaskCreateInput, TaskPlanRow, TaskRow } from "@shared/row-model";
 import type { Connection } from "./settings";
@@ -86,6 +88,40 @@ export async function fetchRows(): Promise<Rows> {
   const task = parseTaskRows(value);
   const destinations = await loadTaskDestinations().then(result => result.destinations, () => [] as TaskDestination[]);
   return { ...work, tasks: task.tasks, taskPlans: task.taskPlans, destinations, ...scopes(value) };
+}
+
+export type CalendarSource = {
+  events: PrototypeData["events"];
+  legacyTasks: PrototypeData["tasks"];
+  listAreas: PrototypeData["listAreas"];
+  records: ImportedRecord[];
+  // either source failed; what did load is still shown
+  failed: boolean;
+};
+
+export const emptyCalendar: CalendarSource = { events: [], legacyTasks: [], listAreas: undefined, records: [], failed: false };
+
+async function readJson(path: string): Promise<unknown> {
+  const response = await apiFetch(path);
+  const value: unknown = await response.json();
+  if (!response.ok) throw new Error(errorText(value) ?? `Fox Focus answered ${response.status}`);
+  return value;
+}
+
+// local blocks from the workspace and read-only imported calendars, the same sources the web calendar uses
+export async function fetchCalendar(): Promise<CalendarSource> {
+  const [workspace, integrations] = await Promise.allSettled([readJson("/api/v1/workspace"), readJson("/api/v1/integrations")]);
+  const data = workspace.status === "fulfilled" && isRecord(workspace.value) && isPrototypeData(workspace.value.data) ? workspace.value.data : null;
+  const overview = integrations.status === "fulfilled" && isOverview(integrations.value) ? integrations.value : null;
+  // the web hides providers this server has not configured
+  const configured = new Set(overview?.providers.filter(provider => provider.configured).map(provider => provider.provider) ?? []);
+  return {
+    events: data?.events ?? [],
+    legacyTasks: data?.tasks ?? [],
+    listAreas: data?.listAreas,
+    records: overview?.records.filter(record => record.kind === "calendar_event" && configured.has(record.provider)) ?? [],
+    failed: !data || !overview,
+  };
 }
 
 export function expectOk(result: RowResponse, fallback: string): void {

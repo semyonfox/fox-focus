@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AppState, StyleSheet, Text, View } from "react-native";
-import { configureServer, emptyRows, fetchRows, type Rows } from "./api";
+import { configureServer, emptyCalendar, emptyRows, fetchCalendar, fetchRows, type CalendarSource, type Rows } from "./api";
 import { loadConnection, saveConnection, type Connection } from "./settings";
 import { colors, font, radius, space } from "./theme";
 import { telemetry } from "./telemetry";
@@ -9,6 +9,7 @@ type Store = {
   connection: Connection | null;
   ready: boolean;
   rows: Rows;
+  calendar: CalendarSource;
   loading: boolean;
   error: string | null;
   actionError: string | null;
@@ -27,11 +28,15 @@ const message = (cause: unknown, fallback: string) => (cause instanceof Error &&
 // same cadence as the web app: quick while Google or Gmail work is in flight, otherwise every 15 seconds
 const quickPollMs = 1_000;
 const pollMs = 15_000;
+// imported calendars change slowly; the web reads them once a minute too
+const calendarPollMs = 60_000;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [ready, setReady] = useState(false);
   const [rows, setRows] = useState<Rows>(emptyRows);
+  const [calendar, setCalendar] = useState<CalendarSource>(emptyCalendar);
+  const calendarReadAt = useRef(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -58,9 +63,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       requestAtStart === requestGeneration.current;
     if (!quiet) setLoading(true);
     try {
-      const nextRows = await fetchRows();
+      const calendarDue = !quiet || Date.now() - calendarReadAt.current >= calendarPollMs;
+      const [nextRows, nextCalendar] = await Promise.all([fetchRows(), calendarDue ? fetchCalendar() : null]);
       if (!isCurrent()) return;
       setRows(nextRows);
+      if (nextCalendar) {
+        calendarReadAt.current = Date.now();
+        setCalendar(nextCalendar);
+      }
       setLoadedAt(new Date().toISOString());
       setError(null);
     } catch (cause) {
@@ -155,6 +165,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       currentConnection.current = next;
       setConnection(next);
       setRows(emptyRows);
+      setCalendar(emptyCalendar);
+      calendarReadAt.current = 0;
       setLoadedAt(null);
       setError(null);
       setActionError(null);
@@ -170,8 +182,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [load]);
 
   const value = useMemo<Store>(() => ({
-    connection, ready, rows, loading, error, actionError, loadedAt, refresh, run, connect, notify,
-  }), [connection, ready, rows, loading, error, actionError, loadedAt, refresh, run, connect, notify]);
+    connection, ready, rows, calendar, loading, error, actionError, loadedAt, refresh, run, connect, notify,
+  }), [connection, ready, rows, calendar, loading, error, actionError, loadedAt, refresh, run, connect, notify]);
 
   return (
     <StoreContext.Provider value={value}>

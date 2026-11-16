@@ -1,31 +1,10 @@
 import { useState } from "react";
 import { AlarmClock, Check, ChevronDown, CircleCheck, CircleDashed, LayoutGrid, List, SquarePen } from "lucide-react";
 import type { AssistantId, AssistantInfo } from "./row-model.ts";
-import { relativeTime, type WorkThread } from "./work-threads.ts";
+import { relativeTime, snoozePresets, type WorkThread } from "./work-threads.ts";
 import "./threads.css";
 
 export type AssistantFilter = AssistantId | "all";
-
-export type SnoozePreset = { id: string; label: string; until: string };
-
-// presets follow T3: later today, tomorrow morning, next Monday morning, in local (Dublin) time
-export function snoozePresets(now: Date): SnoozePreset[] {
-  const at = (date: Date, hours: number) => {
-    const next = new Date(date);
-    next.setHours(hours, 0, 0, 0);
-    return next;
-  };
-  const laterToday = now.getHours() < 17 ? at(now, 18) : new Date(now.getTime() + 3 * 60 * 60_000);
-  const tomorrow = at(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1), 9);
-  const daysToMonday = ((8 - now.getDay()) % 7) || 7;
-  const nextWeek = at(new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysToMonday), 9);
-  const time = (date: Date) => date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-  return [
-    { id: "later", label: `Later today · ${time(laterToday)}`, until: laterToday.toISOString() },
-    { id: "tomorrow", label: `Tomorrow · ${time(tomorrow)}`, until: tomorrow.toISOString() },
-    { id: "next-week", label: `Next week · ${nextWeek.toLocaleDateString("en-GB", { weekday: "short" })} ${time(nextWeek)}`, until: nextWeek.toISOString() },
-  ];
-}
 
 export function assistantInitial(assistant: AssistantId): string {
   return assistant === "fox" ? "F" : "H";

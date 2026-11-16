@@ -155,8 +155,9 @@ export function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function Composer({ placeholder, submitLabel = "Send", onSubmit, onCancel }: {
+export function Composer({ placeholder, label = "Hermes instruction", submitLabel = "Send", onSubmit, onCancel }: {
   placeholder: string;
+  label?: string;
   submitLabel?: string;
   onSubmit: (text: string) => Promise<boolean>;
   onCancel?: () => void;
@@ -173,7 +174,7 @@ export function Composer({ placeholder, submitLabel = "Send", onSubmit, onCancel
   };
   return (
     <Panel>
-      <Field label="Hermes instruction" value={text} onChangeText={setText} placeholder={placeholder} multiline autoFocus maxLength={2000} />
+      <Field label={label} value={text} onChangeText={setText} placeholder={placeholder} multiline autoFocus maxLength={2000} />
       <Actions>
         <Button label={submitLabel} tone="primary" disabled={busy || !text.trim()} onPress={() => { void submit(); }} />
         {onCancel ? <Button label="Cancel" tone="quiet" onPress={onCancel} /> : null}

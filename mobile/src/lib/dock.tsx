@@ -1,7 +1,7 @@
 import { createContext, createRef, useCallback, useContext, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { AccessibilityInfo, type NativeScrollEvent, type NativeSyntheticEvent, type ViewInstance } from "react-native";
 
-type DockTab = "index" | "tasks" | "inbox";
+export type DockTab = "index" | "calendar" | "tasks" | "inbox" | "assistants";
 
 type DockState = {
   expanded: boolean;
@@ -22,8 +22,10 @@ export function DockProvider({ children }: { children: ReactNode }) {
   const travel = useRef(0);
   const blurTargets = useRef({
     index: createRef<ViewInstance>(),
+    calendar: createRef<ViewInstance>(),
     tasks: createRef<ViewInstance>(),
     inbox: createRef<ViewInstance>(),
+    assistants: createRef<ViewInstance>(),
   }).current;
 
   useEffect(() => {

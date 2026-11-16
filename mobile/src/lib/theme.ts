@@ -24,3 +24,14 @@ export const space = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24 } as const;
 export const radius = 8;
 
 export const font = { title: 20, body: 15, small: 13, tiny: 11 } as const;
+
+// event colours from the web calendar (src/calendar.css)
+export const areaColors = {
+  University: "#8fa9e8",
+  Personal: "#d9a179",
+  Work: "#91b7ad",
+  Health: "#9bb88d",
+  Admin: "#c5a1cc",
+} as const;
+
+export const nowColor = "#f66870";

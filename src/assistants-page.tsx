@@ -3,27 +3,7 @@ import { CornerDownLeft, SquarePen } from "lucide-react";
 import type { AssistantId, AssistantInfo, InboxItemRow, Job, ThreadEntry } from "./row-model.ts";
 import { assistantInitial } from "./thread-sidebar.tsx";
 import { ThreadView } from "./thread-view.tsx";
-import { relativeTime, type WorkThread } from "./work-threads.ts";
-
-// the Hermes cron mirror describes each routine in one sentence-per-field summary
-function routineField(summary: string, field: string): string | null {
-  const match = new RegExp(`${field}: ([^.]+)\\.`).exec(summary);
-  return match ? match[1].trim() : null;
-}
-
-const CAPABILITIES: Record<AssistantId, Array<{ label: string; level: "allowed" | "asks" | "never" }>> = {
-  fox: [
-    { label: "Read your tasks, calendar and Inbox", level: "allowed" },
-    { label: "Ask you questions", level: "allowed" },
-    { label: "Create tasks, send email, edit calendars", level: "never" },
-  ],
-  hermes: [
-    { label: "Read Fox Focus context", level: "allowed" },
-    { label: "Propose Inbox items and reply drafts", level: "allowed" },
-    { label: "Send email", level: "asks" },
-    { label: "Approve its own writes", level: "never" },
-  ],
-};
+import { assistantCapabilities, relativeTime, routineField, type WorkThread } from "./work-threads.ts";
 
 export type AssistantsPageProps = {
   assistants: AssistantInfo[];
@@ -141,7 +121,7 @@ export function AssistantsPage(props: AssistantsPageProps) {
           {!routines.length ? <li className="thread-empty">No routines reported.</li> : null}
         </ul> : null}
         {tab === "permissions" ? <ul className="assistants-permissions">
-          {CAPABILITIES[assistant.id].map(capability => <li key={capability.label}>
+          {assistantCapabilities[assistant.id].map(capability => <li key={capability.label}>
             <span>{capability.label}</span>
             <b className={`permission permission--${capability.level}`}>{capability.level === "allowed" ? "allowed" : capability.level === "asks" ? "asks you" : "never"}</b>
           </li>)}

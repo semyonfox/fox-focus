@@ -219,3 +219,44 @@ export function hermesThreadEntries(job: Job, updates: JobUpdate[]): ThreadEntry
   }
   return entries;
 }
+
+export type SnoozePreset = { id: string; label: string; until: string };
+
+// presets follow T3: later today, tomorrow morning, next Monday morning, in local (Dublin) time
+export function snoozePresets(now: Date): SnoozePreset[] {
+  const at = (date: Date, hours: number) => {
+    const next = new Date(date);
+    next.setHours(hours, 0, 0, 0);
+    return next;
+  };
+  const laterToday = now.getHours() < 17 ? at(now, 18) : new Date(now.getTime() + 3 * 60 * 60_000);
+  const tomorrow = at(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1), 9);
+  const daysToMonday = ((8 - now.getDay()) % 7) || 7;
+  const nextWeek = at(new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysToMonday), 9);
+  const time = (date: Date) => date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  return [
+    { id: "later", label: `Later today · ${time(laterToday)}`, until: laterToday.toISOString() },
+    { id: "tomorrow", label: `Tomorrow · ${time(tomorrow)}`, until: tomorrow.toISOString() },
+    { id: "next-week", label: `Next week · ${nextWeek.toLocaleDateString("en-GB", { weekday: "short" })} ${time(nextWeek)}`, until: nextWeek.toISOString() },
+  ];
+}
+
+// the Hermes cron mirror describes each routine in one sentence-per-field summary
+export function routineField(summary: string, field: string): string | null {
+  const match = new RegExp(`${field}: ([^.]+)\\.`).exec(summary);
+  return match ? match[1].trim() : null;
+}
+
+export const assistantCapabilities: Record<AssistantId, Array<{ label: string; level: "allowed" | "asks" | "never" }>> = {
+  fox: [
+    { label: "Read your tasks, calendar and Inbox", level: "allowed" },
+    { label: "Ask you questions", level: "allowed" },
+    { label: "Create tasks, send email, edit calendars", level: "never" },
+  ],
+  hermes: [
+    { label: "Read Fox Focus context", level: "allowed" },
+    { label: "Propose Inbox items and reply drafts", level: "allowed" },
+    { label: "Send email", level: "asks" },
+    { label: "Approve its own writes", level: "never" },
+  ],
+};

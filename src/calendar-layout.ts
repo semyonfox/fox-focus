@@ -1,4 +1,7 @@
 import { addCalendarDays, dublinDateKey, dublinTimeValue } from './calendar-time.ts';
+import type { ImportedRecord } from './integration-model.ts';
+import type { Area, TimelineEvent } from './model.ts';
+import { importedTaskArea } from './workspace-rules.ts';
 
 export type TimedEntry = { id: string; date: string; time: string; duration: number; startsAt?: string };
 export type PositionedEntry<T> = { entry: T; start: number; end: number; column: number; columns: number };
@@ -45,4 +48,33 @@ export function layoutDay<T extends TimedEntry>(entries: readonly T[], date: str
   }
   finish();
   return rows;
+}
+
+export type CalendarEntry = {
+  id: string; title: string; date: string; time: string; duration: number;
+  startsAt?: string; allDay: boolean; endDate?: string; area: Area; source: string;
+  local?: TimelineEvent;
+};
+
+// local blocks and imported calendar records as one list, shared by the web and Android calendars
+export function calendarEntries(events: TimelineEvent[], records: ImportedRecord[], today: string): CalendarEntry[] {
+  return [
+    ...events.map(event => ({
+      id: event.id, title: event.title,
+      date: event.startsAt ? dublinDateKey(new Date(event.startsAt)) : event.date ?? today,
+      time: typeof event.startsAt === "string" ? dublinTimeValue(event.startsAt) : event.start,
+      duration: event.duration, startsAt: event.startsAt, allDay: false,
+      area: event.area, source: event.source ?? (event.editable ? 'Local block' : 'Imported calendar'), local: event,
+    })),
+    ...records.filter(record => record.kind === 'calendar_event' && record.status !== 'cancelled' && (record.startsOn || record.startsAt)).map(record => ({
+      id: `import:${record.provider}:${record.id}`, title: record.title,
+      date: record.startsOn ?? dublinDateKey(new Date(record.startsAt!)),
+      time: record.startsAt ? dublinTimeValue(record.startsAt) : '00:00',
+      // sources without an end are shown as a short marker, not an invented hour
+      duration: record.startsAt && record.endsAt ? Math.max(1, (Date.parse(record.endsAt) - Date.parse(record.startsAt)) / 60_000) : 15,
+      startsAt: record.startsAt ?? undefined, allDay: record.allDay || Boolean(record.startsOn),
+      endDate: record.endsOn ?? undefined,
+      area: importedTaskArea(undefined, record), source: `${record.containerName} · Imported`,
+    })),
+  ];
 }

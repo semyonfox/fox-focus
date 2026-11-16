@@ -2,22 +2,27 @@ import { useEffect, useRef, type ComponentProps, type ReactNode } from "react";
 import { Animated, Pressable, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { BlurTargetView, BlurView } from "expo-blur";
 import { Tabs } from "expo-router";
-import { Clock3, Inbox, ListTodo } from "lucide-react-native";
+import { Bot, CalendarDays, Clock3, Inbox, ListTodo } from "lucide-react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { needsCount } from "@/lib/derive";
-import { useDock } from "@/lib/dock";
+import { useDock, type DockTab } from "@/lib/dock";
 import { useStore } from "@/lib/store";
 import { colors } from "@/lib/theme";
+
+const dockTabs: readonly string[] = ["index", "calendar", "tasks", "inbox", "assistants"] satisfies DockTab[];
+const isDockTab = (name: string): name is DockTab => dockTabs.includes(name);
 
 type TabBarProps = Parameters<NonNullable<ComponentProps<typeof Tabs>["tabBar"]>>[0];
 
 function DockIcon({ name, color }: { name: string; color: string }) {
-  if (name === "tasks") return <ListTodo size={26} color={color} strokeWidth={2} />;
-  if (name === "inbox") return <Inbox size={26} color={color} strokeWidth={2} />;
-  return <Clock3 size={26} color={color} strokeWidth={2} />;
+  if (name === "calendar") return <CalendarDays size={24} color={color} strokeWidth={2} />;
+  if (name === "tasks") return <ListTodo size={24} color={color} strokeWidth={2} />;
+  if (name === "assistants") return <Bot size={24} color={color} strokeWidth={2} />;
+  if (name === "inbox") return <Inbox size={24} color={color} strokeWidth={2} />;
+  return <Clock3 size={24} color={color} strokeWidth={2} />;
 }
 
-export function DockScene({ tab, children }: { tab: "index" | "tasks" | "inbox"; children: ReactNode }) {
+export function DockScene({ tab, children }: { tab: DockTab; children: ReactNode }) {
   const { blurTargets } = useDock();
   return <BlurTargetView ref={blurTargets[tab]} style={styles.scene}>{children}</BlurTargetView>;
 }
@@ -48,7 +53,7 @@ export function Dock({ state, descriptors, emitter, navigateToTab }: TabBarProps
   });
   const labelHeight = progress.interpolate({ inputRange: [0, 1], outputRange: [0, Math.ceil(18 * fontScale)] });
   const activeRoute = state.routes[state.index].name;
-  const blurTarget = activeRoute === "tasks" ? blurTargets.tasks : activeRoute === "inbox" ? blurTargets.inbox : blurTargets.index;
+  const blurTarget = isDockTab(activeRoute) ? blurTargets[activeRoute] : blurTargets.index;
 
   return (
     <Animated.View
@@ -122,7 +127,7 @@ const styles = StyleSheet.create({
   selected: { backgroundColor: "rgba(55, 55, 55, 0.35)" },
   pressed: { opacity: 0.7 },
   labelWrap: { overflow: "hidden" },
-  label: { color: colors.headerMuted, fontSize: 12, fontWeight: "600", lineHeight: 15, textAlign: "center" },
+  label: { color: colors.headerMuted, fontSize: 11, fontWeight: "600", lineHeight: 15, textAlign: "center" },
   selectedLabel: { color: colors.headerText, fontWeight: "700" },
   badge: {
     position: "absolute",

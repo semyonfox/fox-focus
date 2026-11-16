@@ -12,7 +12,7 @@ import { ThreadItem } from "@/components/rows";
 import { Actions, Button, Chip, Composer, Fact, Field, Missing, Panel, Screen, Section, T } from "@/components/ui";
 import { defaultDestination, defaultPlan, oneLine, randomKey } from "@/lib/api";
 import { tomorrowMorning } from "@/lib/dates";
-import { currentDraft, jobsFor, jobThread, sendActionFor, sendState } from "@/lib/derive";
+import { activeJobFor, assistantAvailable, currentDraft, jobsFor, jobThread, sendActionFor, sendState } from "@/lib/derive";
 import { useStore } from "@/lib/store";
 import { space } from "@/lib/theme";
 
@@ -130,7 +130,9 @@ export default function InboxItemScreen() {
       {blocked ? null : open ? (
         <Actions>
           {!tasking ? <Button label="Make task" onPress={() => { setTaskTitle(item.title); setTasking(true); }} /> : null}
-          {!asking ? <Button label="Ask Hermes" onPress={() => setAsking(true)} /> : null}
+          {activeJobFor(rows, { inboxId: item.id })
+            ? null
+            : !asking ? <Button label="Ask Hermes" disabled={!assistantAvailable(rows, "hermes")} onPress={() => setAsking(true)} /> : null}
           <Button label="Snooze" onPress={() => { void decide({ state: "waiting", outcome: null, snoozedUntil: tomorrowMorning() }, "Snoozed until 09:00"); }} />
           <Button label="Done" onPress={() => { void decide({ state: "resolved", outcome: "read", snoozedUntil: null }, "Done"); }} />
           <Button label="Not interested" tone="quiet" onPress={() => { void decide({ state: "resolved", outcome: "dismissed", snoozedUntil: null }, "Marked not interested"); }} />

@@ -1,8 +1,8 @@
 import { useState, type FormEvent } from "react";
 import { AlarmClock, Check, CircleDashed, CornerDownLeft } from "lucide-react";
 import type { Job, ThreadEntry } from "./row-model.ts";
-import { assistantName, relativeTime } from "./work-threads.ts";
-import { assistantInitial, snoozePresets } from "./thread-sidebar.tsx";
+import { assistantName, relativeTime, snoozePresets } from "./work-threads.ts";
+import { assistantInitial } from "./thread-sidebar.tsx";
 
 export type ThreadViewProps = {
   job: Job;
