@@ -326,6 +326,7 @@ p {
   transition: background 140ms ease, transform 140ms ease;
 }
 
+.schedule-row--current,
 .schedule-row:hover {
   background: var(--panel-muted);
 }

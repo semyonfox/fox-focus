@@ -1791,10 +1791,11 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
     return (
       <button
-        className={`schedule-row${showDate ? " schedule-row--dated" : ""}${event.id === selectedEvent?.id ? " schedule-row--selected" : ""}${linkedTaskDone ? " schedule-row--done" : ""}${event.editable ? "" : " schedule-row--imported"}`}
+        className={`schedule-row${showDate ? " schedule-row--dated" : ""}${event.id === currentEvent?.id ? " schedule-row--current" : ""}${event.id === selectedEvent?.id ? " schedule-row--selected" : ""}${linkedTaskDone ? " schedule-row--done" : ""}${event.editable ? "" : " schedule-row--imported"}`}
         key={event.id}
         type="button"
         aria-pressed={event.id === selectedEvent?.id}
+        aria-current={event.id === currentEvent?.id ? "time" : undefined}
         onClick={() => setSelectedEventId(event.id)}
       >
         <time dateTime={event.startsAt ?? time}>
