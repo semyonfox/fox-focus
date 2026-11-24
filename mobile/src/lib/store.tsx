@@ -110,8 +110,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!connection) return;
+    let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const schedule = () => {
+      if (disposed) return;
       timer = setTimeout(() => {
         if (AppState.currentState === "active") void load(true).finally(schedule);
         else schedule();
@@ -120,6 +122,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     schedule();
     const subscription = AppState.addEventListener("change", state => { if (state === "active") void load(true); });
     return () => {
+      disposed = true;
       if (timer) clearTimeout(timer);
       subscription.remove();
     };

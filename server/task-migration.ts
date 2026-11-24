@@ -1,11 +1,9 @@
 import { createHash } from 'node:crypto';
-import { isDateKey } from '../src/calendar-time.ts';
 import type { HermesFeed, HermesTask } from '../src/hermes-model.ts';
 import { isTask, type Area, type Task, type TaskExternalLink } from '../src/model.ts';
 import {
   taskCreateNotes,
   type ActionRow,
-  type ReminderRow,
   type TaskMigrationBlocker,
   type TaskMigrationPlan,
   type TaskMigrationPreview,

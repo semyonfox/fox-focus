@@ -16,7 +16,6 @@ export type EventOrigin = "fixture" | "local" | "task" | "inbox" | "imported";
 export type ReminderMode = "none" | "one-hour" | "morning";
 export type ActiveReminderMode = Exclude<ReminderMode, "none">;
 export type ReminderState = "scheduled" | "snoozed";
-export type InboxDestination = "task" | "event";
 export type TaskFilter = "all" | "open" | "due-today" | "planned" | "waiting" | "done";
 export type TaskSort = "due" | "created";
 
@@ -197,8 +196,7 @@ export type EventDraft = {
 
 export type Modal =
   | { kind: "task"; taskId?: string; inboxId?: string }
-  | { kind: "event"; eventId?: string; inboxId?: string }
-  | { kind: "draft"; inboxId: string }
+  | { kind: "event"; eventId?: string }
   | null;
 
 export const areas = ["University", "Work", "Personal", "Health", "Admin"] as const;

@@ -99,16 +99,6 @@ function jsonRecord(value: unknown): Record<string, unknown> | null {
   }
 }
 
-function jsonStringList(value: unknown): string[] | null {
-  if (typeof value !== 'string') return null;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return Array.isArray(parsed) && parsed.every(item => typeof item === 'string') ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
 function jsonRecordValue(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }

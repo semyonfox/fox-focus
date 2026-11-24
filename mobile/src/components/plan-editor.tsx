@@ -67,7 +67,9 @@ export function PlanEditor({ plan, onSave }: { plan: PlanFields; onSave: (next: 
   const [estimate, setEstimate] = useState(plan.estimateMinutes);
   const [busy, setBusy] = useState(false);
 
-  const plannedAt = day && time ? dublinDateTimeToInstant(day, time) : null;
+  const plannedAt = day === initialDay && time === initialTime
+    ? plan.plannedAt
+    : day && time ? dublinDateTimeToInstant(day, time) : null;
   // a wall time inside the spring-forward gap or the repeated autumn hour has no single instant
   const ambiguous = Boolean(day && time && !plannedAt);
   const dirty = day !== initialDay || time !== initialTime || deadline !== plan.deadlineOn || estimate !== plan.estimateMinutes;
