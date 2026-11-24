@@ -46,6 +46,7 @@ export type ImportedRecord = {
   title: string;
   status: string | null;
   startsAt: string | null;
+  endsAt?: string | null;
   startsOn: string | null;
   dueOn: string | null;
   allDay: boolean;
@@ -105,6 +106,7 @@ function isImportedRecord(value: unknown): value is ImportedRecord {
     typeof value.externalId === 'string' && typeof value.title === 'string' &&
     (value.status === null || typeof value.status === 'string') &&
     (value.startsAt === null || typeof value.startsAt === 'string') &&
+    (value.endsAt === undefined || value.endsAt === null || typeof value.endsAt === 'string') &&
     (value.startsOn === null || typeof value.startsOn === 'string') &&
     (value.dueOn === null || typeof value.dueOn === 'string') && typeof value.allDay === 'boolean' &&
     (value.adoptedTaskId === null || typeof value.adoptedTaskId === 'string');
@@ -434,14 +436,14 @@ export function IntegrationCalendarContext({
 }) {
   const { overview, loading, failed } = overviewState;
   const connected = overview?.providers.some(provider => provider.connection?.state === 'connected') ?? false;
-  const importedEvents = (overview?.records ?? []).filter(record => record.kind === 'calendar_event');
+  const importedEvents = (overview?.records ?? []).filter(record => record.kind === 'calendar_event' && (record.allDay || !record.startsAt || !record.endsAt || Date.parse(record.endsAt) <= Date.parse(record.startsAt)));
   const matchingEvents = filterCalendarContextByDateRange(importedEvents, startDate, endDate);
   const events = matchingEvents.slice(0, 8);
   const today = dublinDateKey(new Date());
 
   if (loading && !overview) return <p className="source-boundary">Checking calendar connections…</p>;
   if (failed && !overview) return <p className="source-boundary source-boundary--warning">Calendar connections could not be checked. <button className="inline-action" type="button" onClick={onOpen}>Open sources</button></p>;
-  if (!connected) return null;
+  if (!connected || !matchingEvents.length) return null;
   return <div className="provider-calendar-context">
     <div><span>{calendarContextHeading(startDate, endDate, today)} · read-only</span><button className="inline-action" type="button" onClick={onOpen}>Open sources</button></div>
     {events.map(record => <p key={record.id}><strong>{record.title}</strong><small>{providerLabel(record.provider)} · {recordWhen(record)}</small></p>)}

@@ -4,6 +4,7 @@ import {
   DUBLIN_TIME_ZONE,
   addCalendarDays,
   calendarDateWindow,
+  currentEventProgress,
   dublinDateKey,
   dublinDateTimeToInstant,
   dublinTimeValue,
@@ -66,4 +67,18 @@ test("does not guess between duplicate fall-back times", () => {
 test("rejects malformed wall times without creating an instant", () => {
   assert.equal(dublinDateTimeToInstant("2026-02-29", "09:00"), null);
   assert.equal(dublinDateTimeToInstant("2026-09-11", "24:00"), null);
+});
+
+test('current event includes its start and excludes its end', () => {
+  const start = '2026-09-15T09:00:00Z';
+  assert.equal(currentEventProgress(start, 60, new Date('2026-09-15T08:59:59Z')), null);
+  assert.equal(currentEventProgress(start, 60, new Date(start)), 0);
+  assert.equal(currentEventProgress(start, 60, new Date('2026-09-15T09:30:00Z')), 0.5);
+  assert.equal(currentEventProgress(start, 60, new Date('2026-09-15T10:00:00Z')), null);
+  assert.equal(currentEventProgress('invalid', 60, new Date(start)), null);
+});
+
+test('current event progress follows elapsed time through Dublin DST transitions', () => {
+  assert.equal(currentEventProgress('2026-03-29T00:30:00Z', 120, new Date('2026-03-29T01:30:00Z')), 0.5);
+  assert.equal(currentEventProgress('2026-10-25T00:30:00Z', 120, new Date('2026-10-25T01:30:00Z')), 0.5);
 });

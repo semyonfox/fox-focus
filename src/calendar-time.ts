@@ -183,3 +183,12 @@ export function dublinTimeValue(instant: string | Date): string {
   if (parts === null) throw new RangeError("Expected a valid instant");
   return `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
 }
+
+/** Elapsed fraction of a running event, using instants across DST changes. */
+export function currentEventProgress(startsAt: string, durationMinutes: number, now: Date): number | null {
+  const elapsed = now.getTime() - Date.parse(startsAt);
+  const duration = durationMinutes * 60_000;
+  return Number.isFinite(elapsed) && Number.isFinite(duration) && duration > 0 && elapsed >= 0 && elapsed < duration
+    ? elapsed / duration
+    : null;
+}

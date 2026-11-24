@@ -3764,3 +3764,30 @@ body {
 .workspace-failure-card .submit-button {
   margin-top: 22px;
 }
+
+/* Selection stays separate from the clock's current-event highlight. */
+.schedule-row--selected { background: var(--panel-muted); outline: 1px solid var(--line); outline-offset: -1px; }
+.schedule-row--now,
+.today-event-row--now { background: color-mix(in srgb, #dc4545 10%, var(--panel)); box-shadow: inset 3px 0 #dc4545; }
+.schedule-row--now time,
+.today-event-row--now time { color: #dc4545; }
+.calendar-now-line { display: flex; align-items: center; gap: 10px; padding: 8px 12px; color: #dc4545; font-size: 12px; font-weight: 650; }
+.calendar-now-line i { height: 1px; flex: 1; background: currentColor; position: relative; }
+.calendar-now-line i::before { content: ""; position: absolute; width: 7px; height: 7px; border-radius: 50%; background: currentColor; top: -3px; left: 0; }
+.hermes-request-context { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; padding: 12px; background: var(--panel-muted); font: inherit; font-size: 13px; }
+.hermes-request-presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.review-queue-nav button { min-height: 44px; padding: 8px 12px; gap: 5px; width: auto; }
+.review-queue-nav .inbox-back { display: none; }
+@media (max-width: 700px) {
+  .review-workbench:not(.review-workbench--detail) .review-detail { display: none; }
+  .review-workbench--detail .inbox-list { display: none; }
+  .review-workbench--detail .review-detail { display: block; }
+  .review-queue-nav .inbox-back { display: inline-flex; }
+  .review-queue-nav { position: sticky; top: 0; z-index: 2; background: var(--panel); gap: 6px; padding: 8px 0; flex-wrap: wrap; }
+  .review-detail-actions { display: flex; }
+  .review-detail-actions > button { flex: 1; min-height: 44px; }
+  .hermes-request-presets > button { min-height: 44px; }
+}
+.schedule-row--now { position: relative; }
+.event-now-marker { position: absolute; left: 0; right: 0; height: 1px; background: #dc4545; pointer-events: none; }
+.event-now-marker::before { content: ""; position: absolute; left: -3px; top: -3px; width: 7px; height: 7px; border-radius: 50%; background: #dc4545; }
