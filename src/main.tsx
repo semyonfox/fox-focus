@@ -21,11 +21,9 @@ import {
   Inbox,
   Link2,
   ListTodo,
-  Mail,
   MessageSquare,
   Moon,
   Newspaper,
-  Pencil,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -35,7 +33,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
 import { telemetry } from "./web-telemetry.ts";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
@@ -70,7 +68,6 @@ import {
   loadWorkRows,
   mergeWorkRows,
   preferredTaskDestination,
-  saveOwnerDraft,
   sendBackJob,
   settleJob,
   snoozeJob,
@@ -91,7 +88,8 @@ import {
   type TaskRowsSnapshot,
   type TaskStatusActionRow,
 } from "./row-client.ts";
-import type { ActionRow, AssistantId, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, ReplyEnvelope, TaskPlanRow, TaskRow, ThreadEntry } from "./row-model.ts";
+import { taskCreateNotes } from "./row-model.ts";
+import type { ActionRow, AssistantId, BriefingEntry, DraftRevision, InboxItemRow, Job, JobUpdate, TaskPlanRow, TaskRow, ThreadEntry } from "./row-model.ts";
 import { ThreadBoard, ThreadSidebar, type AssistantFilter } from "./thread-sidebar.tsx";
 import { ThreadView } from "./thread-view.tsx";
 import { AssistantsPage } from "./assistants-page.tsx";
@@ -107,7 +105,7 @@ import {
   type WorkThread,
 } from "./work-threads.ts";
 
-import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type TaskOrigin, type EventOrigin, type ReminderMode, type ActiveReminderMode, type ReminderState, type InboxDestination, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, taskStates, activeTaskStates, inboxStatuses, eventOrigins, taskOrigins, reminderModes, activeReminderModes, reminderStates, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isTimelineEvent, isInboxItem, isReminder, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
+import { type Area, type Priority, type TaskState, type ActiveTaskState, type InboxStatus, type ThemeMode, type ResolvedTheme, type SectionAnchor, type ReminderMode, type ReminderState, type TaskFilter, type TaskSort, type Task, type TimelineEvent, type InboxItem, type Reminder, type PrototypeData, type TaskDraft, type EventDraft, type Modal, areas, priorities, activeTaskStates, reminderModes, taskFilters, taskSorts, storageKey, defaultTaskDraft, defaultEventDraft, isOneOf, isRecord, isTask, isPrototypeData, compareTasksByCreatedAt, compareTasksByDue, createInitialData } from "./model.ts";
 
 function loadData(): PrototypeData {
   if (typeof window === "undefined") return createInitialData();
@@ -534,12 +532,6 @@ function destinationKey(destination: Pick<TaskDestination, "accountId" | "listId
   return `${destination.accountId}\u0000${destination.listId}`;
 }
 
-function outgoingTaskNotes(notes: string, nonce: string): string {
-  const trimmed = notes.trim();
-  const marker = `Fox-Focus-ID: ${nonce}`;
-  return trimmed ? `${trimmed}\n\n${marker}` : marker;
-}
-
 function urlBase64ToArrayBuffer(value: string): ArrayBuffer {
   const padding = "=".repeat((4 - value.length % 4) % 4);
   const decoded = window.atob((value + padding).replace(/-/g, "+").replace(/_/g, "/"));
@@ -722,7 +714,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [taskDraft, setTaskDraft] = useState<TaskDraft>(defaultTaskDraft);
   const [eventDraft, setEventDraft] = useState<EventDraft>(defaultEventDraft);
   const [now, setNow] = useState(() => new Date());
-  const [draftText, setDraftText] = useState("");
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [inboxView, setInboxView] = useState<InboxLane | "history">("review");
   const [selectedInboxId, setSelectedInboxId] = useState<string | null>(null);
@@ -779,7 +770,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [selectedAssistant, setSelectedAssistant] = useState<AssistantId>("fox");
   const [jobInstruction, setJobInstruction] = useState("");
   const [jobReply, setJobReply] = useState("");
-  const [editingReply, setEditingReply] = useState<{ inboxId: string; inboxVersion: number; reply: ReplyEnvelope } | null>(null);
   const [taskDestinations, setTaskDestinations] = useState<TaskDestination[]>([]);
   const [taskDestinationKey, setTaskDestinationKey] = useState("");
   const [taskDestinationError, setTaskDestinationError] = useState("");
@@ -802,7 +792,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   const [adoptingHermesId, setAdoptingHermesId] = useState<string | null>(null);
   const [reviewUndo, setReviewUndo] = useState<ReviewUndo | null>(null);
   const [showIntegrations, setShowIntegrations] = useState(() => typeof window !== "undefined" && new URLSearchParams(window.location.search).has("integration"));
-  const [agentRequest, setAgentRequest] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("");
   useEffect(() => {
@@ -1051,8 +1040,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     : taskConflictActionId ? "task-conflict"
     : activeReminderId ? `reminder-${activeReminderId}`
     : showReminderTray ? "reminders"
-    : modal?.kind === "draft" || modal?.kind === "event" ? modal.kind
-    : editingReply ? "reply"
+    : modal?.kind === "event" ? modal.kind
     : jobComposer ? "job"
     : modal ? modal.kind
     : editingHermesTaskId ? "hermes-editor"
@@ -1275,7 +1263,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       else if (activeOverlay === "task-conflict") setTaskConflictActionId(null);
       else if (activeOverlay?.startsWith("reminder-")) setActiveReminderId(null);
       else if (activeOverlay === "reminders") setShowReminderTray(false);
-      else if (activeOverlay === "reply") { if (!workBusyKey) setEditingReply(null); }
       else if (activeOverlay === "job") { if (!workBusyKey) setJobComposer(null); }
       else if (modal) setModal(null);
       else if (activeOverlay === "hermes-editor") setEditingHermesTaskId(null);
@@ -1623,11 +1610,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     (task.linkedEventId && eventById.has(task.linkedEventId)))).length +
     hermesTasks.filter(task => task.status !== "done" && Boolean(task.scheduledAt)).length;
   const activeHermesTaskCount = hermesTasks.filter((task) => task.status !== "done").length;
-  const activeImportedTaskCount = importedTasks.filter((task) => task.status !== "completed" &&
-    !hermesProviderIdentities.has(`${task.provider}\u0000${task.externalId}`)).length;
-  const openTaskCount = activeTasks.length + activeHermesTaskCount + activeImportedTaskCount;
-  const selectedTaskSourceLabel = taskSourceOptions.find((source) => source.id === taskSource)?.label ?? "All sources";
-  const selectedTaskCategoryLabel = taskCategory === allTaskCategories ? "all areas" : taskCategory === unclassifiedTaskCategory ? "uncategorised" : taskCategory;
   const taskFilterCounts: Record<TaskFilter, number> = {
     all: categoryLocalTasks.length + categoryHermesTasks.length + categoryDistinctImportedTasks.length,
     open: categoryLocalTasks.filter((task) => !task.completed).length + categoryHermesTasks.filter((task) => task.status !== "done").length + categoryDistinctImportedTasks.filter((task) => task.status !== "completed").length,
@@ -1676,10 +1658,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   useEffect(() => {
     if ((taskFilter === "planned" || taskFilter === "waiting") && isExternalOnlyScope) setTaskSource(allTaskSources);
   }, [taskFilter, taskSource]);
-
-  useEffect(() => {
-    setAgentRequest(selectedInbox?.moreWork ?? "");
-  }, [selectedInbox?.id, selectedInbox?.moreWork]);
 
   function openWorkspaceView(section: WorkspaceView) {
     if (section === activeSection) {
@@ -1858,7 +1836,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
   }
 
-  function openTaskComposer(task?: Task, inboxItem?: InboxItem, inboxRow?: InboxItemRow) {
+  function openTaskComposer(task?: Task, inboxRow?: InboxItemRow) {
     const row = task ? taskRowById.get(task.id) : undefined;
     const plan = task ? taskPlanById.get(task.id) : undefined;
     setTaskPlanVersion(plan?.version ?? null);
@@ -1870,10 +1848,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setTaskPlannedInstant(plannedInstant ? dublinInstantLocalValue(plannedInstant) : null);
     setTaskReminderInstant(null);
     setTaskReminderRequired(false);
-    const startingArea = task?.area ?? inboxItem?.accent ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal");
+    const startingArea = task?.area ?? (isOneOf(taskCategory, areas) ? taskCategory : "Personal");
     const mappedDestination = preferredTaskDestination(taskDestinations, startingArea);
     setTaskDraft({
-      title: task?.title ?? inboxItem?.title ?? inboxRow?.title ?? "",
+      title: task?.title ?? inboxRow?.title ?? "",
       area: mappedDestination && isOneOf(mappedDestination.area, areas) ? mappedDestination.area : startingArea,
       priority: plan?.priority ?? task?.priority ?? "medium",
       due: task?.due ?? "No deadline",
@@ -1896,8 +1874,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setTaskDestinationKey(mappedDestination ? destinationKey(mappedDestination) : "");
     }
     setModalError("");
-    setShowTaskDetails(Boolean(task || inboxItem || inboxRow));
-    setModal({ kind: "task", taskId: task?.id, inboxId: inboxItem?.id ?? inboxRow?.id });
+    setShowTaskDetails(Boolean(task || inboxRow));
+    setModal({ kind: "task", taskId: task?.id, inboxId: inboxRow?.id });
   }
 
   function openBriefingTask(entry: BriefingEntry, withReminder: boolean) {
@@ -1925,7 +1903,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setShowTaskDetails(true);
   }
 
-  function openEventComposer(event?: TimelineEvent, inboxItem?: InboxItem) {
+  function openEventComposer(event?: TimelineEvent) {
     if (event?.taskId && taskRowById.has(event.taskId)) {
       const task = taskById.get(event.taskId);
       if (task) openTaskComposer(task);
@@ -1937,16 +1915,16 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     }
 
     setEventDraft({
-      title: event?.title ?? inboxItem?.title ?? "",
+      title: event?.title ?? "",
       subtitle: event?.subtitle ?? "",
-      area: event?.area ?? inboxItem?.accent ?? "Personal",
+      area: event?.area ?? "Personal",
       date: event ? eventDateKey(event, todayDate) : selectedDate,
       time: event ? eventTimeValue(event) : "09:00",
       duration: event ? String(event.duration) : "30",
       reminderMode: event ? reminderModeFor(data.reminders, event.id) : "none",
     });
     setModalError("");
-    setModal({ kind: "event", eventId: event?.id, inboxId: inboxItem?.id });
+    setModal({ kind: "event", eventId: event?.id });
   }
 
   async function queueTaskStatus(task: Task, row: TaskRow) {
@@ -2257,13 +2235,10 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       return;
     }
 
-    const inboxItem = modal.inboxId ? data.inboxItems.find((item) => item.id === modal.inboxId) : undefined;
     const taskId = existingTask?.id ?? makeId("task");
-    const origin: TaskOrigin = existingTask?.origin ?? (inboxItem ? "inbox" : "manual");
-    const source = existingTask?.source ?? (inboxItem ? `Inbox · ${inboxItem.source}` : undefined);
+    const source = existingTask?.source;
     const linkedEventId = taskDraft.scheduledTime ? existingTask?.linkedEventId ?? makeId("event") : undefined;
-    const linkedEventOrigin: EventOrigin = inboxItem ? "inbox" : "task";
-    const linkedEvent = linkedEventId && plannedStartAt
+    const linkedEvent: TimelineEvent | null = linkedEventId && plannedStartAt
       ? {
           id: linkedEventId,
           title,
@@ -2272,7 +2247,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
           startsAt: plannedStartAt,
           duration: parseDuration(taskDraft.duration),
           editable: true,
-          origin: linkedEventOrigin,
+          origin: "task",
           taskId,
           source: source ? `Local task schedule · ${source}` : "Local task schedule",
         }
@@ -2291,7 +2266,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       scheduledTime: taskDraft.scheduledTime || null,
       ...(taskDraft.scheduledTime ? { scheduledDate } : {}),
       linkedEventId,
-      origin,
+      origin: existingTask?.origin ?? "manual",
       ...(source ? { source } : {}),
       ...(createdAt ? { createdAt } : {}),
       ...(taskDraft.deadlineDate ? { deadlineDate: taskDraft.deadlineDate } : {}),
@@ -2316,9 +2291,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         ...current,
         tasks,
         events,
-        inboxItems: modal.inboxId
-          ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
-          : current.inboxItems,
         reminders: updateReminder(current.reminders, taskId, "task", title, taskDraft.reminderMode, plannedStartAt),
       };
     });
@@ -2328,10 +2300,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       setSelectedDate(scheduledDate);
       setSelectedEventId(linkedEventId);
     }
-    if (inboxItem) {
-      setSelectedInboxId(reviewItems.find((item) => item.id !== inboxItem.id && item.status !== "handled")?.id ?? inboxItem.id);
-    }
-    setStatusMessage(inboxItem ? `Accepted “${title}” as a local task.` : `Saved “${title}”.`);
+    setStatusMessage(`Saved “${title}”.`);
     setModalError("");
     setModal(null);
   }
@@ -2370,9 +2339,8 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       if (task) openTaskComposer(task);
       return;
     }
-    const inboxItem = modal.inboxId ? data.inboxItems.find((item) => item.id === modal.inboxId) : undefined;
     const eventId = existingEvent?.id ?? makeId("event");
-    const source = existingEvent?.source ?? (inboxItem ? `Inbox · ${inboxItem.source}` : "Local calendar block");
+    const source = existingEvent?.source ?? "Local calendar block";
     const nextEvent: TimelineEvent = {
       id: eventId,
       title,
@@ -2381,7 +2349,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       startsAt,
       duration: parseDuration(eventDraft.duration),
       editable: true,
-      origin: existingEvent?.origin === "task" ? "task" : inboxItem ? "inbox" : "local",
+      origin: existingEvent?.origin === "task" ? "task" : "local",
       ...(existingEvent?.taskId ? { taskId: existingEvent.taskId } : {}),
       source,
     };
@@ -2406,9 +2374,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
       events: existingEvent
         ? current.events.map((candidate) => (candidate.id === existingEvent.id ? nextEvent : candidate))
         : [...current.events, nextEvent],
-      inboxItems: modal.inboxId
-        ? current.inboxItems.map((item) => item.id === modal.inboxId ? { ...item, status: "handled" } : item)
-        : current.inboxItems,
       reminders: (() => {
         const eventReminders = updateReminder(current.reminders, eventId, "event", title, eventDraft.reminderMode, startsAt);
         const linkedTaskReminder = existingEvent?.taskId
@@ -2423,10 +2388,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     if (existingEvent?.taskId && completionUndo?.taskId === existingEvent.taskId) setCompletionUndo(null);
     setSelectedDate(eventDraft.date);
     setSelectedEventId(eventId);
-    if (inboxItem) {
-      setSelectedInboxId(reviewItems.find((item) => item.id !== inboxItem.id && item.status !== "handled")?.id ?? inboxItem.id);
-    }
-    setStatusMessage(inboxItem ? `Accepted “${title}” as a local calendar block.` : `Saved “${title}”.`);
+    setStatusMessage(`Saved “${title}”.`);
     setModalError("");
     setModal(null);
   }
@@ -2549,64 +2511,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
   function canMutateInboxItem(item: InboxItemRow): boolean {
     return item.state !== "resolved" &&
       !emailSendBlocksInboxMutation(latestSendActionByInbox.get(item.id)) && workBusyKey === null;
-  }
-
-  function openReplyEditor(item: InboxItemRow) {
-    const draft = draftByInboxId.get(item.id);
-    if (!draft) {
-      setStatusMessage("There is no reply draft to edit yet.");
-      return;
-    }
-    setEditingReply({
-      inboxId: item.id,
-      inboxVersion: item.version,
-      reply: {
-        ...draft.reply,
-        references: [...draft.reply.references],
-        to: [...draft.reply.to],
-        cc: [...draft.reply.cc],
-        bcc: [...draft.reply.bcc],
-      },
-    });
-    setModalError("");
-  }
-
-  async function saveReplyEditor(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!editingReply) return;
-    const item = inboxRowById.get(editingReply.inboxId);
-    if (!item) {
-      setModalError("This Inbox item is no longer available.");
-      return;
-    }
-    if (item.version !== editingReply.inboxVersion) {
-      setModalError("The Inbox item changed while this draft was open. Close it and review the latest draft.");
-      return;
-    }
-    const reply = {
-      ...editingReply.reply,
-      from: editingReply.reply.from.trim(),
-      to: editingReply.reply.to.map((address) => address.trim()).filter(Boolean),
-      cc: editingReply.reply.cc.map((address) => address.trim()).filter(Boolean),
-      bcc: editingReply.reply.bcc.map((address) => address.trim()).filter(Boolean),
-    };
-    if (!reply.from || !reply.to.length) {
-      setModalError("Add the sender and at least one recipient.");
-      return;
-    }
-    setWorkBusyKey(`draft:${item.id}`);
-    setModalError("");
-    try {
-      await saveOwnerDraft({ id: item.id, version: editingReply.inboxVersion }, reply);
-      await refreshRowSnapshots();
-      setEditingReply(null);
-      setStatusMessage("Saved a new owner draft revision.");
-    } catch (error) {
-      try { await refreshRowSnapshots(); } catch { /* the original error is more useful */ }
-      setModalError(error instanceof Error ? error.message : "The draft could not be saved.");
-    } finally {
-      setWorkBusyKey(null);
-    }
   }
 
   function openJobComposer(
@@ -2813,7 +2717,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   function selectInbox(item: InboxItem) {
     setSelectedInboxId(item.id);
-    setAgentRequest(item.moreWork ?? "");
   }
 
   function moveInboxSelection(delta: number) {
@@ -2855,56 +2758,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setInboxView(reviewUndo.item.status === "handled" ? "history" : inboxLane(reviewUndo.item));
     setReviewUndo(null);
     setStatusMessage("Inbox change undone.");
-  }
-
-  function acceptInbox(destination: InboxDestination) {
-    if (!selectedInbox) return;
-    if (destination === "task") openTaskComposer(undefined, selectedInbox);
-    else openEventComposer(undefined, selectedInbox);
-  }
-
-  function openDraft(item: InboxItem) {
-    setSelectedInboxId(item.id);
-    setDraftText(
-      item.draft ??
-        `Hi,\n\nI’ve reviewed the details and can take the next step once you confirm the preferred option.\n\nThanks,`,
-    );
-    setModalError("");
-    setModal({ kind: "draft", inboxId: item.id });
-  }
-
-  function saveDraft() {
-    if (!modal || modal.kind !== "draft") return;
-    const text = draftText.trim();
-    if (!text) {
-      setModalError("Write a draft before saving it for review.");
-      return;
-    }
-    setData((current) => ({
-      ...current,
-      inboxItems: current.inboxItems.map((item) =>
-        item.id === modal.inboxId ? { ...item, draft: text, status: "draft-ready" } : item,
-      ),
-    }));
-    setStatusMessage("Draft saved in the Inbox. Nothing was sent.");
-    setModalError("");
-    setModal(null);
-  }
-
-  function saveMoreWork() {
-    if (!selectedInbox) return;
-    const request = agentRequest.trim();
-    if (!request) {
-      setStatusMessage("Add a short feedback note before saving it.");
-      return;
-    }
-    setData((current) => ({
-      ...current,
-      inboxItems: current.inboxItems.map((item) =>
-        item.id === selectedInbox.id ? { ...item, moreWork: request, status: "waiting-on-agent" } : item,
-      ),
-    }));
-    setStatusMessage("Feedback saved locally. It has not been delivered to Hermes.");
   }
 
   useEffect(() => {
@@ -3115,13 +2968,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     setWorkControlsOpen(false);
     setInboxView("review");
     selectInbox(item);
-    openWorkspaceView("review");
-  }
-
-  function openTodayWorkThread(thread: WorkThread) {
-    setWorkControlsOpen(true);
-    selectWorkThread(thread);
-    setWorkDetailOpen(true);
     openWorkspaceView("review");
   }
 
@@ -3429,7 +3275,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               </> : null}
               {selectedWorkJob?.state === "review" ? <>
                 {selectedWorkItem?.source.kind === "email" && selectedWorkDraft && sendState !== "disabled" ? <button className="page-primary-action" type="button" disabled={sendState !== "ready" || jobBusy} onClick={() => sendWorkItem(selectedWorkItem)}><Send size={12} /> {sendButtonLabel}</button> : null}
-                {selectedWorkItem && !selectedWorkItem.taskId ? <button className="secondary-action" type="button" disabled={jobBusy} onClick={() => openTaskComposer(undefined, undefined, selectedWorkItem)}><ListTodo size={12} /> Review task</button> : null}
+                {selectedWorkItem && !selectedWorkItem.taskId ? <button className="secondary-action" type="button" disabled={jobBusy} onClick={() => openTaskComposer(undefined, selectedWorkItem)}><ListTodo size={12} /> Review task</button> : null}
                 <button className="secondary-action" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "accepted")}><Check size={12} /> Settle <kbd>e</kbd></button>
                 <button className="danger-button" type="button" disabled={jobBusy} onClick={() => settleSelectedJob(selectedWorkJob, "dropped")}><Trash2 size={12} /> Drop</button>
               </> : null}
@@ -3474,7 +3320,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
 
   const taskModal = modal?.kind === "task" ? modal : null;
   const eventModal = modal?.kind === "event" ? modal : null;
-  const draftModal = modal?.kind === "draft" ? modal : null;
   const editingHermesTask = hermesTasks.find(task => task.id === editingHermesTaskId) ?? null;
   const modalTask = taskModal?.taskId ? taskById.get(taskModal.taskId) ?? null : null;
   const modalTaskRow = modalTask ? taskRowById.get(modalTask.id) : undefined;
@@ -3502,9 +3347,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
     : null;
   const modalInbox = taskModal?.inboxId
     ? data.inboxItems.find((item) => item.id === taskModal.inboxId)
-    : eventModal?.inboxId
-      ? data.inboxItems.find((item) => item.id === eventModal.inboxId)
-      : null;
+    : null;
   const modalInboxRow = taskModal?.inboxId ? inboxRowById.get(taskModal.inboxId) ?? null : null;
   const jobPromptPresets = jobComposer?.inboxId
     ? [
@@ -3627,7 +3470,7 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               {modalPendingGoogle ? <label className="field field--full"><span>Google due · pending</span><input type="date" readOnly value={modalCreateAction?.payload.doOn ?? ""} /></label> : null}
               <label className="field field--full"><span>{modalGoogleOwned || modalCreatingGoogle ? "Local deadline · stays in Fox Focus" : "Deadline"}</span><input type="date" value={taskDraft.deadlineDate} onChange={(event) => setTaskDraft((current) => ({ ...current, deadlineDate: event.target.value, due: event.target.value ? deadlineDateLabel(event.target.value, todayDate) : "No deadline" }))} /></label>
             </div>
-            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div><div><dt>Local reminder</dt><dd>{taskReminderLocal ? `${taskReminderLocal.replace("T", " ")} Dublin${taskReminderInstant?.localValue === taskReminderLocal ? ` · ${taskReminderInstant.instant}` : ""}` : "None"}</dd></div></dl><p>Notes sent to Google · the Fox-Focus-ID marker prevents duplicate creation.</p><pre>{outgoingTaskNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
+            {modalCreatingGoogle ? <div className="task-create-preview"><header><span>Outgoing task</span><strong>{selectedTaskDestination?.listName ?? "No destination"}</strong></header><dl><div><dt>Account</dt><dd>{selectedTaskDestination?.accountId ?? ""}</dd></div><div><dt>List ID</dt><dd>{selectedTaskDestination?.listId ?? ""}</dd></div><div><dt>Title</dt><dd>{taskDraft.title.trim() || "Untitled"}</dd></div><div><dt>Due</dt><dd>{taskGoogleDue || "None"}</dd></div><div><dt>Local reminder</dt><dd>{taskReminderLocal ? `${taskReminderLocal.replace("T", " ")} Dublin${taskReminderInstant?.localValue === taskReminderLocal ? ` · ${taskReminderInstant.instant}` : ""}` : "None"}</dd></div></dl><p>Notes sent to Google · the Fox-Focus-ID marker prevents duplicate creation.</p><pre>{taskCreateNotes(taskNotes, taskCreateNonce)}</pre></div> : null}
             <button className="task-details-toggle" type="button" aria-expanded={showTaskDetails} aria-controls="task-more-options" onClick={() => setShowTaskDetails((current) => !current)}><SlidersHorizontal size={13} /><span>{showTaskDetails ? "Hide options" : "More options"}</span><ChevronDown size={13} /></button>
             {showTaskDetails ? <div className="editor-grid editor-grid--task-details" id="task-more-options">
               <label className="field"><span>{modalGoogleOwned || modalPendingGoogle || modalCreatingGoogle ? "Area · from list" : modalRowOwned ? "Area · from source" : "Area"}</span><select disabled={modalRowOwned || modalCreatingGoogle} value={taskDraft.area} onChange={(event) => { const value = event.target.value; if (isOneOf(value, areas)) setTaskDraft((current) => ({ ...current, area: value })); }}><option value="University">University</option><option value="Work">Work</option><option value="Personal">Personal</option><option value="Health">Health</option><option value="Admin">Admin</option></select></label>
@@ -3668,30 +3511,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
         </DialogFrame>
       ) : null}
 
-      {editingReply ? (
-        <DialogFrame title="Edit reply draft" onClose={() => setEditingReply(null)} className="editor-dialog--draft">
-          <form onSubmit={saveReplyEditor}>
-            <div className="editor-heading">
-              <div className="composer-icon"><Mail size={17} /></div>
-              <div><p className="eyebrow">Reply revision</p><h2>Edit draft</h2></div>
-              <button className="close-composer" type="button" onClick={() => setEditingReply(null)} aria-label="Close reply editor"><X size={17} /></button>
-            </div>
-            {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
-            <div className="editor-grid reply-editor-grid">
-              <label className="field"><span>Account</span><input readOnly value={editingReply.reply.accountId} /></label>
-              <label className="field"><span>From</span><input required value={editingReply.reply.from} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, from: event.target.value } } : current)} /></label>
-              <label className="field field--full"><span>To · one recipient per line</span><textarea className="reply-recipient-field" required value={editingReply.reply.to.join("\n")} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, to: event.target.value.split(/\r?\n/) } } : current)} /></label>
-              <label className="field"><span>Cc · one per line</span><textarea className="reply-recipient-field" value={editingReply.reply.cc.join("\n")} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, cc: event.target.value.split(/\r?\n/) } } : current)} /></label>
-              <label className="field"><span>Bcc · one per line</span><textarea className="reply-recipient-field" value={editingReply.reply.bcc.join("\n")} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, bcc: event.target.value.split(/\r?\n/) } } : current)} /></label>
-              <label className="field field--full"><span>Subject</span><input value={editingReply.reply.subject} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, subject: event.target.value } } : current)} /></label>
-              <label className="field field--full"><span>Body</span><textarea data-autofocus maxLength={200000} value={editingReply.reply.bodyText} onChange={(event) => setEditingReply((current) => current ? { ...current, reply: { ...current.reply, bodyText: event.target.value } } : current)} /></label>
-            </div>
-            <div className="reply-envelope-ids"><span>Reply to {editingReply.reply.replyToMessageId}</span><span>Thread {editingReply.reply.threadId}</span></div>
-            <div className="editor-footer"><span>Creates a new owner revision.</span><div><button className="secondary-action" type="button" onClick={() => setEditingReply(null)}>Cancel</button><button className="submit-button" type="submit" disabled={workBusyKey === `draft:${editingReply.inboxId}`}><Check size={14} /> Save revision</button></div></div>
-          </form>
-        </DialogFrame>
-      ) : null}
-
       {eventModal ? (
         <DialogFrame title={eventModal.eventId ? "Edit local calendar block" : "Add calendar block"} onClose={() => setModal(null)}>
           <form onSubmit={saveEvent}>
@@ -3701,7 +3520,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
               <button className="close-composer" type="button" onClick={() => setModal(null)} aria-label="Close calendar editor"><X size={17} /></button>
             </div>
             {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
-            {modalInbox ? <div className="source-notice"><Inbox size={14} /> Capturing from <strong>{modalInbox.source}</strong>. The local block keeps that source.</div> : null}
             <div className="editor-grid">
               <label className="field field--full"><span>Block title</span><input data-autofocus value={eventDraft.title} onChange={(event) => setEventDraft((current) => ({ ...current, title: event.target.value }))} placeholder="What belongs in the timetable?" /></label>
               <label className="field field--full"><span>Location or context</span><input value={eventDraft.subtitle} onChange={(event) => setEventDraft((current) => ({ ...current, subtitle: event.target.value }))} placeholder="Optional note, location, or call link" /></label>
@@ -3713,20 +3531,6 @@ function App({ initial }: { initial?: ServerSnapshot }) {
             </div>
             <div className="editor-footer"><span>Local only. No provider calendar is being written to.</span><div>{eventModal.eventId ? <button className="danger-button" type="button" onClick={deleteEvent}><Trash2 size={13} /> Delete</button> : null}<button className="secondary-action" type="button" onClick={() => setModal(null)}>Cancel</button><button className="submit-button" type="submit"><Check size={14} /> Save block</button></div></div>
           </form>
-        </DialogFrame>
-      ) : null}
-
-      {draftModal ? (
-        <DialogFrame title="Draft for review" onClose={() => setModal(null)} className="editor-dialog--draft">
-          <div className="editor-heading">
-            <div className="composer-icon"><Pencil size={17} /></div>
-            <div><p className="eyebrow">Inbox draft</p><h2>Draft for review</h2></div>
-            <button className="close-composer" type="button" onClick={() => setModal(null)} aria-label="Close draft editor"><X size={17} /></button>
-          </div>
-          {modalError ? <p className="editor-error" role="alert">{modalError}</p> : null}
-          <p className="draft-context">This stays in the local Inbox. It is not a send screen.</p>
-          <label className="field"><span>Draft reply</span><textarea data-autofocus value={draftText} onChange={(event) => setDraftText(event.target.value)} /></label>
-          <div className="editor-footer"><span>Source remains attached for review.</span><div><button className="secondary-action" type="button" onClick={() => setModal(null)}>Keep reviewing</button><button className="submit-button" type="button" onClick={saveDraft}><Check size={14} /> Save draft</button></div></div>
         </DialogFrame>
       ) : null}
 

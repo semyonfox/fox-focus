@@ -78,7 +78,7 @@ Inbox is one T3 Code-style thread sidebar:
 
 Settle means done and dealt with. It is one action with no provider side effect. Snooze only hides a thread. A snoozed thread wakes at its time, or earlier when its assistant asks or finishes after the snooze.
 
-The detail pane shows the summary, current email draft where relevant, update timeline, and bottom actions. Email actions are Send, Edit draft, Ask Hermes, Make task, Snooze, Settle, Not interested, and Noise. Task detail also offers Hand to Hermes.
+The detail pane shows the summary, current email draft and update timeline. On the web, use Ask Hermes to request a draft revision. On Android, Edit opens the reply body for an owner revision. Send approves the displayed envelope and body.
 
 The Assistants tab shows each assistant with an ongoing conversation, its threads, its routines and what it is allowed to do. Threads started there appear in the Inbox too.
 
