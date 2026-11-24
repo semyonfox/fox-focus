@@ -2,7 +2,7 @@ import {
   approveEmailSend, createJob, decideInboxItem, emailSendBlocksInboxMutation, saveOwnerDraft,
 } from "@shared/inbox-client";
 import { sourceCreationNonce } from "@shared/task-creation-guard";
-import type { InboxItemRow, InboxOutcome, TaskCreateInput } from "@shared/row-model";
+import type { DraftRevision, InboxItemRow, InboxOutcome, TaskCreateInput } from "@shared/row-model";
 import { inboxStateLabel, relativeTime } from "@shared/work-threads";
 import { router, useLocalSearchParams } from "expo-router";
 import { useState } from "react";
@@ -17,12 +17,17 @@ import { useStore } from "@/lib/store";
 import { space } from "@/lib/theme";
 
 type Decision = { state: InboxItemRow["state"]; outcome: InboxOutcome | null; snoozedUntil: string | null };
+type DraftEdit = {
+  item: Pick<InboxItemRow, "id" | "version">;
+  draft: DraftRevision;
+  body: string;
+  saving: boolean;
+};
 
 export default function InboxItemScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { rows, run } = useStore();
-  const [editing, setEditing] = useState(false);
-  const [body, setBody] = useState("");
+  const [draftEdit, setDraftEdit] = useState<DraftEdit | null>(null);
   const [asking, setAsking] = useState(false);
   const [tasking, setTasking] = useState(false);
   const [taskTitle, setTaskTitle] = useState("");
@@ -35,6 +40,10 @@ export default function InboxItemScreen() {
   const send = sendState(rows, item);
   const blocked = emailSendBlocksInboxMutation(sendActionFor(rows, item));
   const open = item.state === "open";
+  const edit = draftEdit?.item.id === item.id ? draftEdit : null;
+  const stale = edit !== null && (edit.item.version !== item.version || edit.draft.id !== draft?.id || !open || blocked);
+  const previewDraft = edit?.draft ?? draft;
+  const saveDisabled = !edit || stale || edit.saving || !edit.body.trim() || edit.body === edit.draft.reply.bodyText;
   const jobs = jobsFor(rows, { inboxId: item.id });
   const destination = rows.destinations.find(entry => `${entry.accountId}:${entry.listId}` === destinationKey) ?? defaultDestination(rows);
 
@@ -44,9 +53,13 @@ export default function InboxItemScreen() {
   };
 
   const saveDraft = async () => {
-    if (!draft) return;
-    const ok = await run(() => saveOwnerDraft(item, { ...draft.reply, bodyText: body }), "Draft saved");
-    if (ok) setEditing(false);
+    if (!edit || saveDisabled) return;
+    setDraftEdit({ ...edit, saving: true });
+    const ok = await run(() => saveOwnerDraft(edit.item, { ...edit.draft.reply, bodyText: edit.body }), "Draft saved");
+    setDraftEdit(current => {
+      if (current?.item !== edit.item) return current;
+      return ok ? null : { ...current, saving: false };
+    });
   };
 
   const makeTask = () => {
@@ -78,35 +91,49 @@ export default function InboxItemScreen() {
       </T>
       <T style={styles.summary}>{item.summary}</T>
 
-      {draft ? (
+      {previewDraft ? (
         <Panel>
-          <T size="tiny" tone="faint" bold>{`DRAFT ${draft.revision} · ${draft.author === "hermes" ? "HERMES" : "YOU"}`}</T>
-          <Fact label="Account" value={draft.reply.accountId} />
-          <Fact label="From" value={draft.reply.from} />
-          <Fact label="To" value={draft.reply.to.join(", ")} />
-          <Fact label="Cc" value={draft.reply.cc.join(", ") || "None"} />
-          <Fact label="Bcc" value={draft.reply.bcc.join(", ") || "None"} />
-          <Fact label="Subject" value={draft.reply.subject} />
-          <Fact label="Thread" value={draft.reply.threadId} />
-          <Fact label="Reply to" value={draft.reply.replyToMessageId} />
-          <Fact label="In reply to" value={draft.reply.inReplyTo} />
-          <Fact label="References" value={draft.reply.references.join(", ") || "None"} />
-          {editing
-            ? <Field label="Reply body" value={body} onChangeText={setBody} multiline autoFocus />
-            : <T size="small">{draft.reply.bodyText}</T>}
-          {open && !blocked ? (
+          <T size="tiny" tone="faint" bold>{`DRAFT ${previewDraft.revision} · ${previewDraft.author === "hermes" ? "HERMES" : "YOU"}`}</T>
+          <Fact label="Account" value={previewDraft.reply.accountId} />
+          <Fact label="From" value={previewDraft.reply.from} />
+          <Fact label="To" value={previewDraft.reply.to.join(", ")} />
+          <Fact label="Cc" value={previewDraft.reply.cc.join(", ") || "None"} />
+          <Fact label="Bcc" value={previewDraft.reply.bcc.join(", ") || "None"} />
+          <Fact label="Subject" value={previewDraft.reply.subject} />
+          <Fact label="Thread" value={previewDraft.reply.threadId} />
+          <Fact label="Reply to" value={previewDraft.reply.replyToMessageId} />
+          <Fact label="In reply to" value={previewDraft.reply.inReplyTo} />
+          <Fact label="References" value={previewDraft.reply.references.join(", ") || "None"} />
+          {edit ? (
+            <>
+              {stale && !edit.saving ? (
+                <T size="small" tone="amber" accessibilityRole="alert" accessibilityLiveRegion="polite">
+                  The Inbox item changed. Copy your changes before discarding this edit.
+                </T>
+              ) : null}
+              <Field
+                label="Reply body"
+                value={edit.body}
+                editable={!edit.saving}
+                onChangeText={body => setDraftEdit(current => current?.item === edit.item && !current.saving ? { ...current, body } : current)}
+                multiline
+                autoFocus
+              />
+              <Actions>
+                <Button label="Save draft" tone="primary" disabled={saveDisabled} onPress={() => { void saveDraft(); }} />
+                <Button label={stale ? "Discard edit" : "Cancel"} tone="quiet" disabled={edit.saving} onPress={() => setDraftEdit(null)} />
+              </Actions>
+            </>
+          ) : <T size="small">{previewDraft.reply.bodyText}</T>}
+          {!edit && draft && open && !blocked ? (
             <Actions>
-              {editing ? (
-                <>
-                  <Button label="Save draft" tone="primary" disabled={!body.trim() || body === draft.reply.bodyText} onPress={() => { void saveDraft(); }} />
-                  <Button label="Cancel" tone="quiet" onPress={() => setEditing(false)} />
-                </>
-              ) : (
-                <>
-                  {send === "ready" ? <Button label="Send" tone="primary" onPress={() => { void run(() => approveEmailSend(item, draft), "Sending"); }} /> : null}
-                  <Button label="Edit" onPress={() => { setBody(draft.reply.bodyText); setEditing(true); }} />
-                </>
-              )}
+              {send === "ready" ? <Button label="Send" tone="primary" onPress={() => { void run(() => approveEmailSend(item, draft), "Sending"); }} /> : null}
+              <Button label="Edit" onPress={() => setDraftEdit({
+                item: { id: item.id, version: item.version },
+                draft,
+                body: draft.reply.bodyText,
+                saving: false,
+              })} />
             </Actions>
           ) : null}
         </Panel>
