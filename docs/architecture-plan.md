@@ -24,12 +24,13 @@ Area is not copied into each task row. Fox Focus derives it from the Google list
 
 ## Application shape
 
-The browser has four views:
+The browser has five views.
 
 - Today shows the current calendar context, a short task list, deadlines, and a collapsed briefing card.
 - Tasks shows all current and completed tasks. The checkbox completes or reopens a Google task.
 - Calendar shows read-only provider events and existing local time blocks.
 - Inbox uses one compact thread list with Needs you, Working, and collapsed Settled groups. Likely-noise items stay available in a collapsed group.
+- Assistants shows conversations, routines and permissions for Fox and Hermes.
 
 Inbox detail shows the selected item or job, its draft where relevant, its update timeline, and the actions that apply. It is a handoff loop, not a chat transcript. Each view uses the page scrollbar.
 
@@ -97,7 +98,7 @@ review -> queued     owner sends it back
 review -> settled    owner accepts or drops it
 ```
 
-Hermes can claim a job, add progress, ask one short question, or submit a result. It cannot settle a job. Accepting a job linked to an open task counts as the owner's completion click and queues the normal Google status action.
+Hermes can claim a job, add progress, ask one short question, or submit a result. The owner settles a Hermes job locally. To complete a linked Google task, the owner uses the task's checkbox.
 
 ## Email sending
 

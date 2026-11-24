@@ -2,12 +2,13 @@
 
 Fox Focus is a private, self-hosted task and time app. Google Tasks is the task home; Fox Focus adds local planning, reminders, a calm Today view, read-only calendar context, and a terse Inbox for email decisions and work handed to Hermes.
 
-The four views are:
+The web app has five views.
 
-- Today for the next calendar context, a short task list, deadlines, and a collapsed briefing;
-- Tasks for active and completed Google-backed tasks with local planning;
-- Calendar for unified day, week, and month views of provider events and local blocks, with a current-time line on the hourly grid;
-- Inbox for manual review with a selected item’s details and controls, separate Automations and History, and explicit access to existing work threads.
+- Today shows upcoming events, tasks, deadlines and the daily briefing.
+- Tasks lists active and completed Google tasks with their local plans.
+- Calendar shows provider events and local blocks by day, week or month.
+- Inbox shows incoming requests, decisions and work threads.
+- Assistants shows conversations, routines and permissions for Fox and Hermes.
 
 Task lists use the page scrollbar. Calendar keeps its date controls above a scrollable hourly grid.
 
@@ -21,7 +22,7 @@ An owner checkbox click approves completing or reopening the displayed Google ta
 
 Email sending is off by default. When enabled, the owner approves one immutable reply envelope; Hermes builds MIME and returns a receipt bound to the stored payload hash. An uncertain send becomes reconciliation-only and can never be resent by Fox Focus.
 
-Fox Focus has no provider delete, Google move or clear, calendar write, Microsoft write, Canvas submission, direct Gmail access, assistant settlement, or Hermes database write path.
+Fox Focus has no provider delete, Google move or clear, calendar write, Microsoft write, Canvas submission, direct Gmail access or Hermes database write path. Fox can settle its own thread when the owner says the work is finished.
 
 ## What is implemented
 
@@ -129,9 +130,10 @@ The owner API uses HTTP Basic authentication in this single-owner release. Put i
 - `POST /api/v1/tasks/:taskId/status` records an approved completion or reopen.
 - Inbox item, draft, send, and job routes are owner-only.
 - Migration preview, approval, and status routes are owner-only.
+- The optional owner-only `/mcp` endpoint reads workspace context and manages local Inbox decisions and threads. See [MCP endpoint setup](docs/deployment.md#mcp-endpoint).
 - Hermes uses only `GET /api/v1/context`, `GET /api/v1/changes`, `PUT /api/v1/inbox/:proposalKey`, `POST /api/v1/requests/:id/claim`, `POST /api/v1/requests/:id/result`, and `PUT /api/v1/briefings/:day`.
 
-Compatibility workspace, mirror, annotation, adoption, old task-action, task-status, and task-proposal routes remain until the live migration is verified. They are not the current ownership path. Fox Focus publishes no public API catalog, OpenAPI document, MCP endpoint, or `llms.txt`.
+Compatibility workspace, mirror, annotation, adoption, old task-action, task-status, and task-proposal routes remain until the live migration is verified. They are not the current ownership path. Fox Focus publishes no public API catalog, OpenAPI document or `llms.txt`.
 
 ## Documentation
 
